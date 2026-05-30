@@ -1,5 +1,6 @@
 version = "v1alpha4"
 dockerfile = "Dockerfile"
+published_image = "docker.io/projectjackin/jackin-sentinel:latest"
 agents = ["claude", "codex", "amp", "kimi", "opencode"]
 
 [identity]
