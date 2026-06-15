@@ -7,7 +7,7 @@ agents = ["claude", "codex", "amp", "kimi", "opencode"]
 name = "jackin' Sentinel"
 
 [claude]
-model = "sonnet"
+model = "claude-sonnet-4-6"
 plugins = []
 
 [codex]
@@ -25,6 +25,12 @@ model = "zai-coding-plan/glm-5.1"
 setup_once = "hooks/setup-once.sh"
 source = "hooks/source.sh"
 preflight = "hooks/preflight.sh"
+
+[env.CLAUDE_CODE_NO_FLICKER]
+default = "1"
+
+[env.CLAUDE_CODE_MAX_OUTPUT_TOKENS]
+default = "64000"
 
 [env.STATIC_DEFAULT]
 default = "static-value"
