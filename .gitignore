@@ -1,2 +1,11 @@
-.DS_Store
+# Editor/tool local state
+.idea/
+.vscode/
+*.swp
 .env
+
+# Docker build context leftovers
+*.tar
+*.tar.gz
+.dockerignore.bak
+.DS_Store
