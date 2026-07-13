@@ -4,7 +4,7 @@
 version = "v1alpha4"
 dockerfile = "Dockerfile"
 published_image = "docker.io/projectjackin/jackin-sentinel:latest"
-agents = ["claude", "codex", "amp", "kimi", "opencode"]
+agents = ["claude", "codex", "amp", "opencode", "kimi", "grok"]
 
 [identity]
 name = "jackin' Sentinel"
@@ -23,6 +23,9 @@ model = "kimi-k2"
 
 [opencode]
 model = "zai-coding-plan/glm-5.1"
+
+[grok]
+model = "grok-build"
 
 [hooks]
 setup_once = "hooks/setup-once.sh"
