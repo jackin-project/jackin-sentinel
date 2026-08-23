@@ -27,8 +27,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.lanes == 'both') && '[{"lane":"Velnor","runner":["self-hosted","velnor-target-mvp"],"writer":true},{"lane":"GitHub","runner":"ubuntu-26.04","writer":false}]' || (github.event_name == 'workflow_dispatch' && inputs.lanes == 'github') && '[{"lane":"GitHub","runner":"ubuntu-26.04","writer":true}]' || '[{"lane":"Velnor","runner":["self-hosted","velnor-target-mvp"],"writer":true}]') }}
-    runs-on: ${{ matrix.config.runner }}
+        config: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.lanes == 'both') && '[{"lane":"Velnor","velnor_default_runner":["self-hosted","velnor-target-mvp"],"writer":true},{"lane":"GitHub","velnor_default_runner":"ubuntu-26.04","writer":false}]' || (github.event_name == 'workflow_dispatch' && inputs.lanes == 'github') && '[{"lane":"GitHub","velnor_default_runner":"ubuntu-26.04","writer":true}]' || '[{"lane":"Velnor","velnor_default_runner":["self-hosted","velnor-target-mvp"],"writer":true}]') }}
+    runs-on: ${{ matrix.config.velnor_default_runner }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,8 +50,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.lanes == 'both') && '[{"lane":"Velnor","runner":["self-hosted","velnor-target-mvp"],"writer":true},{"lane":"GitHub","runner":"ubuntu-26.04","writer":false}]' || (github.event_name == 'workflow_dispatch' && inputs.lanes == 'github') && '[{"lane":"GitHub","runner":"ubuntu-26.04","writer":true}]' || '[{"lane":"Velnor","runner":["self-hosted","velnor-target-mvp"],"writer":true}]') }}
-    runs-on: ${{ matrix.config.runner }}
+        config: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.lanes == 'both') && '[{"lane":"Velnor","velnor_default_runner":["self-hosted","velnor-target-mvp"],"writer":true},{"lane":"GitHub","velnor_default_runner":"ubuntu-26.04","writer":false}]' || (github.event_name == 'workflow_dispatch' && inputs.lanes == 'github') && '[{"lane":"GitHub","velnor_default_runner":"ubuntu-26.04","writer":true}]' || '[{"lane":"Velnor","velnor_default_runner":["self-hosted","velnor-target-mvp"],"writer":true}]') }}
+    runs-on: ${{ matrix.config.velnor_default_runner }}
     steps:
       - env:
           NEEDS_JSON: ${{ toJSON(needs) }}
