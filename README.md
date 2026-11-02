@@ -19,6 +19,8 @@ The role holds no secret. Jackin builds the image. This repository does not publ
 
 ## Check and load the role
 
+The repository gate is `mise run test`. It runs `prek run --all-files`: gitleaks, shellcheck, shfmt, and hadolint.
+
 Build jackin in the jackin repository. The gate runs the binary `jackin/target/debug/jackin` from this directory:
 
 ```sh
@@ -65,6 +67,8 @@ jackin-sentinel-probe --version
 
 Without `--host`, the probe refuses to run unless it is on Linux as the user `sandbox` with `/sandbox` present. It exits 66 otherwise. This guard keeps the J10 write checks off a host.
 
+The probe reads other processes only through `/proc/PID/stat` and `/proc/PID/cmdline`. The sandbox denies `exe`, `fd`, and `environ` of a process outside the caller's own tree, even for the same uid.
+
 The probe exits 0 whenever it printed a report, even when a step is `FAIL`. It exits 64 for a usage error, 66 outside a sandbox, and 69 when `jq` is missing.
 
 ### Steps
@@ -78,11 +82,11 @@ Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, 
 | J05 | The sha256 digest of every regular file below `/sandbox/project`, outside `.git`. |
 | J06 | The execution counts of the hooks and the owner and mode of the installed hook files. |
 | J07 | The main process (`jackin-start`), its Codex child, and the answer of `codex exec --skip-git-repo-check "Reply with the word ready"`. |
-| J08 | Whether every credential variable and every token in `auth.json` is a placeholder, and the paths of files that hold a token-shaped string. The probe never prints a value. |
+| J08 | Whether every credential variable and every token in `auth.json` is a placeholder, and the paths of files that hold a token-shaped string. The probe reads its own environment, the `/sandbox/.jackin/env-*` launch files, `auth.json`, and the files under `/sandbox`. It also tries `/proc/PID/environ` of the main process and of Codex. The sandbox denies that read, so the result lists both environments as unreadable. The probe never prints a value. |
 | J09 | The result of `curl` to a host outside the policy, to the metadata address, and to a Codex provider host with the placeholder as the bearer value. |
 | J10 | Which file creations succeed under `/sandbox` and `/tmp` and which fail elsewhere. |
 | J11 | The Codex process with its pid and start time, for a comparison before and after a detach. |
-| J12 | The probe process, its tty, and whether it descends from the main process. |
+| J12 | The probe process, its controlling terminal, and whether it descends from the main process. |
 | J13 | The git state of `/sandbox/project`: branches, tips, HEAD, cleanliness, and stash count. |
 | J14 | A marker file that the first run creates, the boot id, and the hook counts, for a comparison after stop and start. |
 | J15 | With `--docker on`: the Docker variables, the client certificates, the output of `docker run --rm hello-world`, and the engine id. |

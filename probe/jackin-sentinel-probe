@@ -12,6 +12,7 @@ STATE_DIR=/sandbox/.sentinel
 JACKIN_DIR=/sandbox/.jackin
 CODEX_HOME_DIR=/sandbox/.codex
 CODEX_BIN=/usr/local/bin/codex
+CODEX_COMM=codex
 START_BIN=/usr/local/bin/jackin-start
 HOOK_DIR=/usr/local/lib/jackin/hooks
 SCAN_ROOT=/sandbox
@@ -113,29 +114,58 @@ git_in() {
 
 proc_args() {
     [ -r "/proc/$1/cmdline" ] || return 1
-    tr '\0' ' ' <"/proc/$1/cmdline" | sed 's/ *$//' | cut -c1-200
+    { tr '\0' ' ' <"/proc/$1/cmdline"; } 2>/dev/null | sed 's/ *$//' | cut -c1-200
+}
+
+proc_comm() {
+    comm=$(sed -n 's/^[0-9]* (\(.*\)) [^)]*$/\1/p' "/proc/$1/stat" 2>/dev/null)
+    [ -n "$comm" ] || return 1
+    echo "$comm"
 }
 
 proc_stat() {
     [ -r "/proc/$1/stat" ] || return 1
-    stat_line=$(sed 's/^.*) //' "/proc/$1/stat" | awk '{print $2, $4, $20}')
+    stat_line=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $2, $4, $20, $5}')
     [ -n "$stat_line" ] || return 1
     echo "$stat_line"
+}
+
+proc_environ() {
+    { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null
+}
+
+environ_state() {
+    if { true <"/proc/$1/environ"; } 2>/dev/null; then
+        echo read
+    else
+        echo denied
+    fi
+}
+
+tty_name() {
+    [ "$1" -ne 0 ] || return 1
+    major=$((($1 >> 8) & 4095))
+    minor=$((($1 & 255) | (($1 >> 12) & 1048320)))
+    case $major in
+        13[6-9] | 14[0-3]) echo "/dev/pts/$((minor + (major - 136) * 256))" ;;
+        229) echo "/dev/hvc$minor" ;;
+        *) echo "tty:$major:$minor" ;;
+    esac
 }
 
 proc_json() {
     pid=$1
     stat_line=$(proc_stat "$pid") || return 1
-    read -r ppid sid ticks <<EOF
+    read -r ppid sid ticks ttynr <<EOF
 $stat_line
 EOF
-    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || exe=
-    tty=$(readlink "/proc/$pid/fd/0" 2>/dev/null) || tty=
+    comm=$(proc_comm "$pid") || return 1
+    tty=$(tty_name "$ttynr") || tty=
     args=$(proc_args "$pid") || args=
     jq -cn \
         --argjson pid "$pid" --argjson ppid "$ppid" --argjson sid "$sid" --argjson ticks "$ticks" \
-        --arg exe "$exe" --arg args "$args" --arg tty "$tty" \
-        "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, exe: ($exe | n), args: $args, start_ticks: $ticks, tty: ($tty | n)}'
+        --arg comm "$comm" --arg args "$args" --arg tty "$tty" \
+        "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, comm: $comm, args: $args, start_ticks: $ticks, tty: ($tty | n)}'
 }
 
 collect_processes() {
@@ -168,13 +198,12 @@ EOF
         proc_json "$main_pid" >"$work/main.json"
         for dir in /proc/[0-9]*; do
             pid=${dir#/proc/}
-            exe=$(readlink "$dir/exe" 2>/dev/null) || continue
-            [ "$exe" = "$CODEX_BIN" ] || continue
             stat_line=$(proc_stat "$pid") || continue
-            read -r ppid _ _ <<EOF
+            read -r ppid _ <<EOF
 $stat_line
 EOF
             [ "$ppid" = "$main_pid" ] || continue
+            [ "$(proc_comm "$pid")" = "$CODEX_COMM" ] || continue
             proc_json "$pid" >>"$work/codex.ndjson"
         done
     fi
@@ -183,7 +212,7 @@ EOF
     cur=$self_pid
     while [ "$cur" -gt 1 ]; do
         stat_line=$(proc_stat "$cur") || break
-        read -r cur _ _ <<EOF
+        read -r cur _ <<EOF
 $stat_line
 EOF
         if [ -n "$main_pid" ] && [ "$cur" = "$main_pid" ]; then
@@ -273,14 +302,14 @@ token_kinds() {
 }
 
 credential_variables() {
-    awk '
+    awk -v source="$1" '
         /^[A-Za-z_][A-Za-z0-9_]*=/ {
             name = $0
             sub(/=.*/, "", name)
             value = substr($0, length(name) + 2)
             if (name != "SSH_AUTH_SOCK" && name ~ /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)/) {
                 kind = (value == "") ? "empty" : ((value ~ /^openshell:resolve:/) ? "placeholder" : "other")
-                print name "\t" kind
+                print name "\t" kind "\t" source
             }
         }'
 }
@@ -455,20 +484,48 @@ step_J07() (
         '{processes: $p[0], codex_exec: $x[0]}' >"$work/facts"
 )
 
+agent_env() {
+    [ -n "$2" ] || {
+        echo absent
+        return 0
+    }
+    state=$(environ_state "$2")
+    [ "$state" != read ] || proc_environ "$2" | credential_variables "$1" >>"$work/variables.tsv"
+    echo "$state"
+}
+
 step_J08() (
+    : >"$work/variables.tsv"
     main_pid=
+    codex_pid=
     if collect_processes 2>/dev/null; then
         main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
+        codex_pid=$(jq -r '.codex[0].pid // empty' "$work/processes.json")
     fi
-    {
-        env | credential_variables
-        if [ -n "$main_pid" ]; then
-            tr '\0' '\n' <"/proc/$main_pid/environ" 2>/dev/null | credential_variables
-        fi
-    } | sort -u >"$work/variables.tsv"
-    environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1]}]' <"$work/variables.tsv")
+    env | credential_variables probe >>"$work/variables.tsv"
+    launch_files=0
+    for file in "$JACKIN_DIR"/env-*; do
+        [ -f "$file" ] || continue
+        launch_files=$((launch_files + 1))
+        sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$file" 2>/dev/null | credential_variables launch_env >>"$work/variables.tsv"
+    done
+    read_from="the probe environment, $launch_files launch env file(s)"
+    unread_from=
+    main_env=$(agent_env main "$main_pid")
+    codex_env=$(agent_env codex "$codex_pid")
+    case $main_env in
+        read) read_from="$read_from, the main environment" ;;
+        denied) unread_from="the main environment (pid $main_pid, denied)" ;;
+    esac
+    case $codex_env in
+        read) read_from="$read_from, the Codex environment" ;;
+        denied) unread_from="${unread_from:+$unread_from; }the Codex environment (pid $codex_pid, denied)" ;;
+    esac
+    sort -u -o "$work/variables.tsv" "$work/variables.tsv"
+    environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
     others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | join(" ")')
     placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder")] | length')
+    scope="checked: $read_from, $CODEX_HOME_DIR/auth.json, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
     auth_file=null
     auth_problem=
     auth="$CODEX_HOME_DIR/auth.json"
@@ -489,12 +546,12 @@ EOF
     fi
     leaks=$(scan_leaks | jq -Rn '[inputs]')
     if [ "$placeholders" -eq 0 ] && [ "$auth_file" = null ]; then
-        skip credential "the sandbox holds no credential"
+        skip credential "the sandbox holds no credential ($scope)"
     else
-        pass credential "$placeholders placeholder variables, auth.json present: $([ "$auth_file" = null ] && echo no || echo yes)"
+        pass credential "$placeholders placeholder variables, auth.json present: $([ "$auth_file" = null ] && echo no || echo yes) ($scope)"
     fi
     if [ -z "$others" ]; then
-        pass environment "every credential variable is a placeholder or empty"
+        pass environment "every credential variable is a placeholder or empty in: $read_from"
     else
         fail environment "not a placeholder: $others"
     fi
@@ -509,7 +566,9 @@ EOF
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
     fi
     jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
-        '{environment: $environment, auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
+        --arg main_env "$main_env" --arg codex_env "$codex_env" \
+        '{environment: $environment, agent_environment: {main: $main_env, codex: $codex_env},
+          auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
 )
 
 step_J09() (
@@ -890,7 +949,7 @@ main() {
         fi
         finish "$id"
     done
-    cat "$work"/step.J* | jq -cs --arg mode "$mode" --arg docker "$docker" \
+    cat "$work"/step.J* | jq -cMs --arg mode "$mode" --arg docker "$docker" \
         '{schema: 1, probe: "jackin-sentinel-probe", mode: $mode, docker: $docker, steps: add}'
 }
 
