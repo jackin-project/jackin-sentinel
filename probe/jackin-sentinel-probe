@@ -1,0 +1,897 @@
+#!/usr/bin/env sh
+
+# SPDX-FileCopyrightText: 2026 Alexey Zhokhov
+# SPDX-License-Identifier: Apache-2.0
+
+set -u
+
+PROBE=jackin-sentinel-probe
+VERSION=1
+PROJECT=/sandbox/project
+STATE_DIR=/sandbox/.sentinel
+JACKIN_DIR=/sandbox/.jackin
+CODEX_HOME_DIR=/sandbox/.codex
+CODEX_BIN=/usr/local/bin/codex
+START_BIN=/usr/local/bin/jackin-start
+HOOK_DIR=/usr/local/lib/jackin/hooks
+SCAN_ROOT=/sandbox
+PROMPT='Reply with the word ready'
+ALL_STEPS='J00 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 J14 J15 J16'
+JQN='def n: if . == "" then null else . end;'
+
+usage() {
+    echo "usage: $PROBE [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]" >&2
+    echo "       $PROBE --version" >&2
+    exit 64
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+check() {
+    detail=$3
+    if [ "$2" != PASS ] && [ -z "$detail" ]; then
+        detail="no detail"
+    fi
+    jq -cn --arg name "$1" --arg result "$2" --arg detail "$detail" \
+        '{name: $name, result: $result, detail: ($detail | .[0:300])}' >>"$work/checks"
+}
+
+pass() {
+    check "$1" PASS "${2-}"
+}
+
+fail() {
+    check "$1" FAIL "$2"
+}
+
+skip() {
+    check "$1" SKIP "$2"
+}
+
+finish() {
+    jq -cn --arg id "$1" --slurpfile checks "$work/checks" --slurpfile facts "$work/facts" '
+        ($checks
+            + (if ($checks | length) == 0
+               then [{name: "checks", result: "FAIL", detail: "the step recorded no check"}]
+               else [] end)
+            + (if $facts[0] == null and all($checks[]; .result != "SKIP")
+               then [{name: "facts", result: "FAIL", detail: "the step collected no facts"}]
+               else [] end)) as $c
+        | (if any($c[]; .result == "FAIL") then "FAIL"
+           elif any($c[]; .result == "SKIP") then "SKIP"
+           else "PASS" end) as $r
+        | {($id): {
+            result: $r,
+            reason: (if $r == "PASS" then ""
+                     else ([$c[] | select(.result == $r) | "\(.name): \(.detail)"] | join("; ") | .[0:600])
+                     end),
+            checks: $c,
+            facts: ($facts[0] // null)}}' >"$work/step.$1"
+}
+
+selected() {
+    [ -z "$only" ] && return 0
+    case ",$only," in
+        *",$1,"*) return 0 ;;
+    esac
+    return 1
+}
+
+require_sandbox() {
+    if [ "$(uname -s)" = Linux ] && [ "$(id -un)" = sandbox ] && [ -d /sandbox ]; then
+        return 0
+    fi
+    echo "$PROBE: refusing to run outside a sandbox; use --host for a dry run" >&2
+    exit 66
+}
+
+count_lines() {
+    if [ -f "$1" ]; then
+        wc -l <"$1" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+count_matches() {
+    n=0
+    if [ -f "$2" ]; then
+        n=$(grep -c "$1" "$2" 2>/dev/null)
+    fi
+    echo "${n:-0}"
+}
+
+file_meta() {
+    stat -c '%u %a' "$1" 2>/dev/null
+}
+
+git_in() {
+    git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$PROJECT" "$@"
+}
+
+proc_args() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\0' ' ' <"/proc/$1/cmdline" | sed 's/ *$//' | cut -c1-200
+}
+
+proc_stat() {
+    [ -r "/proc/$1/stat" ] || return 1
+    stat_line=$(sed 's/^.*) //' "/proc/$1/stat" | awk '{print $2, $4, $20}')
+    [ -n "$stat_line" ] || return 1
+    echo "$stat_line"
+}
+
+proc_json() {
+    pid=$1
+    stat_line=$(proc_stat "$pid") || return 1
+    read -r ppid sid ticks <<EOF
+$stat_line
+EOF
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || exe=
+    tty=$(readlink "/proc/$pid/fd/0" 2>/dev/null) || tty=
+    args=$(proc_args "$pid") || args=
+    jq -cn \
+        --argjson pid "$pid" --argjson ppid "$ppid" --argjson sid "$sid" --argjson ticks "$ticks" \
+        --arg exe "$exe" --arg args "$args" --arg tty "$tty" \
+        "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, exe: ($exe | n), args: $args, start_ticks: $ticks, tty: ($tty | n)}'
+}
+
+collect_processes() {
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
+    run_state=$(head -n 1 "$JACKIN_DIR/run/state" 2>/dev/null) || run_state=
+    main_pid=
+    for dir in /proc/[0-9]*; do
+        pid=${dir#/proc/}
+        args=$(proc_args "$pid") || continue
+        case $args in
+            *"$START_BIN"*) ;;
+            *) continue ;;
+        esac
+        stat_line=$(proc_stat "$pid") || continue
+        read -r ppid _ _ <<EOF
+$stat_line
+EOF
+        if parent=$(proc_args "$ppid"); then
+            case $parent in
+                *"$START_BIN"*) continue ;;
+            esac
+        fi
+        main_pid=$pid
+        break
+    done
+    self_pid=$$
+    : >"$work/main.json"
+    : >"$work/codex.ndjson"
+    if [ -n "$main_pid" ]; then
+        proc_json "$main_pid" >"$work/main.json"
+        for dir in /proc/[0-9]*; do
+            pid=${dir#/proc/}
+            exe=$(readlink "$dir/exe" 2>/dev/null) || continue
+            [ "$exe" = "$CODEX_BIN" ] || continue
+            stat_line=$(proc_stat "$pid") || continue
+            read -r ppid _ _ <<EOF
+$stat_line
+EOF
+            [ "$ppid" = "$main_pid" ] || continue
+            proc_json "$pid" >>"$work/codex.ndjson"
+        done
+    fi
+    proc_json "$self_pid" >"$work/self.json"
+    descends=false
+    cur=$self_pid
+    while [ "$cur" -gt 1 ]; do
+        stat_line=$(proc_stat "$cur") || break
+        read -r cur _ _ <<EOF
+$stat_line
+EOF
+        if [ -n "$main_pid" ] && [ "$cur" = "$main_pid" ]; then
+            descends=true
+            break
+        fi
+    done
+    jq -n --arg boot_id "$boot_id" --arg run_state "$run_state" --argjson descends "$descends" \
+        --slurpfile main "$work/main.json" --slurpfile codex "$work/codex.ndjson" --slurpfile self "$work/self.json" \
+        "$JQN"'{boot_id: $boot_id, run_state: ($run_state | n), main: ($main[0] // null), codex: $codex,
+          self: $self[0], self_descends_from_main: $descends}' >"$work/processes.json"
+}
+
+process_checks() {
+    main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
+    state=$(jq -r '.run_state // ""' "$work/processes.json")
+    codex_count=$(jq -r '.codex | length' "$work/processes.json")
+    if [ -n "$main_pid" ]; then
+        pass main_process "pid $main_pid"
+    else
+        fail main_process "no process runs $START_BIN"
+    fi
+    case $state in
+        running*)
+            if [ "$codex_count" -gt 0 ]; then
+                pass codex_child "$codex_count Codex process as a child of the main process"
+            else
+                fail codex_child "state is $state but the main process has no Codex child"
+            fi
+            ;;
+        *) skip codex_child "jackin-start state is '${state:-unknown}', not running" ;;
+    esac
+}
+
+ensure_codex_exec() {
+    [ -f "$work/codex_exec.json" ] && return 0
+    credential=none
+    if [ -f "$CODEX_HOME_DIR/auth.json" ] && jq -e '(.tokens.access_token // "") != ""' "$CODEX_HOME_DIR/auth.json" >/dev/null 2>&1; then
+        credential=chatgpt_login
+    elif [ -n "${OPENAI_API_KEY-}" ]; then
+        credential=api_key
+    fi
+    attempted=false
+    exit_code=
+    answered=false
+    bytes=0
+    if [ "$credential" != none ]; then
+        attempted=true
+        out=$(cd "$SCAN_ROOT" && timeout 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 2>/dev/null </dev/null)
+        exit_code=$?
+        bytes=$(printf '%s' "$out" | wc -c | tr -d ' ')
+        if printf '%s' "$out" | grep -qi 'ready'; then
+            answered=true
+        fi
+    fi
+    jq -n --arg credential "$credential" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
+        --argjson answered "$answered" --argjson bytes "$bytes" \
+        "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
+          answered: $answered, output_bytes: $bytes}' >"$work/codex_exec.json"
+}
+
+egress() {
+    url=$1
+    bearer=${2-}
+    if [ -n "$bearer" ]; then
+        printf 'Authorization: Bearer %s\n' "$bearer" >"$work/header"
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
+        rc=$?
+    else
+        code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null </dev/null)
+        rc=$?
+    fi
+    jq -cn --arg url "$url" --argjson rc "$rc" --arg code "${code:-000}" \
+        '{url: $url, curl_exit: $rc, http_code: ($code | tonumber)}'
+}
+
+token_kinds() {
+    jq -r '
+        def kind($k):
+            ((.tokens[$k] // (if $k == "access_token" then .OPENAI_API_KEY else null end))) as $v
+            | if $v == null then "absent"
+              elif $v == "" then "empty"
+              elif $k == "id_token" then (if ($v | endswith(".placeholder")) then "placeholder" else "other" end)
+              elif ($v | startswith("openshell:resolve:")) then "placeholder"
+              else "other" end;
+        [kind("access_token"), kind("refresh_token"), kind("id_token")] | @tsv' "$1"
+}
+
+credential_variables() {
+    awk '
+        /^[A-Za-z_][A-Za-z0-9_]*=/ {
+            name = $0
+            sub(/=.*/, "", name)
+            value = substr($0, length(name) + 2)
+            if (name != "SSH_AUTH_SOCK" && name ~ /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)/) {
+                kind = (value == "") ? "empty" : ((value ~ /^openshell:resolve:/) ? "placeholder" : "other")
+                print name "\t" kind
+            }
+        }'
+}
+
+scan_leaks() {
+    find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f -size -2048k -print0 2>/dev/null |
+        xargs -0 -r grep -IlE -e 'sk-[A-Za-z0-9_-]{20,}' \
+            -e 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' \
+            -e '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' 2>/dev/null |
+        while IFS= read -r file; do
+            if grep -qE -e 'sk-[A-Za-z0-9_-]{20,}' -e '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$file" 2>/dev/null ||
+                grep -oE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' "$file" 2>/dev/null | grep -qv '\.placeholder$'; then
+                printf '%s\n' "$file"
+            fi
+        done | head -n 50
+}
+
+try_create() {
+    (
+        set -C
+        : >"$1"
+    ) 2>/dev/null
+}
+
+step_J00() (
+    present=false
+    executable=false
+    version=
+    [ -e "$CODEX_BIN" ] && present=true
+    if [ -f "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]; then
+        executable=true
+    fi
+    if [ "$executable" = true ]; then
+        home=$(mktemp -d "$work/codexhome.XXXXXX")
+        if version=$(CODEX_HOME=$home timeout 30 "$CODEX_BIN" --version 2>/dev/null </dev/null); then
+            pass codex_version "$version"
+        else
+            version=
+            fail codex_version "codex --version failed"
+        fi
+    else
+        fail codex_binary "$CODEX_BIN is not an executable file"
+    fi
+    jq -n --arg path "$CODEX_BIN" --argjson present "$present" --argjson executable "$executable" --arg version "$version" \
+        "$JQN"'{codex: {path: $path, present: $present, executable: $executable, version: ($version | n)}}' >"$work/facts"
+)
+
+step_J04() (
+    user=$(id -un)
+    uid=$(id -u)
+    gid=$(id -g)
+    home=${HOME-}
+    sudo_found=false
+    sudo_works=false
+    docker_binary=false
+    if have sudo; then
+        sudo_found=true
+        if timeout 5 sudo -n true >/dev/null 2>&1 </dev/null; then
+            sudo_works=true
+        fi
+    fi
+    if have docker; then
+        docker_binary=true
+    fi
+    if [ "$user" = sandbox ] && [ "$uid" = 1000 ] && [ "$gid" = 1000 ]; then
+        pass identity "$user uid=$uid gid=$gid"
+    else
+        fail identity "expected sandbox uid=1000 gid=1000, found $user uid=$uid gid=$gid"
+    fi
+    if [ "$sudo_works" = false ]; then
+        pass sudo "sudo found=$sudo_found works=false"
+    else
+        fail sudo "sudo works"
+    fi
+    if [ "$docker_binary" = true ] && [ "$docker" = off ]; then
+        fail docker_binary "a docker binary exists but the Docker capability is off"
+    elif [ "$docker_binary" = false ] && [ "$docker" = on ]; then
+        fail docker_binary "no docker binary but the Docker capability is on"
+    else
+        pass docker_binary "found=$docker_binary with the capability $docker"
+    fi
+    jq -n --arg user "$user" --argjson uid "$uid" --argjson gid "$gid" --arg home "$home" \
+        --argjson sudo_found "$sudo_found" --argjson sudo_works "$sudo_works" --argjson docker_binary "$docker_binary" \
+        '{user: $user, uid: $uid, gid: $gid, home: $home, sudo: {found: $sudo_found, works: $sudo_works}, docker_binary: $docker_binary}' >"$work/facts"
+)
+
+step_J05() (
+    git_work_tree=false
+    files='[]'
+    if [ -d "$PROJECT" ]; then
+        pass project_dir "$PROJECT"
+        if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+            git_work_tree=true
+        fi
+        files=$(cd "$PROJECT" && find . -path ./.git -prune -o -type f -print0 | xargs -0 -r sha256sum |
+            jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})  (?<path>.*)$")? | .path |= ltrimstr("./")] | sort_by(.path)')
+    else
+        fail project_dir "$PROJECT is missing"
+    fi
+    if [ "$git_work_tree" = true ]; then
+        pass git_work_tree "$PROJECT"
+    else
+        fail git_work_tree "$PROJECT is not a git work tree"
+    fi
+    total=$(printf '%s' "$files" | jq 'length')
+    if [ "$total" -gt 0 ]; then
+        pass files "$total files"
+    else
+        fail files "the project holds no file"
+    fi
+    jq -n --arg project "$PROJECT" --argjson tree "$git_work_tree" --argjson files "$files" \
+        '{project: $project, git_work_tree: $tree, files: $files}' >"$work/facts"
+)
+
+step_J06() (
+    setup_runs=$(count_lines "$STATE_DIR/setup.log")
+    preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
+    preflight_failures=$(count_matches '^preflight fail' "$STATE_DIR/preflight.log")
+    : >"$work/hooks.ndjson"
+    exposed=
+    for name in setup preflight; do
+        path=$HOOK_DIR/$name
+        meta=$(file_meta "$path") || meta="65534 000"
+        read -r uid mode <<EOF
+$meta
+EOF
+        writable=false
+        if [ -w "$path" ] || [ -w "$HOOK_DIR" ]; then
+            writable=true
+        fi
+        if [ ! -e "$path" ] || [ "$writable" = true ] || [ "$uid" != 0 ]; then
+            exposed="$exposed $name"
+        fi
+        jq -cn --arg name "$name" --arg path "$path" --argjson uid "$uid" --arg mode "$mode" --argjson writable "$writable" \
+            '{name: $name, path: $path, uid: $uid, mode: $mode, writable: $writable}' >>"$work/hooks.ndjson"
+    done
+    if [ "$setup_runs" = 1 ]; then
+        pass setup_runs "setup ran once"
+    else
+        fail setup_runs "setup ran $setup_runs times, expected once"
+    fi
+    if [ "$preflight_runs" -ge 1 ]; then
+        pass preflight_runs "preflight ran $preflight_runs times, $preflight_failures failed"
+    else
+        fail preflight_runs "preflight never ran"
+    fi
+    if [ -z "$exposed" ]; then
+        pass hooks_immutable "both hooks are root-owned and not writable"
+    else
+        fail hooks_immutable "missing, not root-owned or writable:$exposed"
+    fi
+    jq -n --arg state_dir "$STATE_DIR" --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
+        --argjson failures "$preflight_failures" --slurpfile hooks "$work/hooks.ndjson" \
+        '{state_dir: $state_dir, setup_runs: $setup, preflight_runs: $preflight, preflight_failures: $failures, hooks: $hooks}' >"$work/facts"
+)
+
+step_J07() (
+    collect_processes
+    ensure_codex_exec
+    process_checks
+    attempted=$(jq -r '.attempted' "$work/codex_exec.json")
+    if [ "$attempted" = true ]; then
+        if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
+            pass codex_exec "codex exec answered the fixed prompt"
+        else
+            fail codex_exec "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
+        fi
+    else
+        skip codex_exec "the sandbox holds no credential"
+    fi
+    jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/codex_exec.json" \
+        '{processes: $p[0], codex_exec: $x[0]}' >"$work/facts"
+)
+
+step_J08() (
+    main_pid=
+    if collect_processes 2>/dev/null; then
+        main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
+    fi
+    {
+        env | credential_variables
+        if [ -n "$main_pid" ]; then
+            tr '\0' '\n' <"/proc/$main_pid/environ" 2>/dev/null | credential_variables
+        fi
+    } | sort -u >"$work/variables.tsv"
+    environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1]}]' <"$work/variables.tsv")
+    others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | join(" ")')
+    placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder")] | length')
+    auth_file=null
+    auth_problem=
+    auth="$CODEX_HOME_DIR/auth.json"
+    if [ -f "$auth" ]; then
+        kinds=$(token_kinds "$auth") || kinds=
+        read -r access refresh idt <<EOF
+$kinds
+EOF
+        meta=$(file_meta "$auth") || meta="65534 000"
+        read -r _ mode <<EOF
+$meta
+EOF
+        auth_file=$(jq -n --arg path "$auth" --arg mode "$mode" --arg a "${access:-other}" --arg r "${refresh:-other}" --arg i "${idt:-other}" \
+            '{path: $path, mode: $mode, access_token: $a, refresh_token: $r, id_token: $i}')
+        for kind in "${access:-other}" "${refresh:-other}" "${idt:-other}"; do
+            [ "$kind" = other ] && auth_problem=1
+        done
+    fi
+    leaks=$(scan_leaks | jq -Rn '[inputs]')
+    if [ "$placeholders" -eq 0 ] && [ "$auth_file" = null ]; then
+        skip credential "the sandbox holds no credential"
+    else
+        pass credential "$placeholders placeholder variables, auth.json present: $([ "$auth_file" = null ] && echo no || echo yes)"
+    fi
+    if [ -z "$others" ]; then
+        pass environment "every credential variable is a placeholder or empty"
+    else
+        fail environment "not a placeholder: $others"
+    fi
+    if [ -z "$auth_problem" ]; then
+        pass auth_file "auth.json holds only placeholders and empty values"
+    else
+        fail auth_file "auth.json holds a token that is not a placeholder"
+    fi
+    if [ "$leaks" = '[]' ]; then
+        pass file_scan "no token-shaped string outside the project"
+    else
+        fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
+    fi
+    jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
+        '{environment: $environment, auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
+)
+
+step_J09() (
+    ensure_codex_exec
+    outside=$(egress https://example.com)
+    metadata=$(egress http://169.254.169.254/latest/meta-data/)
+    bearer=
+    if [ "${CODEX_AUTH_ACCESS_TOKEN-}" != "" ]; then
+        bearer=$CODEX_AUTH_ACCESS_TOKEN
+    elif [ "${OPENAI_API_KEY-}" != "" ]; then
+        bearer=$OPENAI_API_KEY
+    fi
+    case $bearer in
+        openshell:resolve:*) provider=$(egress https://api.openai.com/v1/models "$bearer") ;;
+        *)
+            provider=null
+            ;;
+    esac
+    if [ "$(jq -r '.attempted' "$work/codex_exec.json")" = true ]; then
+        if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
+            pass codex_reaches_api "codex exec answered"
+        else
+            fail codex_reaches_api "codex exec gave no answer"
+        fi
+    else
+        skip codex_reaches_api "the sandbox holds no credential"
+    fi
+    if [ "$(printf '%s' "$outside" | jq -r '.http_code')" = 0 ]; then
+        pass outside_host_denied "no response from example.com"
+    else
+        fail outside_host_denied "example.com answered $(printf '%s' "$outside" | jq -r '.http_code')"
+    fi
+    if [ "$(printf '%s' "$metadata" | jq -r '.http_code')" = 0 ]; then
+        pass metadata_denied "no response from 169.254.169.254"
+    else
+        fail metadata_denied "169.254.169.254 answered $(printf '%s' "$metadata" | jq -r '.http_code')"
+    fi
+    if [ "$provider" = null ]; then
+        skip provider_no_credential "no placeholder to send"
+    else
+        code=$(printf '%s' "$provider" | jq -r '.http_code')
+        case $code in
+            2??) fail provider_no_credential "curl got HTTP $code from the provider host" ;;
+            *) pass provider_no_credential "curl got HTTP $code, no credential was applied" ;;
+        esac
+    fi
+    jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/codex_exec.json" \
+        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, codex_exec: $x[0]}' >"$work/facts"
+)
+
+step_J10() (
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    : >"$work/writes.ndjson"
+    allowed_failed=
+    denied_created=
+    attributed=
+    for expected in allowed denied; do
+        if [ "$expected" = allowed ]; then
+            dirs="$STATE_DIR /tmp"
+        else
+            dirs="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
+        fi
+        for dir in $dirs; do
+            [ -d "$dir" ] || continue
+            path="$dir/jackin-sentinel-j10-$$"
+            dac=false
+            [ -w "$dir" ] && dac=true
+            created=false
+            if try_create "$path"; then
+                created=true
+                rm -f "$path"
+            fi
+            if [ "$expected" = allowed ] && [ "$created" = false ]; then
+                allowed_failed="$allowed_failed $dir"
+            fi
+            if [ "$expected" = denied ] && [ "$created" = true ]; then
+                denied_created="$denied_created $dir"
+            fi
+            if [ "$expected" = denied ] && [ "$created" = false ] && [ "$dac" = true ]; then
+                attributed="$attributed $dir"
+            fi
+            jq -cn --arg path "$path" --arg expected "$expected" --argjson dac "$dac" --argjson created "$created" \
+                '{path: $path, expected: $expected, dac_writable: $dac, created: $created}' >>"$work/writes.ndjson"
+        done
+    done
+    if [ -z "$allowed_failed" ]; then
+        pass allowed_writes "files can be created under $STATE_DIR and /tmp"
+    else
+        fail allowed_writes "cannot create a file in:$allowed_failed"
+    fi
+    if [ -z "$denied_created" ]; then
+        pass denied_writes "no file could be created at a denied path"
+    else
+        fail denied_writes "a file was created in:$denied_created"
+    fi
+    if [ -n "$attributed" ]; then
+        pass denial_by_policy "denied although the mode allows the write:$attributed"
+    else
+        fail denial_by_policy "no denied path was writable by mode, so the policy is not proven"
+    fi
+    jq -n --slurpfile writes "$work/writes.ndjson" '{writes: $writes}' >"$work/facts"
+)
+
+step_J11() (
+    collect_processes
+    process_checks
+    jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
+)
+
+step_J12() (
+    collect_processes
+    if [ "$(jq -r '.self_descends_from_main' "$work/processes.json")" = false ]; then
+        pass not_descendant "the probe is not a descendant of the main process"
+    else
+        fail not_descendant "the probe runs below the main process"
+    fi
+    self_tty=$(jq -r '.self.tty // ""' "$work/processes.json")
+    codex_tty=$(jq -r '.codex[0].tty // ""' "$work/processes.json")
+    if [ -z "$self_tty" ] || [ -z "$codex_tty" ]; then
+        skip distinct_tty "the tty of the probe or of Codex is unknown"
+    elif [ "$self_tty" != "$codex_tty" ]; then
+        pass distinct_tty "probe $self_tty, Codex $codex_tty"
+    else
+        fail distinct_tty "the probe and Codex share $self_tty"
+    fi
+    jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
+)
+
+step_J13() (
+    work_tree=false
+    branch=
+    head=
+    clean=true
+    stash=0
+    branches='[]'
+    if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        work_tree=true
+        branch=$(git_in symbolic-ref --short -q HEAD 2>/dev/null)
+        head=$(git_in rev-parse -q --verify HEAD 2>/dev/null)
+        if [ -n "$(git_in status --porcelain 2>/dev/null)" ]; then
+            clean=false
+        fi
+        stash=$(git_in stash list 2>/dev/null | wc -l | tr -d ' ')
+        branches=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>/dev/null |
+            jq -Rn '[inputs | split(" ") | {name: .[0], tip: .[1]}]')
+    fi
+    if [ "$work_tree" = true ]; then
+        pass work_tree "$PROJECT"
+    else
+        fail work_tree "$PROJECT is not a git work tree"
+    fi
+    if [ -n "$head" ]; then
+        pass head "$head"
+    else
+        fail head "HEAD is unborn or unreadable"
+    fi
+    jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
+        --argjson branches "$branches" --argjson clean "$clean" --argjson stash "$stash" \
+        "$JQN"'{project: $project, work_tree: $work_tree, branch: ($branch | n), head: ($head | n), branches: $branches, clean: $clean, stash: $stash}' >"$work/facts"
+)
+
+step_J14() (
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
+    marker=$STATE_DIR/marker
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    created=false
+    if (
+        set -C
+        printf '%s\n' "$id" >"$marker"
+    ) 2>/dev/null; then
+        created=true
+    else
+        id=$(head -n 1 "$marker" 2>/dev/null) || id=
+    fi
+    setup_runs=$(count_lines "$STATE_DIR/setup.log")
+    preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
+    if printf '%s' "$id" | grep -qE '^[0-9a-f]{32}$'; then
+        pass marker "created=$created id=$id"
+    else
+        fail marker "the marker file $marker holds no valid id"
+    fi
+    if [ -n "$boot_id" ]; then
+        pass boot_id "$boot_id"
+    else
+        fail boot_id "/proc/sys/kernel/random/boot_id is unreadable"
+    fi
+    jq -n --arg boot_id "$boot_id" --arg path "$marker" --arg id "$id" --argjson created "$created" \
+        --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
+        '{boot_id: $boot_id, marker: {path: $path, id: $id, created: $created}, setup_runs: $setup, preflight_runs: $preflight}' >"$work/facts"
+)
+
+step_J15() (
+    if [ "$docker" != on ]; then
+        skip docker_capability "the Docker capability is off (--docker on selects this step)"
+        return 0
+    fi
+    docker_path=$(command -v docker 2>/dev/null) || docker_path=
+    found=false
+    [ -n "$docker_path" ] && found=true
+    cert_dir=$JACKIN_DIR/docker
+    : >"$work/certs.ndjson"
+    cert_problem=
+    for name in ca.pem cert.pem key.pem; do
+        meta=$(file_meta "$cert_dir/$name") || meta="65534 000"
+        read -r _ mode <<EOF
+$meta
+EOF
+        [ -f "$cert_dir/$name" ] || cert_problem="$cert_problem $name"
+        if [ "$name" = key.pem ] && [ "$mode" != 600 ]; then
+            cert_problem="$cert_problem key.pem-mode-$mode"
+        fi
+        jq -cn --arg name "$name" --arg mode "$mode" '{name: $name, mode: $mode}' >>"$work/certs.ndjson"
+    done
+    host=${DOCKER_HOST-}
+    tls=${DOCKER_TLS_VERIFY-}
+    cert_path=${DOCKER_CERT_PATH-}
+    run_exit=
+    hello=false
+    engine_id=
+    engine_version=
+    if [ "$found" = true ]; then
+        out=$(timeout 300 docker run --rm hello-world 2>&1 </dev/null)
+        run_exit=$?
+        if printf '%s' "$out" | grep -q 'Hello from Docker!'; then
+            hello=true
+        fi
+        if info=$(timeout 60 docker info --format '{{.ID}} {{.ServerVersion}}' 2>/dev/null </dev/null); then
+            read -r engine_id engine_version <<EOF
+$info
+EOF
+        fi
+    fi
+    if [ "$found" = true ]; then
+        pass docker_binary "$docker_path"
+    else
+        fail docker_binary "no docker binary on PATH"
+    fi
+    case $host in
+        tcp://host.openshell.internal:*)
+            if [ "$tls" = 1 ] && [ "$cert_path" = "$cert_dir" ]; then
+                pass environment "DOCKER_HOST=$host"
+            else
+                fail environment "DOCKER_TLS_VERIFY or DOCKER_CERT_PATH is wrong"
+            fi
+            ;;
+        *) fail environment "DOCKER_HOST is '${host:-unset}', expected tcp://host.openshell.internal:<port>" ;;
+    esac
+    if [ -z "$cert_problem" ]; then
+        pass certificates "ca.pem, cert.pem and key.pem (mode 600) exist in $cert_dir"
+    else
+        fail certificates "problem:$cert_problem"
+    fi
+    if [ "$hello" = true ] && [ "$run_exit" = 0 ]; then
+        pass hello_world "docker run --rm hello-world printed the hello text"
+    else
+        fail hello_world "docker run --rm hello-world exit ${run_exit:-none}"
+    fi
+    if [ -n "$engine_id" ]; then
+        pass engine "$engine_id"
+    else
+        fail engine "docker info gave no engine id"
+    fi
+    jq -n --argjson found "$found" --arg path "$docker_path" --arg host "$host" --arg tls "$tls" --arg cert_path "$cert_path" \
+        --slurpfile certs "$work/certs.ndjson" --arg run_exit "$run_exit" --argjson hello "$hello" \
+        --arg engine_id "$engine_id" --arg engine_version "$engine_version" \
+        "$JQN"'{docker_binary: {found: $found, path: ($path | n)},
+          environment: {docker_host: ($host | n), tls_verify: ($tls | n), cert_path: ($cert_path | n)},
+          certificates: $certs,
+          run: {exit_code: ($run_exit | n | if . == null then null else tonumber end), hello: $hello},
+          engine: {id: ($engine_id | n), server_version: ($engine_version | n)}}' >"$work/facts"
+)
+
+step_J16() (
+    if [ "$docker" != off ]; then
+        skip docker_capability "the Docker capability is on (--docker off selects this step)"
+        return 0
+    fi
+    binary=false
+    have docker && binary=true
+    variables=$(env | sed -n 's/^\(DOCKER_[A-Za-z0-9_]*\)=.*/\1/p' | jq -Rn '[inputs]')
+    attempted=false
+    curl_exit=
+    http_code=0
+    if [ -n "$engine" ]; then
+        attempted=true
+        reply=$(egress "https://$engine/_ping")
+        curl_exit=$(printf '%s' "$reply" | jq -r '.curl_exit')
+        http_code=$(printf '%s' "$reply" | jq -r '.http_code')
+    fi
+    if [ "$binary" = false ]; then
+        pass docker_binary "no docker binary"
+    else
+        fail docker_binary "a docker binary exists"
+    fi
+    if [ "$variables" = '[]' ]; then
+        pass docker_variables "no DOCKER_ variable"
+    else
+        fail docker_variables "set: $(printf '%s' "$variables" | jq -r 'join(" ")')"
+    fi
+    if [ "$attempted" = false ]; then
+        skip engine_denied "no --engine endpoint was given"
+    elif [ "$curl_exit" = 6 ] || [ "$curl_exit" = 7 ]; then
+        pass engine_denied "no connection to $engine (curl exit $curl_exit)"
+    else
+        fail engine_denied "the connection to $engine was not refused (curl exit $curl_exit, HTTP $http_code)"
+    fi
+    jq -n --argjson binary "$binary" --argjson variables "$variables" --arg engine "$engine" \
+        --argjson attempted "$attempted" --arg curl_exit "$curl_exit" --argjson http_code "$http_code" \
+        "$JQN"'{docker_binary: $binary, docker_variables: $variables, endpoint: ($engine | n),
+          connection: {attempted: $attempted, curl_exit: ($curl_exit | n | if . == null then null else tonumber end), http_code: $http_code}}' >"$work/facts"
+)
+
+main() {
+    mode=sandbox
+    docker=off
+    engine=
+    only=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --version)
+                echo "$PROBE $VERSION"
+                exit 0
+                ;;
+            --host) mode=host ;;
+            --docker)
+                [ $# -ge 2 ] || usage
+                case $2 in
+                    on | off) docker=$2 ;;
+                    *) usage ;;
+                esac
+                shift
+                ;;
+            --engine)
+                [ $# -ge 2 ] || usage
+                case $2 in
+                    '' | *[!A-Za-z0-9.:-]* | *:*:* | :* | *:) usage ;;
+                    *:*[!0-9]*) usage ;;
+                    *:*) engine=$2 ;;
+                    *) usage ;;
+                esac
+                shift
+                ;;
+            --only)
+                [ $# -ge 2 ] || usage
+                only=$2
+                shift
+                ;;
+            *) usage ;;
+        esac
+        shift
+    done
+    if [ -n "$only" ]; then
+        [ -n "$(printf '%s' "$only" | tr -d ', ')" ] || usage
+        for id in $(printf '%s' "$only" | tr ',' ' '); do
+            case " $ALL_STEPS " in
+                *" $id "*) ;;
+                *) usage ;;
+            esac
+        done
+    fi
+    have jq || {
+        echo "$PROBE: jq is required" >&2
+        exit 69
+    }
+    [ "$mode" = host ] || require_sandbox
+    work=$(mktemp -d) || exit 70
+    trap 'rm -rf "$work"' EXIT
+    trap 'exit 70' INT TERM HUP
+    for id in $ALL_STEPS; do
+        selected "$id" || continue
+        : >"$work/checks"
+        : >"$work/facts"
+        if [ "$mode" = host ]; then
+            skip sandbox "not running in a sandbox (--host)"
+        else
+            "step_$id" || true
+        fi
+        finish "$id"
+    done
+    cat "$work"/step.J* | jq -cs --arg mode "$mode" --arg docker "$docker" \
+        '{schema: 1, probe: "jackin-sentinel-probe", mode: $mode, docker: $docker, steps: add}'
+}
+
+main "$@"

@@ -3,13 +3,6 @@
   "extends": [
     "config:best-practices"
   ],
-  "packageRules": [
-    {
-      "matchDatasources": ["docker"],
-      "matchPackageNames": ["projectjackin/construct"],
-      "versioning": "regex:^(?<major>\\d+)\\.(?<minor>\\d+)-trixie$"
-    }
-  ],
   "prHourlyLimit": 0,
   "prConcurrentLimit": 20,
   "commitBody": "Signed-off-by: Renovate Bot <renovate@whitesourcesoftware.com>"
