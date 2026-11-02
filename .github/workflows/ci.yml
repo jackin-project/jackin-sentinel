@@ -22,14 +22,7 @@ env:
   GH_HOST: ""
   GH_TOKEN: ""
   GITHUB_TOKEN: ""
-  MISE_AUTO_INSTALL: "false"
-  MISE_EXEC_AUTO_INSTALL: "false"
   MISE_GITHUB_TOKEN: ""
-  MISE_LOCKFILE: "0"
-  MISE_NO_CONFIG: "1"
-  MISE_NO_ENV: "1"
-  MISE_NO_HOOKS: "1"
-  MISE_QUIET: "1"
   NODE_AUTH_TOKEN: ""
   NPM_TOKEN: ""
 concurrency:
@@ -66,6 +59,11 @@ jobs:
           sha256: c72477ae6c3a8e7d817a322f43da70e4643e75ee5c21265f1c19c894273b7428
           version: 2026.10.8
       - name: Prepare pinned tools
+        env:
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
         run: mise --no-config --no-env --no-hooks install actionlint@1.7.12 shellcheck@0.11.0
       - name: Run actionlint
         run: env -u ACTIONS_ID_TOKEN_REQUEST_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_RUNTIME_TOKEN -u GITHUB_TOKEN -u MISE_GITHUB_TOKEN -u GH_TOKEN -u GH_HOST -u GH_CONFIG_DIR mise --no-config --no-env --no-hooks exec actionlint@1.7.12 shellcheck@0.11.0 -- actionlint -color
@@ -117,6 +115,11 @@ jobs:
           sha256: c72477ae6c3a8e7d817a322f43da70e4643e75ee5c21265f1c19c894273b7428
           version: 2026.10.8
       - name: Prepare pinned tools
+        env:
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
         run: mise --no-config --no-env --no-hooks install actionlint@1.7.12 shellcheck@0.11.0 zizmor@1.30.1
       - name: Acquire Velnor
         run: "sh -c 'unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR; d=\"$RUNNER_TEMP/velnor/bin/velnor-actions-0.1.12\"&&mkdir -p \"${d%/*}\"&&s=\"/opt/velnor/seed/generator/${d##*/}\"&&p=\"$VELNOR_ASSET_SHA256  \"&&if [ -f \"$s\" ]&&echo \"$p$s\"|sha256sum -c -;then cp \"$s\" \"$d\";else curl -fsSL --retry 5 --retry-all-errors --proto '\\''=https'\\'' --tlsv1.2 \"$VELNOR_ASSET_URL\" -o \"$d\"&&echo \"$p$d\"|sha256sum -c -;fi&&chmod +x \"$d\"'"
@@ -126,12 +129,25 @@ jobs:
           VELNOR_REQUEST_FILE: ${{ runner.temp }}/velnor/request/plan-v1-request.json
         run: "\"$RUNNER_TEMP\"'/velnor/bin/velnor-actions-0.1.12'"
       - name: Check generated files
+        env:
+          MISE_AUTO_INSTALL: "false"
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
         run: "sh -c 'unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR; $RUNNER_TEMP/velnor/bin/velnor-actions-0.1.12 generate --output-dir \"$RUNNER_TEMP/velnor-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\" && diff -r --brief .github \"$RUNNER_TEMP/velnor-actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/.github\"'"
       - name: Plan
         id: plan
         env:
           VELNOR_INTERNAL_OP: plan-v1
           VELNOR_REQUEST_FILE: ${{ runner.temp }}/velnor/request/plan-v1-request.json
+          MISE_AUTO_INSTALL: "false"
+          MISE_EXEC_AUTO_INSTALL: "false"
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
         run: "\"$RUNNER_TEMP\"'/velnor/bin/velnor-actions-0.1.12'"
       - name: Publish plan
         if: always()
@@ -198,8 +214,9 @@ jobs:
       contents: read
       actions: read
     needs:
-      - plan
       - actionlint
+      - plan
+      - task-test
     if: always()
     steps:
       - name: Setup Mise
@@ -216,6 +233,10 @@ jobs:
       - name: Prepare pinned tools
         env:
           MISE_CARGO_HOME: ${{ runner.temp }}/velnor/cargo
+          MISE_LOCKFILE: "0"
+          MISE_NO_CONFIG: "1"
+          MISE_NO_ENV: "1"
+          MISE_NO_HOOKS: "1"
           MISE_RUSTUP_HOME: ${{ runner.temp }}/velnor/rustup
         run: mise --no-config --no-env --no-hooks install gh@2.102.0
       - name: Download plan
@@ -234,14 +255,14 @@ jobs:
         env:
           VELNOR_INTERNAL_OP: write-request-v1
           VELNOR_NEEDS_JSON: ${{ toJSON(needs) }}
-          VELNOR_NEEDS_EXPECTED: "[\"actionlint\",\"plan\"]"
+          VELNOR_NEEDS_EXPECTED: "[\"actionlint\",\"plan\",\"task-test\"]"
           VELNOR_REQUEST_FILE: ${{ runner.temp }}/velnor/request/merge-v1-request.json
         run: "\"$RUNNER_TEMP\"'/velnor/bin/velnor-actions-0.1.12'"
       - name: Merge reports
         env:
           VELNOR_INTERNAL_OP: merge-v1
           VELNOR_NEEDS_JSON: ${{ toJSON(needs) }}
-          VELNOR_NEEDS_EXPECTED: "[\"actionlint\",\"plan\"]"
+          VELNOR_NEEDS_EXPECTED: "[\"actionlint\",\"plan\",\"task-test\"]"
           VELNOR_REQUEST_FILE: ${{ runner.temp }}/velnor/request/merge-v1-request.json
         run: "\"$RUNNER_TEMP\"'/velnor/bin/velnor-actions-0.1.12'"
       - name: Publish final report
@@ -252,3 +273,31 @@ jobs:
           name: velnor-final-r${{ github.run_id }}-a${{ github.run_attempt }}
           path: ${{ runner.temp }}/velnor/r${{ github.run_id }}-a${{ github.run_attempt }}/final-report.json
           retention-days: "30"
+  task-test:
+    name: Verify test
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: "false"
+      - name: Setup Mise
+        uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8
+        with:
+          cache: "false"
+          cache_save: "false"
+          env: "false"
+          install: "false"
+          sha256: c72477ae6c3a8e7d817a322f43da70e4643e75ee5c21265f1c19c894273b7428
+          version: 2026.10.8
+      - name: Install declared prebuilt task tools
+        env:
+          MISE_CARGO_BINSTALL_ONLY: "1"
+        run: "bash -c 'unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR; set -euo pipefail; for name in ${!MISE_@}; do unset \"$name\"; done; umask 077; task_root=\"${RUNNER_TEMP}/velnor-verification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-test\"; test -n \"$RUNNER_TEMP\" && test -n \"$GITHUB_WORKSPACE\" && test -n \"$GITHUB_RUN_ID\" && test -n \"$GITHUB_RUN_ATTEMPT\"; [[ \"$GITHUB_RUN_ID\" =~ ^[0-9]+$ ]]; [[ \"$GITHUB_RUN_ATTEMPT\" =~ ^[0-9]+$ ]]; /bin/mkdir -m 700 \"$task_root\"; /bin/mkdir -m 700 \"$task_root/home\" \"$task_root/home/config\" \"$task_root/home/data\" \"$task_root/home/cache\" \"$task_root/home/state\" \"$task_root/config\" \"$task_root/data\" \"$task_root/cache\" \"$task_root/state\" \"$task_root/cargo\" \"$task_root/rustup\"; export HOME=\"$task_root/home\"; export XDG_CONFIG_HOME=\"$task_root/home/config\"; export XDG_DATA_HOME=\"$task_root/home/data\"; export XDG_CACHE_HOME=\"$task_root/home/cache\"; export XDG_STATE_HOME=\"$task_root/home/state\"; export MISE_CONFIG_DIR=\"$task_root/config\"; export MISE_DATA_DIR=\"$task_root/data\"; export MISE_CACHE_DIR=\"$task_root/cache\"; export MISE_STATE_DIR=\"$task_root/state\"; export CARGO_HOME=\"$task_root/cargo\"; export RUSTUP_HOME=\"$task_root/rustup\"; export MISE_GLOBAL_CONFIG_FILE=\"$task_root/global.toml\"; export MISE_SYSTEM_CONFIG_FILE=\"$task_root/system.toml\"; export MISE_AUTO_INSTALL=false; export MISE_EXEC_AUTO_INSTALL=false; export MISE_TASK_RUN_AUTO_INSTALL=false; export MISE_AUTO_ENV=false; export MISE_NO_ENV=1; export MISE_CEILING_PATHS=\"$task_root\"; export MISE_TRUSTED_CONFIG_PATHS=\"$task_root\"; export MISE_NO_HOOKS=1; export MISE_CARGO_BINSTALL_ONLY=1; : > \"$task_root/global.toml\"; : > \"$task_root/system.toml\"; printf '\\''%s\\n'\\'' '\\''[tools.\"gitleaks\"]'\\'' '\\''version = \"8.30.1\"'\\'' '\\'''\\'' '\\''[tools.\"hadolint\"]'\\'' '\\''version = \"2.15.1\"'\\'' '\\'''\\'' '\\''[tools.\"prek\"]'\\'' '\\''version = \"0.5.9\"'\\'' '\\'''\\'' '\\''[tools.\"shellcheck\"]'\\'' '\\''version = \"0.11.0\"'\\'' '\\'''\\'' '\\''[tools.\"shfmt\"]'\\'' '\\''version = \"3.14.1\"'\\'' '\\'''\\'' '\\'''\\'' '\\''[settings]'\\'' '\\''lockfile = true'\\'' > \"$task_root/mise.toml\"; printf '\\''%s\\n'\\'' '\\''[[tools.\"gitleaks\"]]'\\'' '\\''version = \"8.30.1\"'\\'' '\\''backend = \"aqua:gitleaks/gitleaks\"'\\'' '\\'''\\'' '\\''[tools.\"gitleaks\".\"platforms.linux-x64\"]'\\'' '\\''checksum = \"sha256:551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb\"'\\'' '\\''url = \"https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz\"'\\'' '\\''url_api = \"https://api.github.com/repos/gitleaks/gitleaks/releases/assets/378332058\"'\\'' '\\'''\\'' '\\''[[tools.\"hadolint\"]]'\\'' '\\''version = \"2.15.1\"'\\'' '\\''backend = \"aqua:hadolint/hadolint\"'\\'' '\\'''\\'' '\\''[tools.\"hadolint\".\"platforms.linux-x64\"]'\\'' '\\''checksum = \"sha256:c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507\"'\\'' '\\''url = \"https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64\"'\\'' '\\''url_api = \"https://api.github.com/repos/hadolint/hadolint/releases/assets/496546506\"'\\'' '\\''provenance = \"github-attestations\"'\\'' '\\'''\\'' '\\''[[tools.\"prek\"]]'\\'' '\\''version = \"0.5.9\"'\\'' '\\''backend = \"aqua:j178/prek\"'\\'' '\\'''\\'' '\\''[tools.\"prek\".\"platforms.linux-x64\"]'\\'' '\\''checksum = \"sha256:2fee13923018dd517c19dba032ddcae8010cadfb81bc47e742ad5e8981a3f126\"'\\'' '\\''url = \"https://github.com/j178/prek/releases/download/v0.5.9/prek-x86_64-unknown-linux-gnu.tar.gz\"'\\'' '\\''url_api = \"https://api.github.com/repos/j178/prek/releases/assets/691760524\"'\\'' '\\''provenance = \"github-attestations\"'\\'' '\\'''\\'' '\\''[[tools.\"shellcheck\"]]'\\'' '\\''version = \"0.11.0\"'\\'' '\\''backend = \"aqua:koalaman/shellcheck\"'\\'' '\\'''\\'' '\\''[tools.\"shellcheck\".\"platforms.linux-x64\"]'\\'' '\\''checksum = \"sha256:8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198\"'\\'' '\\''url = \"https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz\"'\\'' '\\''url_api = \"https://api.github.com/repos/koalaman/shellcheck/releases/assets/279056942\"'\\'' '\\'''\\'' '\\''[[tools.\"shfmt\"]]'\\'' '\\''version = \"3.14.1\"'\\'' '\\''backend = \"aqua:mvdan/sh\"'\\'' '\\'''\\'' '\\''[tools.\"shfmt\".\"platforms.linux-x64\"]'\\'' '\\''checksum = \"sha256:76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf\"'\\'' '\\''url = \"https://github.com/mvdan/sh/releases/download/v3.14.1/shfmt_v3.14.1_linux_amd64\"'\\'' '\\''url_api = \"https://api.github.com/repos/mvdan/sh/releases/assets/547320883\"'\\'' > \"$task_root/mise.lock\"; cd -P \"$task_root\"; command -v jq > \"$task_root/jq_path.txt\"; IFS= read -r jq_path < \"$task_root/jq_path.txt\"; test -n \"$jq_path\"; test -x \"$jq_path\"; \"$jq_path\" --version | /usr/bin/grep -Fqx '\\''jq-1.8.2'\\''; mise --no-env --no-hooks config ls --json | \"$jq_path\" -r '\\''.[].path'\\'' | LC_ALL=C /usr/bin/sort > \"$task_root/actual_mise_configs.txt\"; printf '\\''%s\\n'\\'' \"$task_root/mise.toml\" \"$task_root/global.toml\" \"$task_root/system.toml\" | LC_ALL=C /usr/bin/sort | /usr/bin/cmp -s \"$task_root/actual_mise_configs.txt\" -; mise --no-env --locked --no-hooks install --jobs 2'"
+      - name: Run declared Mise task
+        env:
+          MISE_CARGO_BINSTALL_ONLY: "1"
+        run: "bash -c 'unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RUNTIME_TOKEN GITHUB_TOKEN MISE_GITHUB_TOKEN GH_TOKEN GH_HOST GH_CONFIG_DIR; set -euo pipefail; for name in ${!MISE_@}; do unset \"$name\"; done; umask 077; task_root=\"${RUNNER_TEMP}/velnor-verification-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-test\"; test -n \"$RUNNER_TEMP\" && test -n \"$GITHUB_WORKSPACE\" && test -n \"$GITHUB_RUN_ID\" && test -n \"$GITHUB_RUN_ATTEMPT\"; [[ \"$GITHUB_RUN_ID\" =~ ^[0-9]+$ ]]; [[ \"$GITHUB_RUN_ATTEMPT\" =~ ^[0-9]+$ ]]; cd -P \"$GITHUB_WORKSPACE\"; workspace_root=\"$PWD\"; test -d \"$workspace_root/.\"; test ! -L \"$workspace_root/.\"; cd -P \"$workspace_root/.\"; task_working_directory=\"$PWD\"; test -d \"$task_root\"; export HOME=\"$task_root/home\"; export XDG_CONFIG_HOME=\"$task_root/home/config\"; export XDG_DATA_HOME=\"$task_root/home/data\"; export XDG_CACHE_HOME=\"$task_root/home/cache\"; export XDG_STATE_HOME=\"$task_root/home/state\"; export MISE_CONFIG_DIR=\"$task_root/config\"; export MISE_DATA_DIR=\"$task_root/data\"; export MISE_CACHE_DIR=\"$task_root/cache\"; export MISE_STATE_DIR=\"$task_root/state\"; export CARGO_HOME=\"$task_root/cargo\"; export RUSTUP_HOME=\"$task_root/rustup\"; export MISE_GLOBAL_CONFIG_FILE=\"$task_root/global.toml\"; export MISE_SYSTEM_CONFIG_FILE=\"$task_root/system.toml\"; export MISE_AUTO_INSTALL=false; export MISE_EXEC_AUTO_INSTALL=false; export MISE_TASK_RUN_AUTO_INSTALL=false; export MISE_AUTO_ENV=false; export MISE_NO_ENV=1; export MISE_CEILING_PATHS=\"$workspace_root/..\"; export MISE_TRUSTED_CONFIG_PATHS=\"$workspace_root\"; export MISE_NO_HOOKS=1; export MISE_CARGO_BINSTALL_ONLY=1; unset MISE_CONFIG_FILE MISE_ENV MISE_ENV_FILE; test -f \"$workspace_root/mise.toml\"; test ! -L \"$workspace_root/mise.toml\"; /usr/bin/sha256sum  \"$workspace_root/mise.toml\" > \"$task_root/sha256.txt\"; read actual rest < \"$task_root/sha256.txt\"; test \"$actual\" = \"cb16b670b1ad43756bddebbb392efe814c5132c2afbfc47c4a9028b97932478b\"; test -f \"$workspace_root/mise.lock\"; test ! -L \"$workspace_root/mise.lock\"; /usr/bin/sha256sum  \"$workspace_root/mise.lock\" > \"$task_root/sha256.txt\"; read actual rest < \"$task_root/sha256.txt\"; test \"$actual\" = \"1f5ad145255189b54cd4af7c0edf96966c6d6685dc5f1a211151300b13e536de\"; test ! -e \"$workspace_root/rust-toolchain.toml\" && test ! -L \"$workspace_root/rust-toolchain.toml\"; command -v jq > \"$task_root/jq_path.txt\"; IFS= read -r jq_path < \"$task_root/jq_path.txt\"; test -n \"$jq_path\"; test -x \"$jq_path\"; \"$jq_path\" --version | /usr/bin/grep -Fqx '\\''jq-1.8.2'\\''; mise --no-env --no-hooks config ls --json | \"$jq_path\" -r '\\''.[].path'\\'' | LC_ALL=C /usr/bin/sort > \"$task_root/mise_configs.txt\"; workspace_config_found=false; while IFS= read -r path; do case \"$path\" in \"$workspace_root/mise.toml\") workspace_config_found=true ;; \"$workspace_root/rust-toolchain.toml\"|\"$task_root/global.toml\"|\"$task_root/system.toml\") ;; *) exit 1 ;; esac; done < \"$task_root/mise_configs.txt\"; [[ \"$workspace_config_found\" == true ]]; mise --no-env --locked --no-hooks run --skip-tools test'"
