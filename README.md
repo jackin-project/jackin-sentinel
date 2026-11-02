@@ -14,12 +14,13 @@ jackin-sentinel is the verification role of jackin. It proves that jackin works 
 | `hooks/setup.sh` | Appends one line to `/sandbox/.sentinel/setup.log`. |
 | `hooks/preflight.sh` | Appends one line to `/sandbox/.sentinel/preflight.log`. It exits 17 when `SENTINEL_FAIL_PREFLIGHT` is `1`. |
 | `probe/jackin-sentinel-probe` | The probe. A POSIX `sh` script that needs `jq`. |
+| `probe/tests/j08.sh` | The offline cases of the J08 environment check: a copy of the probe runs against a scratch `/sandbox` and `/proc`. |
 
 The role holds no secret. Jackin builds the image. This repository does not publish it.
 
 ## Check and load the role
 
-The repository gate is `mise run test`. It runs `prek run --all-files`: gitleaks, shellcheck, shfmt, and hadolint.
+The repository gate is `mise run test`. It runs `prek run --all-files`: gitleaks, shellcheck, shfmt, hadolint, and the J08 cases of `probe/tests/j08.sh`.
 
 Build jackin in the jackin repository. The gate runs the binary `jackin/target/debug/jackin` from this directory:
 
@@ -82,7 +83,7 @@ Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, 
 | J05 | The sha256 digest of every regular file below `/sandbox/project`, outside `.git`. |
 | J06 | The execution counts of the hooks and the owner and mode of the installed hook files. |
 | J07 | The main process (`jackin-start`), its Codex child, and the answer of `codex exec --skip-git-repo-check "Reply with the word ready"`. |
-| J08 | Whether every credential variable and every token in `auth.json` is a placeholder, and the paths of files that hold a token-shaped string. The probe reads its own environment, the `/sandbox/.jackin/env-*` launch files, `auth.json`, and the files under `/sandbox`. It also tries `/proc/PID/environ` of the main process and of Codex. The sandbox denies that read, so the result lists both environments as unreadable. The probe never prints a value. |
+| J08 | Whether every credential variable and every token in `auth.json` is a placeholder, and the paths of files that hold a token-shaped string. The probe reads its own environment, the `/sandbox/.jackin/env-*` launch files, `auth.json`, and the files under `/sandbox`. The sandbox denies `/proc/PID/environ` of the main process and of Codex, so the probe reads the start record `/sandbox/.jackin/run/env-kinds`, which `jackin-start` writes with the names and kinds (placeholder, empty, other) of the credential variables of both environments and never a value. The environment check is PASS only with a fresh, valid record that covers both environments, FAIL for a variable of kind other or a malformed record, and SKIP when the record is absent, unreadable or stale, or Codex has not started. The agent runs as the same user and can rewrite the record, so a PASS shows the launch path of jackin, not a hostile agent. The probe never prints a value. |
 | J09 | The result of `curl` to a host outside the policy, to the metadata address, and to a Codex provider host with the placeholder as the bearer value. |
 | J10 | Which file creations succeed under `/sandbox` and `/tmp` and which fail elsewhere. |
 | J11 | The Codex process with its pid and start time, for a comparison before and after a detach. |

@@ -11,14 +11,20 @@ repos:
         name: shellcheck
         language: system
         entry: shellcheck
-        files: ^(probe/jackin-sentinel-probe|hooks/[^/]+\.sh)$
+        files: ^(probe/jackin-sentinel-probe|probe/tests/[^/]+\.sh|hooks/[^/]+\.sh)$
       - id: shfmt
         name: shfmt
         language: system
         entry: shfmt -d -i 4 -ci
-        files: ^(probe/jackin-sentinel-probe|hooks/[^/]+\.sh)$
+        files: ^(probe/jackin-sentinel-probe|probe/tests/[^/]+\.sh|hooks/[^/]+\.sh)$
       - id: hadolint
         name: hadolint
         language: system
         entry: hadolint
         files: ^Dockerfile$
+      - id: probe-j08
+        name: probe J08 cases
+        language: system
+        entry: sh probe/tests/j08.sh
+        files: ^probe/(jackin-sentinel-probe|tests/j08\.sh)$
+        pass_filenames: false

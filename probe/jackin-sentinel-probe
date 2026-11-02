@@ -15,6 +15,9 @@ CODEX_BIN=/usr/local/bin/codex
 CODEX_COMM=codex
 START_BIN=/usr/local/bin/jackin-start
 HOOK_DIR=/usr/local/lib/jackin/hooks
+RECORD_FILE=$JACKIN_DIR/run/env-kinds
+RUN_STATE_FILE=$JACKIN_DIR/run/state
+RECORD_MAX=65536
 SCAN_ROOT=/sandbox
 PROMPT='Reply with the word ready'
 ALL_STEPS='J00 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 J14 J15 J16'
@@ -485,13 +488,109 @@ step_J07() (
 )
 
 agent_env() {
-    [ -n "$2" ] || {
+    [ -n "$3" ] || {
         echo absent
         return 0
     }
-    state=$(environ_state "$2")
-    [ "$state" != read ] || proc_environ "$2" | credential_variables "$1" >>"$work/variables.tsv"
+    state=$(environ_state "$3")
+    [ "$state" != read ] || proc_environ "$3" | credential_variables "$1" >"$2"
     echo "$state"
+}
+
+record_parse() {
+    LC_ALL=C awk '
+        function bad() { failed = 1; exit 1 }
+        NR == 1 { if ($0 != "jackin-env-kinds 1") bad(); next }
+        NR == 2 {
+            if ($0 !~ /^attempt (0|[1-9][0-9]*)$/) bad()
+            split($0, parts, " ")
+            if (length(parts[2]) > 18) bad()
+            print "attempt\t" parts[2]
+            next
+        }
+        {
+            if ($0 !~ /^(main|codex) [A-Za-z_][A-Za-z0-9_]* (placeholder|empty|other)$/) bad()
+            split($0, parts, " ")
+            if (parts[1] == "main" && seen_codex) bad()
+            if (parts[1] == "codex") seen_codex = 1
+            key = parts[1] " " parts[2]
+            if (key in used) bad()
+            used[key] = 1
+            print parts[1] "\t" parts[2] "\t" parts[3]
+        }
+        END { if (!failed && NR < 2) exit 1 }'
+}
+
+record_load() {
+    : >"$work/record.tsv"
+    record_state=absent
+    record_attempt=
+    if [ -L "$RECORD_FILE" ]; then
+        record_state=malformed
+        return 0
+    fi
+    [ -e "$RECORD_FILE" ] || return 0
+    if [ ! -f "$RECORD_FILE" ]; then
+        record_state=malformed
+        return 0
+    fi
+    if ! head -c $((RECORD_MAX + 1)) "$RECORD_FILE" >"$work/record.raw" 2>/dev/null; then
+        record_state=unreadable
+        return 0
+    fi
+    size=$(wc -c <"$work/record.raw" | tr -d ' ')
+    nuls=$(tr -cd '\000' <"$work/record.raw" | wc -c | tr -d ' ')
+    if [ "$size" -gt "$RECORD_MAX" ] || [ "$nuls" -ne 0 ]; then
+        record_state=malformed
+        return 0
+    fi
+    if record_parse <"$work/record.raw" >"$work/record.tsv"; then
+        record_state="read"
+        record_attempt=$(awk -F'\t' '$1 == "attempt" { print $2 }' "$work/record.tsv")
+    else
+        : >"$work/record.tsv"
+        record_state=malformed
+    fi
+}
+
+run_state_attempt() {
+    case $run_state in
+        waiting) echo 0 ;;
+        'running '* | 'exited '*)
+            n=${run_state#* }
+            n=${n%% *}
+            case $n in
+                '' | 0* | *[!0-9]*) return 1 ;;
+            esac
+            [ "${#n}" -le 18 ] || return 1
+            echo "$n"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+record_rows() {
+    awk -F'\t' -v env="$1" '$1 == env { print $2 "\t" $3 "\t" env }' "$work/record.tsv"
+}
+
+settle() {
+    record_rows "$1" | sort -u >"$work/rec.$1.tsv"
+    settled=$2
+    if [ "$2" = read ]; then
+        sort -u "$work/live.$1.tsv" >"$work/eff.$1.tsv"
+        read_from="$read_from, the $1 environment (/proc)"
+        if [ "$3" -eq 1 ] && ! cmp -s "$work/eff.$1.tsv" "$work/rec.$1.tsv"; then
+            disagree="${disagree:+$disagree, }$1"
+        fi
+    elif [ "$3" -eq 1 ]; then
+        cp "$work/rec.$1.tsv" "$work/eff.$1.tsv"
+        read_from="$read_from, the $1 environment (record)"
+        settled=record
+    else
+        : >"$work/eff.$1.tsv"
+        unread_from="${unread_from:+$unread_from; }the $1 environment ($2, no fresh record)"
+    fi
+    cat "$work/eff.$1.tsv" >>"$work/variables.tsv"
 }
 
 step_J08() (
@@ -511,19 +610,34 @@ step_J08() (
     done
     read_from="the probe environment, $launch_files launch env file(s)"
     unread_from=
-    main_env=$(agent_env main "$main_pid")
-    codex_env=$(agent_env codex "$codex_pid")
-    case $main_env in
-        read) read_from="$read_from, the main environment" ;;
-        denied) unread_from="the main environment (pid $main_pid, denied)" ;;
-    esac
-    case $codex_env in
-        read) read_from="$read_from, the Codex environment" ;;
-        denied) unread_from="${unread_from:+$unread_from; }the Codex environment (pid $codex_pid, denied)" ;;
-    esac
+    run_state=$(head -n 1 "$RUN_STATE_FILE" 2>/dev/null) || run_state=
+    record_load
+    state_attempt=$(run_state_attempt) || state_attempt=
+    if [ "$record_state" = read ] && [ "$record_attempt" != "$state_attempt" ]; then
+        record_state=stale
+    fi
+    main_known=0
+    codex_known=0
+    if [ "$record_state" = read ]; then
+        main_known=1
+        codex_lines=$(awk -F'\t' '$1 == "codex"' "$work/record.tsv" | wc -l | tr -d ' ')
+        if [ "$record_attempt" -ge 1 ]; then
+            case $run_state in
+                'exited '*' 65') [ "$codex_lines" -eq 0 ] || codex_known=1 ;;
+                *) codex_known=1 ;;
+            esac
+        fi
+    fi
+    main_env=$(agent_env main "$work/live.main.tsv" "$main_pid")
+    codex_env=$(agent_env codex "$work/live.codex.tsv" "$codex_pid")
+    disagree=
+    settle main "$main_env" "$main_known"
+    main_env=$settled
+    settle codex "$codex_env" "$codex_known"
+    codex_env=$settled
     sort -u -o "$work/variables.tsv" "$work/variables.tsv"
     environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
-    others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | join(" ")')
+    others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | unique | join(" ")')
     placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder")] | length')
     scope="checked: $read_from, $CODEX_HOME_DIR/auth.json, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
     auth_file=null
@@ -550,10 +664,20 @@ EOF
     else
         pass credential "$placeholders placeholder variables, auth.json present: $([ "$auth_file" = null ] && echo no || echo yes) ($scope)"
     fi
-    if [ -z "$others" ]; then
-        pass environment "every credential variable is a placeholder or empty in: $read_from"
+    if [ "$record_state" = malformed ]; then
+        fail environment "malformed start record"
+    elif [ -n "$others" ]; then
+        fail environment "not a placeholder: $others${disagree:+ (/proc and the start record disagree for: $disagree)}"
+    elif [ "$record_state" != read ]; then
+        case $record_state in
+            absent) skip environment "no start record at $RECORD_FILE; the environments are unknown, never clean" ;;
+            unreadable) skip environment "the start record at $RECORD_FILE cannot be read" ;;
+            *) skip environment "the start record is stale (record attempt $record_attempt, run state '${run_state:-absent}')" ;;
+        esac
+    elif [ "$codex_known" -ne 1 ]; then
+        skip environment "the Codex environment is not known: the record at attempt $record_attempt holds no Codex environment"
     else
-        fail environment "not a placeholder: $others"
+        pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
     fi
     if [ -z "$auth_problem" ]; then
         pass auth_file "auth.json holds only placeholders and empty values"
@@ -565,9 +689,15 @@ EOF
     else
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
     fi
+    case $record_state in
+        read | stale) attempt_fact=$record_attempt ;;
+        *) attempt_fact=null ;;
+    esac
     jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
         --arg main_env "$main_env" --arg codex_env "$codex_env" \
+        --arg record_state "$record_state" --argjson record_attempt "$attempt_fact" \
         '{environment: $environment, agent_environment: {main: $main_env, codex: $codex_env},
+          start_record: {state: $record_state, attempt: $record_attempt},
           auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
 )
 
