@@ -20,6 +20,15 @@ RECORD_FILE=$JACKIN_DIR/run/env-kinds
 RUN_STATE_FILE=$JACKIN_DIR/run/state
 RECORD_MAX=65536
 SCAN_ROOT=/sandbox
+SCAN_MAX_KIB=262144
+SCAN_GREP_SECONDS=20
+LEAK_SK='(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}'
+LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
+LEAK_JWT_SAFE='\.placeholder$'
+LEAK_RT='"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"'
+LEAK_RT_SAFE=':[[:space:]]*"openshell:resolve:[^"]*"$'
+J10_ALLOWED="$STATE_DIR /tmp"
+J10_DENIED="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
 PROMPT='Reply with the word ready'
 ALL_STEPS='J00 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 J14 J15 J16'
 JQN='def n: if . == "" then null else . end;'
@@ -351,17 +360,64 @@ credential_variables() {
 }
 
 scan_leaks() {
-    find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f -print0 2>/dev/null |
-        xargs -0 -r grep -alE -e 'sk-[A-Za-z0-9_-]{20,}' \
-            -e 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' \
-            -e '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' 2>/dev/null |
-        while IFS= read -r file; do
-            if grep -aqE -e 'sk-[A-Za-z0-9_-]{20,}' "$file" 2>/dev/null ||
-                grep -aoE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' "$file" 2>/dev/null | grep -qv '\.placeholder$' ||
-                grep -aoE '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$file" 2>/dev/null | grep -aqvE ':[[:space:]]*"openshell:resolve:[^"]*"$'; then
-                printf '%s\n' "$file"
-            fi
-        done | head -n 50
+    cat >"$work/scan-file.sh" <<'EOF'
+emit() {
+    jq -cn --arg kind "$1" --arg path "$2" --arg why "$3" '{kind: $kind, path: $path, why: $why}' ||
+        echo "the scan could not record a $1" >&2
+}
+listed() {
+    { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
+        SAFE=$2 awk '$0 == "SCAN_ERROR" { bad = 1; next } $0 !~ ENVIRON["SAFE"] { hit = 1 } END { print bad ? "error" : (hit ? "hit" : "none") }'
+}
+mode=$1
+shift
+for file; do
+    if [ "$mode" = oversize ]; then
+        emit unscanned "$file" "over the size cap"
+        continue
+    fi
+    if [ ! -r "$file" ]; then
+        emit unscanned "$file" unreadable
+        continue
+    fi
+    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" -e "$LEAK_JWT" -e "$LEAK_RT" "$file"
+    case $? in
+        0) ;;
+        1) continue ;;
+        124)
+            emit unscanned "$file" "grep timed out"
+            continue
+            ;;
+        *)
+            emit unscanned "$file" "grep failed"
+            continue
+            ;;
+    esac
+    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" "$file"
+    sk=$?
+    jwt=$(listed "$LEAK_JWT" "$LEAK_JWT_SAFE" "$file")
+    rt=$(listed "$LEAK_RT" "$LEAK_RT_SAFE" "$file")
+    if [ "$sk" -eq 0 ] || [ "$jwt" = hit ] || [ "$rt" = hit ]; then
+        emit leak "$file" "token-shaped string"
+    elif [ "$sk" -ge 2 ] || [ "$jwt" = error ] || [ "$rt" = error ]; then
+        emit unscanned "$file" "grep failed or timed out"
+    fi
+done
+exit 0
+EOF
+    env "SCAN_GREP_SECONDS=$SCAN_GREP_SECONDS" "LEAK_SK=$LEAK_SK" "LEAK_JWT=$LEAK_JWT" "LEAK_JWT_SAFE=$LEAK_JWT_SAFE" \
+        "LEAK_RT=$LEAK_RT" "LEAK_RT_SAFE=$LEAK_RT_SAFE" \
+        find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f \
+        \( -size +"${SCAN_MAX_KIB}k" -exec sh "$work/scan-file.sh" oversize {} + \
+        -o -exec sh "$work/scan-file.sh" scan {} + \) >"$work/scan.ndjson" 2>"$work/scan.err"
+    find_rc=$?
+    scan_result=$(jq -n --slurpfile found "$work/scan.ndjson" --rawfile err "$work/scan.err" --argjson rc "$find_rc" '
+        ($err | split("\n") | map(select(. != "") | sub("^find: "; ""))) as $e
+        | {leaks: ([$found[] | select(.kind == "leak") | .path] | .[0:50]),
+           unscanned: ([$found[] | select(.kind == "unscanned") | "\(.path) (\(.why))"]
+                       + $e
+                       + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end))}') ||
+        scan_result='{"leaks": [], "unscanned": ["the scan output could not be read"]}'
 }
 
 try_create() {
@@ -436,16 +492,15 @@ step_J04() (
 step_J05() (
     git_work_tree=false
     files='[]'
+    sums_rc=0
     if [ -d "$PROJECT" ]; then
         pass project_dir "$PROJECT"
         if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             git_work_tree=true
         fi
-        files=$(cd "$PROJECT" && find . -path ./.git -prune -o -type f -exec sh -c '
-            for file; do
-                sum=$(sha256sum <"$file" 2>/dev/null) || continue
-                jq -cn --arg sha256 "${sum%% *}" --arg path "${file#./}" "{sha256: \$sha256, path: \$path}"
-            done' sh {} + | jq -s 'sort_by(.path)')
+        (cd "$PROJECT" && find . -path ./.git -prune -o -type f -exec sha256sum --zero {} +) >"$work/sums" 2>"$work/sums.err"
+        sums_rc=$?
+        files=$(jq -Rs '[split("\u0000")[] | select(. != "") | {sha256: .[0:64], path: (.[66:] | ltrimstr("./"))}] | sort_by(.path)' "$work/sums") || files='[]'
     else
         fail project_dir "$PROJECT is missing"
     fi
@@ -455,7 +510,9 @@ step_J05() (
         fail git_work_tree "$PROJECT is not a git work tree"
     fi
     total=$(printf '%s' "$files" | jq 'length')
-    if [ "$total" -gt 0 ]; then
+    if [ "$sums_rc" -ne 0 ]; then
+        fail files "$total files hashed, but some could not be read: $(head -n 3 "$work/sums.err" | tr '\n' ';')"
+    elif [ "$total" -gt 0 ]; then
         pass files "$total files"
     else
         fail files "the project holds no file"
@@ -647,6 +704,13 @@ step_J08() (
     done
     read_from="the probe environment, $launch_files launch env file(s)"
     unread_from=
+    scan_leaks
+    leaks=$(printf '%s' "$scan_result" | jq -c '.leaks')
+    unscanned=$(printf '%s' "$scan_result" | jq -r '.unscanned | length')
+    if [ "$unscanned" -gt 0 ]; then
+        unscanned_text="$unscanned paths under $SCAN_ROOT not scanned: $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
+        unread_from="${unread_from:+$unread_from; }$unscanned_text"
+    fi
     run_state=$(head -n 1 "$RUN_STATE_FILE" 2>/dev/null) || run_state=
     record_load
     state_attempt=$(run_state_attempt) || state_attempt=
@@ -697,7 +761,6 @@ EOF
             [ "$kind" = placeholder ] && auth_placeholders=$((auth_placeholders + 1))
         done
     fi
-    leaks=$(scan_leaks | jq -Rn '[inputs]')
     if [ "$placeholders" -eq 0 ] && [ "$auth_placeholders" -eq 0 ]; then
         skip credential "the sandbox holds no credential placeholder ($scope)"
     else
@@ -723,10 +786,12 @@ EOF
     else
         fail auth_file "auth.json holds a token that is not a placeholder"
     fi
-    if [ "$leaks" = '[]' ]; then
-        pass file_scan "no token-shaped string outside the project"
-    else
+    if [ "$leaks" != '[]' ]; then
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
+    elif [ "$unscanned" -gt 0 ]; then
+        skip file_scan "$unscanned_text"
+    else
+        pass file_scan "no token-shaped string outside the project"
     fi
     case $record_state in
         read | stale) attempt_fact=$record_attempt ;;
@@ -790,9 +855,9 @@ step_J10() (
     attributed=
     for expected in allowed denied; do
         if [ "$expected" = allowed ]; then
-            dirs="$STATE_DIR /tmp"
+            dirs=$J10_ALLOWED
         else
-            dirs="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
+            dirs=$J10_DENIED
         fi
         for dir in $dirs; do
             [ -d "$dir" ] || [ "$expected" = allowed ] || continue
@@ -818,7 +883,7 @@ step_J10() (
         done
     done
     if [ -z "$allowed_failed" ]; then
-        pass allowed_writes "files can be created under $STATE_DIR and /tmp"
+        pass allowed_writes "files can be created under $J10_ALLOWED"
     else
         fail allowed_writes "cannot create a file in:$allowed_failed"
     fi
@@ -892,7 +957,9 @@ step_J13() (
     else
         fail head "HEAD is unborn or unreadable"
     fi
-    if [ "$status_known" = true ]; then
+    if [ "$work_tree" = false ]; then
+        skip work_tree_status "git status not run: $PROJECT is not a git work tree"
+    elif [ "$status_known" = true ]; then
         pass work_tree_status "git status ran"
     else
         fail work_tree_status "git status failed, so the cleanliness of the work tree is unknown"

@@ -50,6 +50,29 @@ environ() {
     done
 }
 
+seam() {
+    printf 's#^%s=.*#%s=%s#\n' "$1" "$1" "$2" >>"$t/seams.sed"
+}
+
+exit_shim() {
+    real=$(command -v "$1")
+    cat >"$t/bin/$1" <<EOF
+#!/bin/sh
+for last; do :; done
+case \$last in
+    $2) exit $3 ;;
+esac
+exec $real "\$@"
+EOF
+    chmod +x "$t/bin/$1"
+}
+
+setup_failed() {
+    total=$((total + 1))
+    failures=$((failures + 1))
+    echo "FAIL $1: the test setup failed"
+}
+
 bounded() {
     limit=$1
     shift
@@ -80,6 +103,9 @@ begin() {
     shift
     problems=
     sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc#$t/proc#g" "$probe" >"$t/probe"
+    if [ -f "$t/seams.sed" ]; then
+        sed -f "$t/seams.sed" "$t/probe" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe"
+    fi
     bounded 20 env -i PATH="$scratch/shim:$PATH" TMPDIR="$t/tmp" "$@"
     rc=$?
     cp "$scratch/bounded.out" "$t/out"
@@ -379,25 +405,72 @@ expect auth_file FAIL 'not a placeholder'
 expect credential SKIP 'no credential placeholder'
 finish_case
 
-if [ "$(id -u)" -ne 0 ]; then
-    mk j10_state_dir_cannot_be_created
-    chmod 555 "$t/sandbox"
-    begin j10_state_dir_cannot_be_created sh "$t/probe" --only J10
-    chmod 755 "$t/sandbox"
-    expect_rc 0
-    expect_report J10 sandbox
-    expect allowed_writes FAIL '.sentinel'
-    finish_case
-else
-    echo "skip j10_state_dir_cannot_be_created: running as root"
-fi
+j10_seams() {
+    mkdir -p "$t/allowed"
+    seam J10_ALLOWED "\"\$STATE_DIR $t/allowed\""
+    seam J10_DENIED "\"$1\""
+}
+
+j10_stays_inside() {
+    fact '[.writes[].path | select(startswith("'"$t"'/") | not)] | length' 0
+}
 
 mk j10_state_dir_is_created
+j10_seams "$t/missing"
 begin j10_state_dir_is_created sh "$t/probe" --only J10
 expect_rc 0
 expect_report J10 sandbox
 expect allowed_writes PASS '.sentinel'
+j10_stays_inside
 finish_case
+
+mk j10_state_dir_cannot_be_created
+: >"$t/sandbox/.sentinel"
+j10_seams "$t/missing"
+begin j10_state_dir_cannot_be_created sh "$t/probe" --only J10
+expect_rc 0
+expect_report J10 sandbox
+expect allowed_writes FAIL '.sentinel'
+j10_stays_inside
+finish_case
+
+mk j10_writable_denied_directory_fails
+mkdir "$t/denied_rw"
+j10_seams "$t/denied_rw"
+begin j10_writable_denied_directory_fails sh "$t/probe" --only J10
+expect_rc 0
+expect_report J10 sandbox
+expect denied_writes FAIL 'denied_rw'
+expect denial_by_policy FAIL 'not proven'
+j10_stays_inside
+finish_case
+
+mk j10_missing_denied_directory_is_not_proof_of_a_policy
+j10_seams "$t/missing"
+begin j10_missing_denied_directory_is_not_proof_of_a_policy sh "$t/probe" --only J10
+expect_rc 0
+expect_report J10 sandbox
+expect denied_writes PASS 'no file could be created'
+expect denial_by_policy FAIL 'not proven'
+j10_stays_inside
+finish_case
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk j10_denial_that_the_mode_allows_is_attributed_to_the_policy
+    mkdir "$t/denied_policy"
+    chmod 622 "$t/denied_policy"
+    j10_seams "$t/denied_policy"
+    begin j10_denial_that_the_mode_allows_is_attributed_to_the_policy sh "$t/probe" --only J10
+    chmod 755 "$t/denied_policy"
+    expect_rc 0
+    expect_report J10 sandbox
+    expect denied_writes PASS 'no file could be created'
+    expect denial_by_policy PASS 'denied_policy'
+    j10_stays_inside
+    finish_case
+else
+    echo "skip j10_denial_that_the_mode_allows_is_attributed_to_the_policy: running as root"
+fi
 
 mk only_rejects_whitespace
 begin only_rejects_whitespace sh "$t/probe" --only 'J04 J05'
@@ -450,29 +523,194 @@ report file_scan_flags_token_in_binary_file
 expect file_scan FAIL 'blob.bin'
 finish_case
 
+mk file_scan_ignores_sk_inside_a_word
+state waiting
+record "$R_W0"
+printf 'see task-manager-configuration-value-for-the-job\n' >"$t/sandbox/note.txt"
+report file_scan_ignores_sk_inside_a_word
+expect file_scan PASS 'no token-shaped string'
+finish_case
+
+mk file_scan_flags_token_in_name_with_newline
+state waiting
+record "$R_W0"
+printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/$(printf 'to\nken.txt')"
+report file_scan_flags_token_in_name_with_newline
+expect file_scan FAIL 'token-shaped strings in'
+fact '.leaks | length' 1
+fact '.leaks[0] | endswith("to\nken.txt")' true
+finish_case
+
+mk file_scan_skips_a_file_over_the_size_cap
+state waiting
+record "$R_W0"
+seam SCAN_MAX_KIB 1
+{
+    head -c 3072 /dev/zero | tr '\0' 'a'
+    printf '\nsk-%s\n' abcdefghijklmnopqrstuvwxyz
+} >"$t/sandbox/big.log"
+report file_scan_skips_a_file_over_the_size_cap
+expect file_scan SKIP 'big.log (over the size cap)'
+fact '.leaks | length' 0
+finish_case
+
+mk file_scan_skips_when_grep_fails
+state waiting
+record "$R_W0"
+mkdir "$t/bin"
+exit_shim grep '*bad.dat' 2
+printf 'plain\n' >"$t/sandbox/bad.dat"
+begin file_scan_skips_when_grep_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan SKIP 'bad.dat'
+finish_case
+
+mk file_scan_flags_a_token_next_to_a_failed_grep
+state waiting
+record "$R_W0"
+mkdir "$t/bin"
+exit_shim grep '*bad.dat' 2
+printf 'plain\n' >"$t/sandbox/bad.dat"
+printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/secret.txt"
+begin file_scan_flags_a_token_next_to_a_failed_grep env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan FAIL 'secret.txt'
+finish_case
+
+mk file_scan_skips_when_grep_times_out
+state waiting
+record "$R_W0"
+mkdir "$t/bin"
+exit_shim timeout '*slow.dat' 124
+printf 'plain\n' >"$t/sandbox/slow.dat"
+begin file_scan_skips_when_grep_times_out env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan SKIP 'slow.dat (grep timed out)'
+finish_case
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk file_scan_skips_an_unreadable_file
+    state waiting
+    record "$R_W0"
+    printf 'plain\n' >"$t/sandbox/locked.txt"
+    chmod 000 "$t/sandbox/locked.txt"
+    report file_scan_skips_an_unreadable_file
+    expect file_scan SKIP 'locked.txt (unreadable)'
+    finish_case
+
+    mk file_scan_skips_an_unreadable_directory
+    state waiting
+    record "$R_W0"
+    mkdir "$t/sandbox/locked"
+    printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/locked/secret.txt"
+    chmod 000 "$t/sandbox/locked"
+    report file_scan_skips_an_unreadable_directory
+    chmod 755 "$t/sandbox/locked"
+    expect file_scan SKIP 'locked'
+    finish_case
+else
+    echo "skip file_scan_skips_an_unreadable_file and directory: running as root"
+fi
+
+git_in_project() {
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$t/sandbox/project" "$@"
+}
+
 git_project() {
-    git -C "$t/sandbox/project" init -q
-    git -C "$t/sandbox/project" -c core.hooksPath=/dev/null -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m init
+    git_in_project init -q &&
+        git_in_project -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m init
 }
 
 mk j13_clean_work_tree
-git_project
-begin j13_clean_work_tree sh "$t/probe" --only J13
-expect_rc 0
-expect_report J13 sandbox
-expect work_tree_status PASS 'git status ran'
-fact '.clean' true
-finish_case
+if git_project; then
+    begin j13_clean_work_tree sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect head PASS ''
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' true
+    finish_case
+else
+    setup_failed j13_clean_work_tree
+fi
 
 mk j13_unreadable_index_is_not_a_clean_work_tree
-git_project
-printf 'garbage' >"$t/sandbox/project/.git/index"
-begin j13_unreadable_index_is_not_a_clean_work_tree sh "$t/probe" --only J13
+if git_project; then
+    printf 'garbage' >"$t/sandbox/project/.git/index"
+    begin j13_unreadable_index_is_not_a_clean_work_tree sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status FAIL 'cleanliness of the work tree is unknown'
+    fact '.clean' false
+    finish_case
+else
+    setup_failed j13_unreadable_index_is_not_a_clean_work_tree
+fi
+
+mk j13_not_a_work_tree_does_not_claim_git_status_ran
+begin j13_not_a_work_tree_does_not_claim_git_status_ran sh "$t/probe" --only J13
 expect_rc 0
 expect_report J13 sandbox
-expect work_tree_status FAIL 'cleanliness of the work tree is unknown'
-fact '.clean' false
+expect work_tree FAIL 'not a git work tree'
+expect work_tree_status SKIP 'git status not run'
 finish_case
+
+mk j05_hashes_every_file_by_its_exact_name
+if git_project; then
+    printf a >"$t/sandbox/project/plain.txt"
+    printf n >"$t/sandbox/project/$(printf 'new\nline')"
+    printf b >"$t/sandbox/project/back\\slash"
+    printf h >"$t/sandbox/project/.hidden"
+    begin j05_hashes_every_file_by_its_exact_name sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files PASS '4 files'
+    fact '[.files[].path] | sort | join(",")' '.hidden,back\slash,new
+line,plain.txt'
+    fact '.files[] | select(.path == "new\nline") | .sha256' "$(printf n | sha256sum | cut -d' ' -f1)"
+    fact '.files[] | select(.path == "back\\slash") | .sha256' "$(printf b | sha256sum | cut -d' ' -f1)"
+    finish_case
+else
+    setup_failed j05_hashes_every_file_by_its_exact_name
+fi
+
+mk j05_a_file_that_cannot_be_hashed_fails_the_files_check
+if git_project; then
+    printf a >"$t/sandbox/project/plain.txt"
+    printf u >"$t/sandbox/project/unreadable.txt"
+    mkdir "$t/bin"
+    real_sum=$(command -v sha256sum)
+    cat >"$t/bin/sha256sum" <<EOF
+#!/bin/sh
+rc=0
+n=\$#
+while [ \$n -gt 0 ]; do
+    arg=\$1
+    shift
+    n=\$((n - 1))
+    case \$arg in
+        *unreadable.txt)
+            echo "sha256sum: \$arg: Permission denied" >&2
+            rc=1
+            ;;
+        *) set -- "\$@" "\$arg" ;;
+    esac
+done
+$real_sum "\$@"
+[ \$rc -eq 0 ] || exit 1
+EOF
+    chmod +x "$t/bin/sha256sum"
+    begin j05_a_file_that_cannot_be_hashed_fails_the_files_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'unreadable.txt: Permission denied'
+    finish_case
+else
+    setup_failed j05_a_file_that_cannot_be_hashed_fails_the_files_check
+fi
 
 mk j15_runs_the_hello_world_image_by_digest
 mkdir "$t/bin"
