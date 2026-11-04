@@ -11,13 +11,18 @@ failures=0
 total=0
 
 mkdir "$scratch/tools"
-for tool in sh jq sed tr cat env awk grep; do
+for tool in sh jq sed tr cat env awk grep mktemp rm wc; do
     found=$(command -v "$tool") || {
         echo "FAIL setup: $tool is not installed"
         exit 70
     }
     ln -s "$found" "$scratch/tools/$tool"
 done
+real_id=$(command -v id) || exit 70
+printf '#!/bin/sh\necho Linux\n' >"$scratch/tools/uname"
+printf '#!/bin/sh\n[ "$*" = -un ] && echo sandbox && exit 0\nexec %s "$@"\n' "$real_id" >"$scratch/tools/id"
+printf '#!/bin/sh\nshift\nexec "$@"\n' >"$scratch/tools/timeout"
+chmod +x "$scratch/tools/uname" "$scratch/tools/id" "$scratch/tools/timeout"
 if PATH="$scratch/tools" command -v curl >/dev/null 2>&1; then
     echo "FAIL setup: the tool directory reaches a real curl"
     exit 70
@@ -37,27 +42,22 @@ exit 99
 EOF
 chmod +x "$scratch/stub-curl"
 
-cat >"$scratch/driver.sh" <<'EOF'
-set -u
-. "$1"
-work=$2
-step=$3
-docker=off
-engine=${4-}
-: >"$work/checks"
-: >"$work/facts"
-printf '%s\n' '{"attempted":false,"credential":"none","exit_code":null,"answered":false,"output_bytes":0}' >"$work/codex_exec.json"
-"$step"
-cat "$work/checks"
-cat "$work/facts"
-EOF
-
 mk() {
     t=$scratch/$1
     rm -rf "$t"
-    mkdir -p "$t/bin" "$t/work"
+    mkdir -p "$t/bin" "$t/sandbox" "$t/tmp"
     : >"$t/table"
     pathvar=$t/bin:$scratch/tools
+}
+
+codex_says() {
+    printf '#!/bin/sh\necho "%s"\nexit %s\n' "$1" "$2" >"$t/bin/codex"
+    chmod +x "$t/bin/codex"
+}
+
+auth_json() {
+    mkdir -p "$t/sandbox/.codex"
+    printf '%s\n' "$1" >"$t/sandbox/.codex/auth.json"
 }
 
 with_curl() {
@@ -71,7 +71,7 @@ answer() {
 bounded() {
     limit=$1
     shift
-    "$@" >"$scratch/bounded.out" 2>&1 &
+    "$@" >"$scratch/bounded.out" 2>"$scratch/bounded.err" &
     pid=$!
     ticks=0
     while kill -0 "$pid" 2>/dev/null; do
@@ -90,10 +90,13 @@ execute() {
     step=$1
     engine=${2-}
     shift 2
-    sed -e '$d' "$probe" >"$t/probe"
-    bounded 20 env -i PATH="$pathvar" STUB_TABLE="$t/table" "$@" sh "$scratch/driver.sh" "$t/probe" "$t/work" "$step" "$engine"
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/bin/codex#" "$probe" >"$t/probe"
+    set -- "$@" sh "$t/probe" --only "${step#step_}"
+    [ -z "$engine" ] || set -- "$@" --engine "$engine"
+    bounded 20 env -i PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" "$@"
     rc=$?
     cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
     return "$rc"
 }
 
@@ -103,7 +106,9 @@ begin() {
     shift
     problems=
     if ! execute "$@"; then
-        problems=" the step did not finish in time or failed"
+        problems=" the probe did not finish in time or failed"
+    elif ! jq -e --arg step "${1#step_}" '.schema == 1 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
+        problems=" report-shape"
     fi
 }
 
@@ -111,8 +116,8 @@ expect() {
     check=$1
     want_result=$2
     want_detail=$3
-    got_result=$(jq -r --arg n "$check" 'select(.name == $n) | .result' "$t/out" 2>/dev/null)
-    got_detail=$(jq -r --arg n "$check" 'select(.name == $n) | .detail' "$t/out" 2>/dev/null)
+    got_result=$(jq -r --arg n "$check" '.steps[].checks[] | select(.name == $n) | .result' "$t/out" 2>/dev/null)
+    got_detail=$(jq -r --arg n "$check" '.steps[].checks[] | select(.name == $n) | .detail' "$t/out" 2>/dev/null)
     [ "$got_result" = "$want_result" ] || problems="$problems $check=$got_result(want $want_result)"
     case $got_detail in
         *"$want_detail"*) ;;
@@ -123,7 +128,7 @@ expect() {
 fact() {
     filter=$1
     want=$2
-    got=$(jq -r "select(.name == null) | $filter" "$t/out" 2>/dev/null)
+    got=$(jq -r ".steps[].facts | $filter" "$t/out" 2>/dev/null)
     [ "$got" = "$want" ] || problems="$problems fact[$filter]=[$got](want [$want])"
 }
 
@@ -213,6 +218,48 @@ finish_case
 mk j09_provider_curl_missing
 begin j09_provider_curl_missing step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
 expect provider_no_credential FAIL 'curl is not installed'
+finish_case
+
+mk j09_codex_answers
+with_curl
+codex_says 'ready' 0
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_codex_answers step_J09 '' OPENAI_API_KEY="$PLACEHOLDER"
+expect codex_reaches_api PASS 'codex exec answered'
+fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
+finish_case
+
+mk j09_codex_timeout_after_partial_output_is_not_an_answer
+with_curl
+codex_says 'ready' 124
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_codex_timeout_after_partial_output_is_not_an_answer step_J09 '' OPENAI_API_KEY="$PLACEHOLDER"
+expect codex_reaches_api FAIL 'exit 124 gave no answer'
+fact '.codex_exec | "\(.attempted) \(.exit_code) \(.answered)"' 'true 124 false'
+finish_case
+
+mk j09_codex_uses_the_api_key_of_auth_json
+with_curl
+codex_says 'ready' 0
+auth_json '{"OPENAI_API_KEY":"FAKE-api-key-value"}'
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+begin j09_codex_uses_the_api_key_of_auth_json step_J09 ''
+expect codex_reaches_api PASS 'codex exec answered'
+fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
+finish_case
+
+mk j09_no_credential_skips_codex
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+begin j09_no_credential_skips_codex step_J09 ''
+expect codex_reaches_api SKIP 'no credential'
+fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
 finish_case
 
 mk j16_engine_refused
