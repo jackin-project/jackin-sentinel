@@ -12,12 +12,13 @@ total=0
 
 R_OK1='jackin-env-kinds 1\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_KEY placeholder\ncodex GITHUB_TOKEN empty\ncodex OPENAI_API_KEY placeholder\n'
 R_W0='jackin-env-kinds 1\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
+R_EMPTY='jackin-env-kinds 1\nattempt 0\nmain GITHUB_TOKEN empty\n'
 R_NOCODEX='jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\n'
 
 mk() {
     t=$scratch/$1
     rm -rf "$t"
-    mkdir -p "$t/sandbox/.jackin/run" "$t/sandbox/project" "$t/proc/sys/kernel/random" "$t/work"
+    mkdir -p "$t/sandbox/.jackin/run" "$t/sandbox/project" "$t/proc/sys/kernel/random" "$t/tmp"
 }
 
 state() {
@@ -52,7 +53,7 @@ environ() {
 bounded() {
     limit=$1
     shift
-    "$@" >"$scratch/bounded.out" 2>&1 &
+    "$@" >"$scratch/bounded.out" 2>"$scratch/bounded.err" &
     pid=$!
     ticks=0
     while kill -0 "$pid" 2>/dev/null; do
@@ -67,46 +68,64 @@ bounded() {
     wait "$pid"
 }
 
-cat >"$scratch/driver.sh" <<'EOF'
-set -u
-. "$1"
-work=$2
-: >"$work/checks"
-: >"$work/facts"
-step_J08
-cat "$work/checks"
-cat "$work/facts"
-EOF
+mkdir "$scratch/shim"
+real_id=$(command -v id) || exit 70
+printf '#!/bin/sh\necho Linux\n' >"$scratch/shim/uname"
+printf '#!/bin/sh\n[ "$*" = -un ] && echo sandbox && exit 0\nexec %s "$@"\n' "$real_id" >"$scratch/shim/id"
+chmod +x "$scratch/shim/uname" "$scratch/shim/id"
 
-execute() {
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc#$t/proc#g" -e '$d' "$probe" >"$t/probe"
-    bounded 20 env -i PATH="$PATH" sh "$scratch/driver.sh" "$t/probe" "$t/work"
-    rc=$?
-    cp "$scratch/bounded.out" "$t/out"
-    return "$rc"
-}
-
-verify() {
+begin() {
     total=$((total + 1))
     name=$1
+    shift
+    problems=
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc#$t/proc#g" "$probe" >"$t/probe"
+    bounded 20 env -i PATH="$scratch/shim:$PATH" TMPDIR="$t/tmp" "$@"
+    rc=$?
+    cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
+}
+
+expect_rc() {
+    [ "$rc" -eq "$1" ] || problems="$problems rc=$rc(want $1)"
+}
+
+expect_report() {
+    jq -e --arg step "$1" --arg mode "$2" \
+        '.schema == 1 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
+        problems="$problems report-shape"
+}
+
+expect() {
+    check=$1
     want_result=$2
     want_detail=$3
-    want_record=$4
-    if ! execute; then
-        failures=$((failures + 1))
-        echo "FAIL $name: the probe did not finish in time or failed"
-        return 0
-    fi
-    got_result=$(jq -r 'select(.name == "environment") | .result' "$t/out" 2>/dev/null)
-    got_detail=$(jq -r 'select(.name == "environment") | .detail' "$t/out" 2>/dev/null)
-    got_record=$(jq -r 'select(has("start_record")) | .start_record.state' "$t/out" 2>/dev/null)
-    problems=
-    [ "$got_result" = "$want_result" ] || problems="$problems result=$got_result(want $want_result)"
+    got_result=$(jq -r --arg n "$check" '.steps[].checks[] | select(.name == $n) | .result' "$t/out" 2>/dev/null)
+    got_detail=$(jq -r --arg n "$check" '.steps[].checks[] | select(.name == $n) | .detail' "$t/out" 2>/dev/null)
+    [ "$got_result" = "$want_result" ] || problems="$problems $check=$got_result(want $want_result)"
     case $got_detail in
         *"$want_detail"*) ;;
-        *) problems="$problems detail=[$got_detail](want [$want_detail])" ;;
+        *) problems="$problems $check.detail=[$got_detail](want [$want_detail])" ;;
     esac
-    [ "$got_record" = "$want_record" ] || problems="$problems record=$got_record(want $want_record)"
+}
+
+fact() {
+    filter=$1
+    want=$2
+    got=$(jq -r ".steps[].facts | $filter" "$t/out" 2>/dev/null)
+    [ "$got" = "$want" ] || problems="$problems fact[$filter]=[$got](want [$want])"
+}
+
+expect_usage() {
+    expect_rc 64
+    [ ! -s "$t/out" ] || problems="$problems stdout-not-empty"
+    case $(cat "$t/err") in
+        usage:*) ;;
+        *) problems="$problems stderr=[$(cat "$t/err")](want usage)" ;;
+    esac
+}
+
+finish_case() {
     if LC_ALL=C grep -q '[[:cntrl:]]' "$t/out"; then
         problems="$problems control-byte-in-report"
     fi
@@ -116,6 +135,15 @@ verify() {
     else
         echo "ok   $name"
     fi
+}
+
+verify() {
+    begin "$1" sh "$t/probe" --only J08
+    expect_rc 0
+    expect_report J08 sandbox
+    expect environment "$2" "$3"
+    fact '.start_record.state' "$4"
+    finish_case
 }
 
 mk pass_via_record
@@ -270,22 +298,212 @@ for variant in \
     verify "malformed_$vname" FAIL 'malformed start record' malformed
 done
 
-total=$((total + 1))
+PLACEHOLDER_ACCESS=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN
+PLACEHOLDER_REFRESH=openshell:resolve:env:CODEX_AUTH_REFRESH_TOKEN
+
+auth_json() {
+    mkdir -p "$t/sandbox/.codex"
+    printf '%s\n' "$1" >"$t/sandbox/.codex/auth.json"
+}
+
+report() {
+    begin "$1" sh "$t/probe" --only J08
+    expect_rc 0
+    expect_report J08 sandbox
+}
+
+mk credential_skip_for_empty_auth_file
+state waiting
+record "$R_EMPTY"
+auth_json '{}'
+report credential_skip_for_empty_auth_file
+expect credential SKIP 'no credential placeholder'
+expect auth_file PASS 'only placeholders'
+finish_case
+
+mk credential_pass_for_placeholder_auth_file
+state waiting
+record "$R_EMPTY"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"\"}}"
+report credential_pass_for_placeholder_auth_file
+expect credential PASS '1 placeholder tokens in auth.json'
+expect auth_file PASS 'only placeholders'
+expect file_scan PASS 'no token-shaped string'
+finish_case
+
+mk file_scan_accepts_placeholder_refresh_token
+state waiting
+record "$R_W0"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"$PLACEHOLDER_REFRESH\"}}"
+report file_scan_accepts_placeholder_refresh_token
+expect auth_file PASS 'only placeholders'
+expect file_scan PASS 'no token-shaped string'
+finish_case
+
+mk file_scan_flags_real_refresh_token
+state waiting
+record "$R_W0"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"rt_FAKE_refresh_value\"}}"
+report file_scan_flags_real_refresh_token
+expect auth_file FAIL 'not a placeholder'
+expect file_scan FAIL 'auth.json'
+finish_case
+
+mk file_scan_flags_token_in_file_over_two_mebibytes
+state waiting
+record "$R_W0"
+{
+    head -c 3145728 /dev/zero | tr '\0' 'a'
+    printf '\nsk-%s\n' abcdefghijklmnopqrstuvwxyz
+} >"$t/sandbox/big.log"
+report file_scan_flags_token_in_file_over_two_mebibytes
+expect file_scan FAIL 'big.log'
+fact '.leaks | length' 1
+finish_case
+
+mk file_scan_passes_clean_sandbox
+state waiting
+record "$R_W0"
+printf 'nothing here\n' >"$t/sandbox/note.txt"
+report file_scan_passes_clean_sandbox
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
+finish_case
+
+mk api_key_in_auth_file_is_not_a_placeholder
+state waiting
+record "$R_EMPTY"
+auth_json '{"OPENAI_API_KEY":"FAKE-not-a-placeholder"}'
+report api_key_in_auth_file_is_not_a_placeholder
+expect auth_file FAIL 'not a placeholder'
+expect credential SKIP 'no credential placeholder'
+finish_case
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk j10_state_dir_cannot_be_created
+    chmod 555 "$t/sandbox"
+    begin j10_state_dir_cannot_be_created sh "$t/probe" --only J10
+    chmod 755 "$t/sandbox"
+    expect_rc 0
+    expect_report J10 sandbox
+    expect allowed_writes FAIL '.sentinel'
+    finish_case
+else
+    echo "skip j10_state_dir_cannot_be_created: running as root"
+fi
+
+mk j10_state_dir_is_created
+begin j10_state_dir_is_created sh "$t/probe" --only J10
+expect_rc 0
+expect_report J10 sandbox
+expect allowed_writes PASS '.sentinel'
+finish_case
+
+mk only_rejects_whitespace
+begin only_rejects_whitespace sh "$t/probe" --only 'J04 J05'
+expect_usage
+finish_case
+
+mk only_rejects_comma_then_space
+begin only_rejects_comma_then_space sh "$t/probe" --only 'J04, J05'
+expect_usage
+finish_case
+
+mk only_rejects_glob
+begin only_rejects_glob sh "$t/probe" --only '*'
+expect_usage
+finish_case
+
+mk only_rejects_unknown_step
+begin only_rejects_unknown_step sh "$t/probe" --only J99
+expect_usage
+finish_case
+
+mk only_rejects_commas_alone
+begin only_rejects_commas_alone sh "$t/probe" --only ,,
+expect_usage
+finish_case
+
+mk host_mode_skips_every_selected_step
+begin host_mode_skips_every_selected_step sh "$t/probe" --host --only J08
+expect_rc 0
+expect_report J08 host
+expect sandbox SKIP 'not running in a sandbox'
+finish_case
+
+mk outside_a_sandbox_the_probe_refuses
+begin outside_a_sandbox_the_probe_refuses env PATH="$PATH" sh "$t/probe" --only J08
+case $(uname -s)-$(id -un) in
+    Linux-sandbox) ;;
+    *)
+        expect_rc 66
+        [ ! -s "$t/out" ] || problems="$problems stdout-not-empty"
+        ;;
+esac
+finish_case
+
+mk file_scan_flags_token_in_binary_file
+state waiting
+record "$R_W0"
+printf 'head\0tail\nsk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/blob.bin"
+report file_scan_flags_token_in_binary_file
+expect file_scan FAIL 'blob.bin'
+finish_case
+
+git_project() {
+    git -C "$t/sandbox/project" init -q
+    git -C "$t/sandbox/project" -c core.hooksPath=/dev/null -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m init
+}
+
+mk j13_clean_work_tree
+git_project
+begin j13_clean_work_tree sh "$t/probe" --only J13
+expect_rc 0
+expect_report J13 sandbox
+expect work_tree_status PASS 'git status ran'
+fact '.clean' true
+finish_case
+
+mk j13_unreadable_index_is_not_a_clean_work_tree
+git_project
+printf 'garbage' >"$t/sandbox/project/.git/index"
+begin j13_unreadable_index_is_not_a_clean_work_tree sh "$t/probe" --only J13
+expect_rc 0
+expect_report J13 sandbox
+expect work_tree_status FAIL 'cleanliness of the work tree is unknown'
+fact '.clean' false
+finish_case
+
+mk j15_runs_the_hello_world_image_by_digest
+mkdir "$t/bin"
+cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+case "$*" in
+    "run --rm hello-world@sha256:"*) echo "Hello from Docker!" ;;
+    *) exit 1 ;;
+esac
+EOF
+chmod +x "$t/bin/docker"
+begin j15_runs_the_hello_world_image_by_digest env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J15 --docker on
+expect_rc 0
+expect_report J15 sandbox
+expect hello_world PASS '@sha256:'
+fact '.run.hello' true
+finish_case
+
 mk name_rule
 corpus_yes='OPENAI_API_KEY KEY MY_KEY_2 AUTH PASSWORD CREDENTIAL CREDENTIALS X_TOKEN DB_PASSWD A_SECRET_B'
 corpus_no='KEYBOARD TOKENIZER OAUTH_X SSH_AUTH_SOCK openai_api_key'
+set --
 for corpus_name in $corpus_yes $corpus_no; do
-    printf '%s=v\n' "$corpus_name"
-done >"$t/names.env"
-sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc#$t/proc#g" -e '$d' "$probe" >"$t/probe"
-matched=$(env -i PATH="$PATH" sh -c ". \"\$1\"; credential_variables x <\"\$2\"" sh "$t/probe" "$t/names.env" | cut -f1 | sort | tr '\n' ' ')
+    set -- "$@" "$corpus_name=v"
+done
+begin name_rule "$@" sh "$t/probe" --only J08
+expect_rc 0
+matched=$(jq -r '.steps.J08.facts.environment[] | select(.source == "probe") | .name' "$t/out" | sort | tr '\n' ' ')
 wanted=$(echo "$corpus_yes" | tr ' ' '\n' | sort | tr '\n' ' ')
-if [ "$matched" = "$wanted" ]; then
-    echo "ok   name_rule"
-else
-    failures=$((failures + 1))
-    echo "FAIL name_rule: got [$matched] want [$wanted]"
-fi
+[ "$matched" = "$wanted" ] || problems="$problems got [$matched] want [$wanted]"
+finish_case
 
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

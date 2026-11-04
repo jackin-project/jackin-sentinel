@@ -14,6 +14,7 @@ CODEX_HOME_DIR=/sandbox/.codex
 CODEX_BIN=/usr/local/bin/codex
 CODEX_COMM=codex
 START_BIN=/usr/local/bin/jackin-start
+HELLO_IMAGE='hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef'
 HOOK_DIR=/usr/local/lib/jackin/hooks
 RECORD_FILE=$JACKIN_DIR/run/env-kinds
 RUN_STATE_FILE=$JACKIN_DIR/run/state
@@ -257,6 +258,8 @@ ensure_codex_exec() {
         credential=chatgpt_login
     elif [ -n "${OPENAI_API_KEY-}" ]; then
         credential=api_key
+    elif [ -f "$CODEX_HOME_DIR/auth.json" ] && jq -e '(.OPENAI_API_KEY // "") != ""' "$CODEX_HOME_DIR/auth.json" >/dev/null 2>&1; then
+        credential=api_key
     fi
     attempted=false
     exit_code=
@@ -267,7 +270,7 @@ ensure_codex_exec() {
         out=$(cd "$SCAN_ROOT" && timeout 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 2>/dev/null </dev/null)
         exit_code=$?
         bytes=$(printf '%s' "$out" | wc -c | tr -d ' ')
-        if printf '%s' "$out" | grep -qi 'ready'; then
+        if [ "$exit_code" -eq 0 ] && printf '%s' "$out" | grep -qi 'ready'; then
             answered=true
         fi
     fi
@@ -348,13 +351,14 @@ credential_variables() {
 }
 
 scan_leaks() {
-    find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f -size -2048k -print0 2>/dev/null |
-        xargs -0 -r grep -IlE -e 'sk-[A-Za-z0-9_-]{20,}' \
+    find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f -print0 2>/dev/null |
+        xargs -0 -r grep -alE -e 'sk-[A-Za-z0-9_-]{20,}' \
             -e 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' \
             -e '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' 2>/dev/null |
         while IFS= read -r file; do
-            if grep -qE -e 'sk-[A-Za-z0-9_-]{20,}' -e '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$file" 2>/dev/null ||
-                grep -oE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' "$file" 2>/dev/null | grep -qv '\.placeholder$'; then
+            if grep -aqE -e 'sk-[A-Za-z0-9_-]{20,}' "$file" 2>/dev/null ||
+                grep -aoE 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}' "$file" 2>/dev/null | grep -qv '\.placeholder$' ||
+                grep -aoE '"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"' "$file" 2>/dev/null | grep -aqvE ':[[:space:]]*"openshell:resolve:[^"]*"$'; then
                 printf '%s\n' "$file"
             fi
         done | head -n 50
@@ -437,8 +441,11 @@ step_J05() (
         if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             git_work_tree=true
         fi
-        files=$(cd "$PROJECT" && find . -path ./.git -prune -o -type f -print0 | xargs -0 -r sha256sum |
-            jq -Rn '[inputs | capture("^(?<sha256>[0-9a-f]{64})  (?<path>.*)$")? | .path |= ltrimstr("./")] | sort_by(.path)')
+        files=$(cd "$PROJECT" && find . -path ./.git -prune -o -type f -exec sh -c '
+            for file; do
+                sum=$(sha256sum <"$file" 2>/dev/null) || continue
+                jq -cn --arg sha256 "${sum%% *}" --arg path "${file#./}" "{sha256: \$sha256, path: \$path}"
+            done' sh {} + | jq -s 'sort_by(.path)')
     else
         fail project_dir "$PROJECT is missing"
     fi
@@ -672,6 +679,7 @@ step_J08() (
     scope="checked: $read_from, $CODEX_HOME_DIR/auth.json, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
     auth_file=null
     auth_problem=
+    auth_placeholders=0
     auth="$CODEX_HOME_DIR/auth.json"
     if [ -f "$auth" ]; then
         kinds=$(token_kinds "$auth") || kinds=
@@ -686,13 +694,14 @@ EOF
             '{path: $path, mode: $mode, access_token: $a, refresh_token: $r, id_token: $i}')
         for kind in "${access:-other}" "${refresh:-other}" "${idt:-other}"; do
             [ "$kind" = other ] && auth_problem=1
+            [ "$kind" = placeholder ] && auth_placeholders=$((auth_placeholders + 1))
         done
     fi
     leaks=$(scan_leaks | jq -Rn '[inputs]')
-    if [ "$placeholders" -eq 0 ] && [ "$auth_file" = null ]; then
-        skip credential "the sandbox holds no credential ($scope)"
+    if [ "$placeholders" -eq 0 ] && [ "$auth_placeholders" -eq 0 ]; then
+        skip credential "the sandbox holds no credential placeholder ($scope)"
     else
-        pass credential "$placeholders placeholder variables, auth.json present: $([ "$auth_file" = null ] && echo no || echo yes) ($scope)"
+        pass credential "$placeholders placeholder variables, $auth_placeholders placeholder tokens in auth.json ($scope)"
     fi
     if [ "$record_state" = malformed ]; then
         fail environment "malformed start record"
@@ -751,7 +760,7 @@ step_J09() (
         if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
             pass codex_reaches_api "codex exec answered"
         else
-            fail codex_reaches_api "codex exec gave no answer"
+            fail codex_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
         fi
     else
         skip codex_reaches_api "the sandbox holds no credential"
@@ -786,7 +795,7 @@ step_J10() (
             dirs="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
         fi
         for dir in $dirs; do
-            [ -d "$dir" ] || continue
+            [ -d "$dir" ] || [ "$expected" = allowed ] || continue
             path="$dir/jackin-sentinel-j10-$$"
             dac=false
             [ -w "$dir" ] && dac=true
@@ -856,13 +865,17 @@ step_J13() (
     branch=
     head=
     clean=true
+    status_known=false
     stash=0
     branches='[]'
     if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         work_tree=true
         branch=$(git_in symbolic-ref --short -q HEAD 2>/dev/null)
         head=$(git_in rev-parse -q --verify HEAD 2>/dev/null)
-        if [ -n "$(git_in status --porcelain 2>/dev/null)" ]; then
+        if porcelain=$(git_in status --porcelain 2>/dev/null); then
+            status_known=true
+            [ -z "$porcelain" ] || clean=false
+        else
             clean=false
         fi
         stash=$(git_in stash list 2>/dev/null | wc -l | tr -d ' ')
@@ -878,6 +891,11 @@ step_J13() (
         pass head "$head"
     else
         fail head "HEAD is unborn or unreadable"
+    fi
+    if [ "$status_known" = true ]; then
+        pass work_tree_status "git status ran"
+    else
+        fail work_tree_status "git status failed, so the cleanliness of the work tree is unknown"
     fi
     jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
         --argjson branches "$branches" --argjson clean "$clean" --argjson stash "$stash" \
@@ -945,7 +963,7 @@ EOF
     engine_id=
     engine_version=
     if [ "$found" = true ]; then
-        out=$(timeout 300 docker run --rm hello-world 2>&1 </dev/null)
+        out=$(timeout 300 docker run --rm "$HELLO_IMAGE" 2>&1 </dev/null)
         run_exit=$?
         if printf '%s' "$out" | grep -q 'Hello from Docker!'; then
             hello=true
@@ -977,9 +995,9 @@ EOF
         fail certificates "problem:$cert_problem"
     fi
     if [ "$hello" = true ] && [ "$run_exit" = 0 ]; then
-        pass hello_world "docker run --rm hello-world printed the hello text"
+        pass hello_world "docker run --rm $HELLO_IMAGE printed the hello text"
     else
-        fail hello_world "docker run --rm hello-world exit ${run_exit:-none}"
+        fail hello_world "docker run --rm $HELLO_IMAGE exit ${run_exit:-none}"
     fi
     if [ -n "$engine_id" ]; then
         pass engine "$engine_id"
@@ -1085,7 +1103,10 @@ main() {
         shift
     done
     if [ -n "$only" ]; then
-        [ -n "$(printf '%s' "$only" | tr -d ', ')" ] || usage
+        case $only in
+            *[!A-Za-z0-9,]*) usage ;;
+        esac
+        [ -n "$(printf '%s' "$only" | tr -d ',')" ] || usage
         for id in $(printf '%s' "$only" | tr ',' ' '); do
             case " $ALL_STEPS " in
                 *" $id "*) ;;
