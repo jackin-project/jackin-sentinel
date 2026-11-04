@@ -531,6 +531,52 @@ report file_scan_ignores_sk_inside_a_word
 expect file_scan PASS 'no token-shaped string'
 finish_case
 
+b64url() {
+    printf '%s' "$1" | base64 | tr -d '\n=' | tr '+/' '-_'
+}
+
+JWT_HEADER=$(b64url '{"alg":"ES256","kid":"oailb-v1","typ":"JWT"}')
+JWT_NO_SUB=$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":1,"iss":"edge-gateway"}')
+JWT_WITH_SUB=$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":1,"iss":"edge-gateway","sub":"user-FAKE"}')
+JWT_SIGNATURE=ZmFrZXNpZ25hdHVyZWZha2VzaWduYXR1cmU
+
+mk file_scan_passes_a_jwt_without_a_sub_claim_in_a_binary_file
+state waiting
+record "$R_W0"
+printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$JWT_NO_SUB" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+report file_scan_passes_a_jwt_without_a_sub_claim_in_a_binary_file
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
+finish_case
+
+mk file_scan_flags_a_jwt_with_a_sub_claim_in_a_binary_file
+state waiting
+record "$R_W0"
+printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$JWT_WITH_SUB" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+report file_scan_flags_a_jwt_with_a_sub_claim_in_a_binary_file
+expect file_scan FAIL 'logs.sqlite'
+fact '.leaks | length' 1
+finish_case
+
+mk file_scan_flags_a_jwt_shaped_string_that_does_not_decode
+state waiting
+record "$R_W0"
+printf 'head\0token=eyJhaaaaaaaaaaaa.eyJbbbbbbbbbbbbbb.%s\0tail\n' "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+report file_scan_flags_a_jwt_shaped_string_that_does_not_decode
+expect file_scan FAIL 'logs.sqlite'
+fact '.leaks | length' 1
+finish_case
+
+mk file_scan_accepts_a_placeholder_id_token
+state waiting
+record "$R_W0"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"$PLACEHOLDER_REFRESH\",\"id_token\":\"$JWT_HEADER.$JWT_WITH_SUB.placeholder\"}}"
+report file_scan_accepts_a_placeholder_id_token
+expect auth_file PASS 'only placeholders'
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
+finish_case
+
 mk file_scan_flags_token_in_name_with_newline
 state waiting
 record "$R_W0"

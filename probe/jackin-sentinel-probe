@@ -369,6 +369,21 @@ listed() {
     { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
         SAFE=$2 awk '$0 == "SCAN_ERROR" { bad = 1; next } $0 !~ ENVIRON["SAFE"] { hit = 1 } END { print bad ? "error" : (hit ? "hit" : "none") }'
 }
+jwt_listed() {
+    { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
+        jq -nrR --arg safe "$2" '
+            def b64: gsub("-"; "+") | gsub("_"; "/")
+                | (length % 4) as $m
+                | if $m == 2 then . + "==" elif $m == 3 then . + "=" elif $m == 1 then error("length") else . end
+                | @base64d;
+            def verdict:
+                if . == "SCAN_ERROR" then "error"
+                elif test($safe) then "none"
+                else (try (split(".")[1] | b64 | fromjson | if type == "object" and (has("sub") | not) then "none" else "hit" end) catch "hit")
+                end;
+            reduce (inputs | verdict) as $v ("none";
+                if . == "error" or $v == "error" then "error" elif . == "hit" or $v == "hit" then "hit" else "none" end)'
+}
 mode=$1
 shift
 for file; do
@@ -395,7 +410,11 @@ for file; do
     esac
     timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" "$file"
     sk=$?
-    jwt=$(listed "$LEAK_JWT" "$LEAK_JWT_SAFE" "$file")
+    jwt=$(jwt_listed "$LEAK_JWT" "$LEAK_JWT_SAFE" "$file")
+    case $jwt in
+        none | hit) ;;
+        *) jwt=error ;;
+    esac
     rt=$(listed "$LEAK_RT" "$LEAK_RT_SAFE" "$file")
     if [ "$sk" -eq 0 ] || [ "$jwt" = hit ] || [ "$rt" = hit ]; then
         emit leak "$file" "token-shaped string"
