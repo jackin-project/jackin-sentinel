@@ -28,3 +28,9 @@ repos:
         entry: sh probe/tests/j08.sh
         files: ^probe/(jackin-sentinel-probe|tests/j08\.sh)$
         pass_filenames: false
+      - id: probe-egress
+        name: probe egress cases
+        language: system
+        entry: sh probe/tests/egress.sh
+        files: ^probe/(jackin-sentinel-probe|tests/egress\.sh)$
+        pass_filenames: false

@@ -94,14 +94,14 @@ Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, 
 | J06 | The execution counts of the hooks, and the owner and mode of the installed hook files. |
 | J07 | The main process, its Codex child, and the answer of a `codex exec` call. |
 | J08 | Whether every credential variable and every token in `auth.json` is a placeholder, and which files hold a token-shaped string. The probe never prints a value. |
-| J09 | The result of `curl` to a host outside the policy, to the metadata address, and to a Codex provider host. |
+| J09 | The `curl` exit code and HTTP code for a host outside the policy, the metadata address, and a Codex provider host. A denial is curl exit 7 with no HTTP response. Exit 6 (the name did not resolve), a missing `curl`, and any other exit are not a denial. |
 | J10 | Which file creations succeed under `/sandbox` and `/tmp` and which fail elsewhere. |
 | J11 | The Codex process with its pid and start time, for a comparison before and after a detach. |
 | J12 | The probe process, its controlling terminal, and whether it descends from the main process. |
 | J13 | The git state of `/sandbox/project`: branches, tips, HEAD, cleanliness, and stash count. |
 | J14 | A marker file, the boot id, and the hook counts, for a comparison after stop and start. |
 | J15 | With `--docker on`: the Docker variables, the client certificates, the output of a `hello-world` container that the agent starts through the engine, and the engine id. |
-| J16 | With `--docker off`: no `docker` binary, no `DOCKER_` variable, and no connection to the engine endpoint. |
+| J16 | With `--docker off`: no `docker` binary, no `DOCKER_` variable, and no connection to the engine endpoint. Curl exit 7 is a denial. Exit 6 counts only when a control name (`example.com`) resolves and is refused in the same run, so a resolver fault does not pass. |
 
 J01, J02, J03, and J17 have no in-sandbox part. `xtask e2e` runs them on the host.
 
@@ -126,7 +126,7 @@ The capability is off in the manifest. Enable it for a launch with `docker = tru
 
 ## Repository checks
 
-`mise run test` runs `prek run --all-files`: gitleaks, shellcheck, shfmt, hadolint, and the J08 cases of `probe/tests/j08.sh`.
+`mise run test` runs `prek run --all-files`: gitleaks, shellcheck, shfmt, hadolint, the J08 cases of `probe/tests/j08.sh`, and the J09 and J16 egress cases of `probe/tests/egress.sh`.
 
 `velnor` generates the CI workflows from `.velnor/config.toml`. Do not edit them by hand.
 

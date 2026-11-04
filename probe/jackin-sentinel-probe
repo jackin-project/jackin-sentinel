@@ -280,6 +280,10 @@ ensure_codex_exec() {
 egress() {
     url=$1
     bearer=${2-}
+    if ! have curl; then
+        jq -cn --arg url "$url" '{url: $url, curl_found: false, curl_exit: null, http_code: 0}'
+        return 0
+    fi
     if [ -n "$bearer" ]; then
         printf 'Authorization: Bearer %s\n' "$bearer" >"$work/header"
         code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
@@ -289,7 +293,33 @@ egress() {
         rc=$?
     fi
     jq -cn --arg url "$url" --argjson rc "$rc" --arg code "${code:-000}" \
-        '{url: $url, curl_exit: $rc, http_code: ($code | tonumber)}'
+        '{url: $url, curl_found: true, curl_exit: $rc, http_code: ($code | tonumber)}'
+}
+
+egress_outcome() {
+    printf '%s' "$1" | jq -r '
+        if .curl_found != true then "curl_missing"
+        elif .http_code != 0 then "answered"
+        elif .curl_exit == 7 then "refused"
+        elif .curl_exit == 6 then "unresolved"
+        else "failed" end'
+}
+
+egress_fault() {
+    case $(egress_outcome "$2") in
+        curl_missing) echo "curl is not installed, so the probe cannot test $1" ;;
+        answered) echo "$1 answered HTTP $(printf '%s' "$2" | jq -r '.http_code')" ;;
+        unresolved) echo "$1 did not resolve (curl exit 6): a resolver fault is not a policy denial" ;;
+        *) echo "$1 gave curl exit $(printf '%s' "$2" | jq -r '.curl_exit') and no HTTP response: not a policy denial" ;;
+    esac
+}
+
+denial_check() {
+    if [ "$(egress_outcome "$3")" = refused ]; then
+        pass "$1" "$2 refused the connection (curl exit 7, no HTTP response)"
+    else
+        fail "$1" "$(egress_fault "$2" "$3")"
+    fi
 }
 
 token_kinds() {
@@ -726,18 +756,12 @@ step_J09() (
     else
         skip codex_reaches_api "the sandbox holds no credential"
     fi
-    if [ "$(printf '%s' "$outside" | jq -r '.http_code')" = 0 ]; then
-        pass outside_host_denied "no response from example.com"
-    else
-        fail outside_host_denied "example.com answered $(printf '%s' "$outside" | jq -r '.http_code')"
-    fi
-    if [ "$(printf '%s' "$metadata" | jq -r '.http_code')" = 0 ]; then
-        pass metadata_denied "no response from 169.254.169.254"
-    else
-        fail metadata_denied "169.254.169.254 answered $(printf '%s' "$metadata" | jq -r '.http_code')"
-    fi
+    denial_check outside_host_denied example.com "$outside"
+    denial_check metadata_denied 169.254.169.254 "$metadata"
     if [ "$provider" = null ]; then
         skip provider_no_credential "no placeholder to send"
+    elif [ "$(egress_outcome "$provider")" = curl_missing ]; then
+        fail provider_no_credential "$(egress_fault api.openai.com "$provider")"
     else
         code=$(printf '%s' "$provider" | jq -r '.http_code')
         case $code in
@@ -981,13 +1005,14 @@ step_J16() (
     have docker && binary=true
     variables=$(env | sed -n 's/^\(DOCKER_[A-Za-z0-9_]*\)=.*/\1/p' | jq -Rn '[inputs]')
     attempted=false
-    curl_exit=
-    http_code=0
+    curl_found=false
+    have curl && curl_found=true
+    reply=null
+    control=null
     if [ -n "$engine" ]; then
         attempted=true
         reply=$(egress "https://$engine/_ping")
-        curl_exit=$(printf '%s' "$reply" | jq -r '.curl_exit')
-        http_code=$(printf '%s' "$reply" | jq -r '.http_code')
+        control=$(egress https://example.com)
     fi
     if [ "$binary" = false ]; then
         pass docker_binary "no docker binary"
@@ -1001,15 +1026,23 @@ step_J16() (
     fi
     if [ "$attempted" = false ]; then
         skip engine_denied "no --engine endpoint was given"
-    elif [ "$curl_exit" = 6 ] || [ "$curl_exit" = 7 ]; then
-        pass engine_denied "no connection to $engine (curl exit $curl_exit)"
     else
-        fail engine_denied "the connection to $engine was not refused (curl exit $curl_exit, HTTP $http_code)"
+        case $(egress_outcome "$reply") in
+            unresolved)
+                if [ "$(egress_outcome "$control")" = refused ]; then
+                    pass engine_denied "$engine does not resolve (curl exit 6) while example.com resolves and is refused: the policy refuses the name"
+                else
+                    fail engine_denied "$engine did not resolve (curl exit 6) and the control name example.com gave $(egress_outcome "$control"): a resolver fault cannot be told from a policy denial"
+                fi
+                ;;
+            *) denial_check engine_denied "$engine" "$reply" ;;
+        esac
     fi
     jq -n --argjson binary "$binary" --argjson variables "$variables" --arg engine "$engine" \
-        --argjson attempted "$attempted" --arg curl_exit "$curl_exit" --argjson http_code "$http_code" \
+        --argjson attempted "$attempted" --argjson curl_found "$curl_found" --argjson reply "$reply" --argjson control "$control" \
         "$JQN"'{docker_binary: $binary, docker_variables: $variables, endpoint: ($engine | n),
-          connection: {attempted: $attempted, curl_exit: ($curl_exit | n | if . == null then null else tonumber end), http_code: $http_code}}' >"$work/facts"
+          connection: {attempted: $attempted, curl_found: $curl_found, curl_exit: ($reply.curl_exit // null), http_code: ($reply.http_code // 0)},
+          resolver_control: $control}' >"$work/facts"
 )
 
 main() {
