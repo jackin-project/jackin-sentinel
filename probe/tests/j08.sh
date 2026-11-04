@@ -561,10 +561,23 @@ finish_case
 mk file_scan_flags_a_jwt_shaped_string_that_does_not_decode
 state waiting
 record "$R_W0"
-printf 'head\0token=eyJhaaaaaaaaaaaa.eyJbbbbbbbbbbbbbb.%s\0tail\n' "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+JWT_NOT_JSON=$(b64url '{"not json at all')
+printf 'head\0token=%s.%s.%s\0tail\n' "$JWT_HEADER" "$JWT_NOT_JSON" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
 report file_scan_flags_a_jwt_shaped_string_that_does_not_decode
 expect file_scan FAIL 'logs.sqlite'
 fact '.leaks | length' 1
+finish_case
+
+mk file_scan_skips_when_the_jwt_classifier_fails
+state waiting
+record "$R_W0"
+mkdir "$t/bin"
+exit_shim jq '*base64d*' 5
+printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$JWT_NO_SUB" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+begin file_scan_skips_when_the_jwt_classifier_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan SKIP 'not scanned'
 finish_case
 
 mk file_scan_accepts_a_placeholder_id_token
