@@ -317,10 +317,10 @@ egress() {
     fi
     if [ -n "$bearer" ]; then
         printf 'Authorization: Bearer %s\n' "$bearer" >"$work/header"
-        code=$(curl -sS -o "$body" --max-filesize 65536 -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
+        code=$(curl -q -sS --noproxy '*' -o "$body" --max-filesize 65536 -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
         rc=$?
     else
-        code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null </dev/null)
+        code=$(curl -q -sS --noproxy '*' -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null </dev/null)
         rc=$?
     fi
     jq -cn --arg url "$url" --argjson rc "$rc" --arg code "${code:-000}" \

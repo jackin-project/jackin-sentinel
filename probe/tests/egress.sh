@@ -33,12 +33,22 @@ cat >"$scratch/stub-curl" <<'EOF'
 for last; do :; done
 out=
 header=
+noproxy=
 prev=
 for arg; do
     [ "$prev" = -o ] && out=$arg
     [ "$prev" = -H ] && header=${arg#@}
+    [ "$prev" = --noproxy ] && noproxy=$arg
     prev=$arg
 done
+if [ "${1-}" != -q ] && [ -f "${CURL_HOME:-${HOME-}}/.curlrc" ]; then
+    printf '000'
+    exit 7
+fi
+if [ "$noproxy" != '*' ] && [ -n "${http_proxy-}${https_proxy-}${all_proxy-}${HTTP_PROXY-}${HTTPS_PROXY-}${ALL_PROXY-}" ]; then
+    printf '000'
+    exit 7
+fi
 {
     echo "curl $last"
     [ -z "$header" ] || cat "$header"
@@ -209,6 +219,26 @@ expect outside_host_denied PASS 'refused the connection (curl exit 7'
 expect metadata_denied PASS 'refused the connection (curl exit 7'
 fact '.outside_host | "\(.curl_found) \(.curl_exit) \(.http_code)"' 'true 7 0'
 fact '.metadata_host | "\(.curl_found) \(.curl_exit) \(.http_code)"' 'true 7 0'
+finish_case
+
+mk j09_a_curlrc_of_the_sandbox_user_cannot_turn_an_allowed_host_into_a_denial
+with_curl
+printf 'connect-to = "::127.0.0.1:9"\n' >"$t/sandbox/.curlrc"
+answer "$OUTSIDE" 0 200
+answer "$METADATA" 0 200
+begin j09_a_curlrc_of_the_sandbox_user_cannot_turn_an_allowed_host_into_a_denial step_J09 '' CURL_HOME="$t/sandbox"
+expect outside_host_denied FAIL 'answered HTTP 200'
+expect metadata_denied FAIL 'answered HTTP 200'
+fact '.outside_host | "\(.curl_exit) \(.http_code)"' '0 200'
+finish_case
+
+mk j09_a_proxy_variable_of_the_sandbox_user_cannot_turn_an_allowed_host_into_a_denial
+with_curl
+answer "$OUTSIDE" 0 200
+answer "$METADATA" 0 200
+begin j09_a_proxy_variable_of_the_sandbox_user_cannot_turn_an_allowed_host_into_a_denial step_J09 '' HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9
+expect outside_host_denied FAIL 'answered HTTP 200'
+expect metadata_denied FAIL 'answered HTTP 200'
 finish_case
 
 mk j09_dns_failure_is_not_a_denial
@@ -524,6 +554,15 @@ answer "$OUTSIDE" 6 000
 begin j16_resolver_fault step_J16 "$ENGINE"
 expect engine_denied FAIL 'resolver fault'
 fact '.resolver_control | "\(.curl_found) \(.curl_exit) \(.http_code)"' 'true 6 0'
+finish_case
+
+mk j16_a_curlrc_of_the_sandbox_user_cannot_turn_an_answering_engine_into_a_denial
+with_curl
+printf 'connect-to = "::127.0.0.1:9"\n' >"$t/sandbox/.curlrc"
+answer "$PING" 0 200
+answer "$OUTSIDE" 7 000
+begin j16_a_curlrc_of_the_sandbox_user_cannot_turn_an_answering_engine_into_a_denial step_J16 "$ENGINE" CURL_HOME="$t/sandbox"
+expect engine_denied FAIL 'answered HTTP 200'
 finish_case
 
 mk j16_curl_missing
