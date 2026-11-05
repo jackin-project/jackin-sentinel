@@ -599,12 +599,18 @@ jwt_flagged() {
 jwt_flagged file_scan_flags_a_subless_jwt_of_another_issuer "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"iss":"other-service"}')"
 jwt_flagged file_scan_flags_a_subless_jwt_of_another_audience "$JWT_HEADER" "$(b64url '{"aud":["api.example.com"],"exp":1,"iss":"edge-gateway"}')"
 jwt_flagged file_scan_flags_a_subless_jwt_without_an_audience "$JWT_HEADER" "$(b64url '{"exp":1,"iss":"edge-gateway"}')"
+jwt_flagged file_scan_flags_a_cookie_with_an_extra_secret_claim "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":1,"iss":"edge-gateway","x":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD"}')"
+jwt_flagged file_scan_flags_a_cookie_with_an_email_claim "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"email":"user@example.com","exp":1,"host":"x","iat":1,"iss":"edge-gateway"}')"
+jwt_flagged file_scan_flags_a_cookie_without_a_host_claim "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"iat":1,"iss":"edge-gateway"}')"
+jwt_flagged file_scan_flags_a_cookie_wrapped_around_a_jwt_with_a_sub "$JWT_HEADER" "$JWT_NO_SUB.$JWT_HEADER.$JWT_WITH_SUB"
 jwt_flagged file_scan_flags_a_subless_jwt_of_another_key "$(b64url '{"alg":"ES256","kid":"other-v1","typ":"JWT"}')" "$JWT_NO_SUB"
+jwt_flagged file_scan_flags_a_subless_jwt_with_a_string_audience_of_another_host "$JWT_HEADER" "$(b64url '{"aud":"api.example.com","exp":1,"host":"x","iat":1,"iss":"edge-gateway"}')"
+jwt_flagged file_scan_flags_a_subless_jwt_with_an_extra_audience "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com","api.example.com"],"exp":1,"host":"x","iat":1,"iss":"edge-gateway"}')"
 
 mk file_scan_passes_the_cookie_with_a_string_audience
 state waiting
 record "$R_W0"
-printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$(b64url '{"aud":"chatgpt.com","exp":1,"iss":"edge-gateway"}')" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$(b64url '{"aud":"chatgpt.com","exp":1,"host":"x","iat":1,"iss":"edge-gateway"}')" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
 report file_scan_passes_the_cookie_with_a_string_audience
 expect file_scan PASS 'no token-shaped string'
 finish_case
@@ -911,8 +917,8 @@ expect codex_version FAIL 'failed'
 finish_case
 
 mk name_rule
-corpus_yes='OPENAI_API_KEY KEY MY_KEY_2 AUTH PASSWORD CREDENTIAL CREDENTIALS X_TOKEN DB_PASSWD A_SECRET_B'
-corpus_no='KEYBOARD TOKENIZER OAUTH_X SSH_AUTH_SOCK openai_api_key'
+corpus_yes='OPENAI_API_KEY openai_api_key Openai_Api_Key KEY MY_KEY_2 AUTH PASSWORD CREDENTIAL CREDENTIALS X_TOKEN DB_PASSWD A_SECRET_B'
+corpus_no='KEYBOARD TOKENIZER OAUTH_X oauth_x SSH_AUTH_SOCK ssh_auth_sock'
 set --
 for corpus_name in $corpus_yes $corpus_no; do
     set -- "$@" "$corpus_name=v"
@@ -922,6 +928,143 @@ expect_rc 0
 matched=$(jq -r '.steps.J08.facts.environment[] | select(.source == "probe") | .name' "$t/out" | sort | tr '\n' ' ')
 wanted=$(echo "$corpus_yes" | tr ' ' '\n' | sort | tr '\n' ' ')
 [ "$matched" = "$wanted" ] || problems="$problems got [$matched] want [$wanted]"
+finish_case
+
+INJECTED_JSON='openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN\nX-Exfil: FAKE-REAL-SECRET-0123456789'
+
+mk auth_file_flags_a_newline_after_the_placeholder_prefix
+state waiting
+record "$R_EMPTY"
+auth_json "{\"tokens\":{\"access_token\":\"$INJECTED_JSON\"}}"
+report auth_file_flags_a_newline_after_the_placeholder_prefix
+expect auth_file FAIL 'not a placeholder'
+expect credential SKIP 'no credential placeholder'
+fact '.auth_file.access_token' other
+finish_case
+
+for partial in 'openshell:resolve:' 'openshell:resolve:env:' 'openshell:resolve:env:A B' 'openshell:resolve:env:1A' 'openshell:resolve:file:A' 'openshell:resolve:env:A-B' 'openshell:resolve:env:A\n'; do
+    partial_index=$((${partial_index:-0} + 1))
+    mk "auth_file_flags_the_partial_placeholder_$partial_index"
+    state waiting
+    record "$R_EMPTY"
+    auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"$partial\"}}"
+    report "auth_file_flags_the_partial_placeholder_$partial_index"
+    expect auth_file FAIL 'not a placeholder'
+    finish_case
+done
+
+mk environment_flags_a_newline_after_the_placeholder_prefix
+state waiting
+begin environment_flags_a_newline_after_the_placeholder_prefix env OPENAI_API_KEY="openshell:resolve:env:OPENAI_API_KEY
+X-Exfil: FAKE-REAL-SECRET-0123456789" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'OPENAI_API_KEY'
+fact '.environment[] | select(.name == "OPENAI_API_KEY") | .kind' other
+finish_case
+
+mk environment_flags_a_trailing_newline_after_the_placeholder
+state waiting
+begin environment_flags_a_trailing_newline_after_the_placeholder env OPENAI_API_KEY="openshell:resolve:env:OPENAI_API_KEY
+" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'OPENAI_API_KEY'
+finish_case
+
+mk environment_reads_the_continuation_of_a_credential_in_the_main_environment
+state waiting
+proc_main
+{
+    printf 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY\nX-Exfil: FAKE-REAL-SECRET-0123456789\0'
+} >"$t/proc/100/environ"
+verify environment_reads_the_continuation_of_a_credential_in_the_main_environment FAIL 'OPENAI_API_KEY' absent
+
+for partial in 'openshell:resolve:' 'openshell:resolve:env:' 'openshell:resolve:env:A B' 'openshell:resolve:env:1A' 'openshell:resolve:file:A' 'openshell:resolve:env:A-B'; do
+    partial_index=$((${partial_index:-0} + 1))
+    mk "environment_flags_the_partial_placeholder_$partial_index"
+    state waiting
+    begin "environment_flags_the_partial_placeholder_$partial_index" env X_TOKEN="$partial" sh "$t/probe" --only J08
+    expect_rc 0
+    expect_report J08 sandbox
+    expect environment FAIL 'X_TOKEN'
+    finish_case
+done
+
+mk environment_accepts_the_full_placeholder_in_a_lower_case_name
+state waiting
+begin environment_accepts_the_full_placeholder_in_a_lower_case_name env openai_api_key="openshell:resolve:env:OPENAI_API_KEY" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect credential PASS '1 placeholder variables'
+fact '.environment[] | select(.name == "openai_api_key") | .kind' placeholder
+finish_case
+
+mk environment_flags_a_real_value_in_a_lower_case_name
+state waiting
+begin environment_flags_a_real_value_in_a_lower_case_name env openai_api_key=FAKE-real-key sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'openai_api_key'
+finish_case
+
+mk file_scan_flags_sk_after_a_json_newline_escape
+state waiting
+record "$R_W0"
+printf '{"k":"x\\nsk-%s"}\n' FAKEFAKEFAKEFAKEFAKE0123456789ABCD >"$t/sandbox/notes.json"
+report file_scan_flags_sk_after_a_json_newline_escape
+expect file_scan FAIL 'notes.json'
+fact '.leaks | length' 1
+finish_case
+
+mk file_scan_flags_sk_after_a_json_unicode_escape
+state waiting
+record "$R_W0"
+printf '{"k":"x\\u000ask-%s"}\n' FAKEFAKEFAKEFAKEFAKE0123456789ABCD >"$t/sandbox/notes.json"
+report file_scan_flags_sk_after_a_json_unicode_escape
+expect file_scan FAIL 'notes.json'
+finish_case
+
+mk file_scan_ignores_sk_inside_a_word_after_an_escape_letter
+state waiting
+record "$R_W0"
+printf '{"k":"C:\\\\temp\\\\task-manager-configuration-value-for-the-job"}\n' >"$t/sandbox/notes.json"
+report file_scan_ignores_sk_inside_a_word_after_an_escape_letter
+expect file_scan PASS 'no token-shaped string'
+finish_case
+
+mk file_scan_flags_a_refresh_token_that_only_starts_like_a_placeholder
+state waiting
+record "$R_W0"
+printf '{"refresh_token":"openshell:resolve:env:A-real-secret-0123456789"}\n' >"$t/sandbox/session.json"
+report file_scan_flags_a_refresh_token_that_only_starts_like_a_placeholder
+expect file_scan FAIL 'session.json'
+finish_case
+
+mk auth_file_skips_when_auth_json_is_absent
+state waiting
+record "$R_EMPTY"
+report auth_file_skips_when_auth_json_is_absent
+expect auth_file SKIP 'no auth.json'
+fact '.auth_file' null
+finish_case
+
+mk auth_file_fails_when_auth_json_is_a_directory
+state waiting
+record "$R_EMPTY"
+mkdir -p "$t/sandbox/.codex/auth.json"
+report auth_file_fails_when_auth_json_is_a_directory
+expect auth_file FAIL 'not a regular file'
+fact '.auth_file' null
+finish_case
+
+mk auth_file_fails_when_auth_json_is_a_dangling_symlink
+state waiting
+record "$R_EMPTY"
+mkdir -p "$t/sandbox/.codex"
+ln -s "$t/missing-target" "$t/sandbox/.codex/auth.json"
+report auth_file_fails_when_auth_json_is_a_dangling_symlink
+expect auth_file FAIL 'not a regular file'
 finish_case
 
 echo "$total cases, $failures failed"

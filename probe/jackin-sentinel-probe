@@ -22,11 +22,12 @@ RECORD_MAX=65536
 SCAN_ROOT=/sandbox
 SCAN_MAX_KIB=262144
 SCAN_GREP_SECONDS=20
-LEAK_SK='(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}'
+LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
 LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
 LEAK_JWT_SAFE='\.placeholder$'
 LEAK_RT='"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"'
-LEAK_RT_SAFE=':[[:space:]]*"openshell:resolve:[^"]*"$'
+LEAK_RT_SAFE=':[[:space:]]*"openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*"$'
+PLACEHOLDER_RE='^openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*'
 J10_ALLOWED="$STATE_DIR /tmp"
 J10_DENIED="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
 PROMPT='Reply with the word ready'
@@ -263,13 +264,30 @@ process_checks() {
 ensure_codex_exec() {
     [ -f "$work/codex_exec.json" ] && return 0
     credential=none
-    if [ -f "$CODEX_HOME_DIR/auth.json" ] && jq -e '(.tokens.access_token // "") != ""' "$CODEX_HOME_DIR/auth.json" >/dev/null 2>&1; then
+    why="the sandbox holds no credential"
+    auth="$CODEX_HOME_DIR/auth.json"
+    unsafe=
+    if [ -e "$auth" ] || [ -L "$auth" ]; then
+        kinds=$(token_kinds "$auth") || kinds="other other other"
+        case $kinds in
+            *other*) unsafe=1 ;;
+        esac
+    fi
+    for value in "${CODEX_AUTH_ACCESS_TOKEN-}" "${OPENAI_API_KEY-}"; do
+        if [ -n "$value" ] && ! is_placeholder "$value"; then
+            unsafe=1
+        fi
+    done
+    if [ -n "$unsafe" ]; then
+        why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
+    elif [ -f "$auth" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$auth" >/dev/null 2>&1; then
         credential=chatgpt_login
     elif [ -n "${OPENAI_API_KEY-}" ]; then
         credential=api_key
-    elif [ -f "$CODEX_HOME_DIR/auth.json" ] && jq -e '(.OPENAI_API_KEY // "") != ""' "$CODEX_HOME_DIR/auth.json" >/dev/null 2>&1; then
+    elif [ -f "$auth" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$auth" >/dev/null 2>&1; then
         credential=api_key
     fi
+    printf '%s' "$why" >"$work/codex_exec.why"
     attempted=false
     exit_code=
     answered=false
@@ -292,13 +310,14 @@ ensure_codex_exec() {
 egress() {
     url=$1
     bearer=${2-}
+    body=${3-/dev/null}
     if ! have curl; then
         jq -cn --arg url "$url" '{url: $url, curl_found: false, curl_exit: null, http_code: 0}'
         return 0
     fi
     if [ -n "$bearer" ]; then
         printf 'Authorization: Bearer %s\n' "$bearer" >"$work/header"
-        code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
+        code=$(curl -sS -o "$body" --max-filesize 65536 -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
         rc=$?
     else
         code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null </dev/null)
@@ -326,6 +345,14 @@ egress_fault() {
     esac
 }
 
+provider_saw_only() {
+    head -c 65536 "$2" 2>/dev/null | jq -e --arg p "$1" '
+        def shown: if ($p | length) > 12 then $p[0:8] + ([range(($p | length) - 12)] | map("*") | join("")) + $p[-4:] else $p end;
+        .error.code == "invalid_api_key"
+        and (.error.message | type == "string")
+        and (.error.message as $m | [shown, $p] | any(. as $s | $m | startswith("Incorrect API key provided: " + $s + ". ")))' >/dev/null 2>&1
+}
+
 denial_check() {
     if [ "$(egress_outcome "$3")" = refused ]; then
         pass "$1" "$2 refused the connection (curl exit 7, no HTTP response)"
@@ -335,12 +362,12 @@ denial_check() {
 }
 
 token_kinds() {
-    jq -r '
+    jq -r --arg re "$PLACEHOLDER_RE" '
         def kind($v; $jwt):
             if $v == null then "absent"
             elif $v == "" then "empty"
             elif $jwt then (if ($v | endswith(".placeholder")) then "placeholder" else "other" end)
-            elif ($v | startswith("openshell:resolve:")) then "placeholder"
+            elif ($v | type == "string" and test($re + "\\z")) then "placeholder"
             else "other" end;
         def worst:
             if any(. == "other") then "other"
@@ -353,16 +380,29 @@ token_kinds() {
 }
 
 credential_variables() {
-    awk -v source="$1" '
+    awk -v source="$1" -v re="$PLACEHOLDER_RE" '
+        function flush() {
+            if (current != "") print current "\t" kind "\t" source
+            current = ""
+        }
         /^[A-Za-z_][A-Za-z0-9_]*=/ {
+            flush()
             name = $0
             sub(/=.*/, "", name)
-            value = substr($0, length(name) + 2)
-            if (name != "SSH_AUTH_SOCK" && name ~ /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)/) {
-                kind = (value == "") ? "empty" : ((value ~ /^openshell:resolve:/) ? "placeholder" : "other")
-                print name "\t" kind "\t" source
+            upper = toupper(name)
+            if (upper != "SSH_AUTH_SOCK" && upper ~ /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)/) {
+                value = substr($0, length(name) + 2)
+                current = name
+                kind = (value == "") ? "empty" : ((value ~ (re "$")) ? "placeholder" : "other")
             }
-        }'
+            next
+        }
+        { if (current != "") kind = "other" }
+        END { flush() }'
+}
+
+is_placeholder() {
+    jq -en --arg v "$1" --arg re "$PLACEHOLDER_RE" '$v | test($re + "\\z")' >/dev/null 2>&1
 }
 
 scan_leaks() {
@@ -385,8 +425,10 @@ jwt_listed() {
             def part($i): split(".")[$i] | b64 | fromjson;
             def audience: if type == "string" then . == "chatgpt.com" elif type == "array" then . == ["chatgpt.com"] else false end;
             def known_cookie:
-                (part(0) | type == "object" and .kid == "oailb-v1")
-                and (part(1) | type == "object" and .iss == "edge-gateway" and (has("sub") | not) and (.aud | audience));
+                (split(".")[2] | startswith("eyJ") | not)
+                and (part(0) | type == "object" and .kid == "oailb-v1")
+                and (part(1) | type == "object" and (keys | sort) == ["aud", "exp", "host", "iat", "iss"]
+                     and .iss == "edge-gateway" and (.aud | audience));
             def verdict:
                 if . == "SCAN_ERROR" then "error"
                 elif test($safe) then "none"
@@ -610,7 +652,7 @@ step_J07() (
             fail codex_exec "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
         fi
     else
-        skip codex_exec "the sandbox holds no credential"
+        skip codex_exec "$(cat "$work/codex_exec.why")"
     fi
     jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/codex_exec.json" \
         '{processes: $p[0], codex_exec: $x[0]}' >"$work/facts"
@@ -816,10 +858,16 @@ EOF
     else
         pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
     fi
-    if [ -z "$auth_problem" ]; then
-        pass auth_file "auth.json holds only placeholders and empty values"
+    if [ -f "$auth" ]; then
+        if [ -z "$auth_problem" ]; then
+            pass auth_file "auth.json holds only placeholders and empty values"
+        else
+            fail auth_file "auth.json holds a token that is not a placeholder"
+        fi
+    elif [ -e "$auth" ] || [ -L "$auth" ]; then
+        fail auth_file "$auth exists but is not a regular file, so the probe did not examine its tokens"
     else
-        fail auth_file "auth.json holds a token that is not a placeholder"
+        skip auth_file "no auth.json at $auth, so there is no file to examine"
     fi
     if [ "$leaks" != '[]' ]; then
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
@@ -853,12 +901,11 @@ step_J09() (
     if [ -z "$bearer" ] && [ -f "$CODEX_HOME_DIR/auth.json" ]; then
         bearer=$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
     fi
-    case $bearer in
-        openshell:resolve:*) provider=$(egress https://api.openai.com/v1/models "$bearer") ;;
-        *)
-            provider=null
-            ;;
-    esac
+    provider=null
+    if [ -n "$bearer" ] && is_placeholder "$bearer"; then
+        : >"$work/provider.body"
+        provider=$(egress https://api.openai.com/v1/models "$bearer" "$work/provider.body")
+    fi
     if [ "$(jq -r '.attempted' "$work/codex_exec.json")" = true ]; then
         if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
             pass codex_reaches_api "codex exec answered"
@@ -866,7 +913,7 @@ step_J09() (
             fail codex_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
         fi
     else
-        skip codex_reaches_api "the sandbox holds no credential"
+        skip codex_reaches_api "$(cat "$work/codex_exec.why")"
     fi
     denial_check outside_host_denied example.com "$outside"
     denial_check metadata_denied 169.254.169.254 "$metadata"
@@ -874,13 +921,23 @@ step_J09() (
         skip provider_no_credential "no placeholder to send"
     elif [ "$(egress_outcome "$provider")" = curl_missing ]; then
         fail provider_no_credential "$(egress_fault api.openai.com "$provider")"
+    elif [ "$(egress_outcome "$provider")" != answered ]; then
+        fail provider_no_credential "api.openai.com gave no HTTP response, so the probe cannot show that no credential was applied"
     else
         code=$(printf '%s' "$provider" | jq -r '.http_code')
         case $code in
             2??) fail provider_no_credential "curl got HTTP $code from the provider host" ;;
-            *) pass provider_no_credential "curl got HTTP $code, no credential was applied" ;;
+            401)
+                if provider_saw_only "$bearer" "$work/provider.body"; then
+                    pass provider_no_credential "HTTP 401: the provider named only the placeholder, so no credential was applied"
+                else
+                    fail provider_no_credential "HTTP 401 without the invalid-key answer for the placeholder: the provider may have seen another credential"
+                fi
+                ;;
+            *) fail provider_no_credential "curl got HTTP $code, not the 401 that shows the provider saw only the placeholder" ;;
         esac
     fi
+    rm -f "$work/provider.body"
     jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/codex_exec.json" \
         '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, codex_exec: $x[0]}' >"$work/facts"
 )

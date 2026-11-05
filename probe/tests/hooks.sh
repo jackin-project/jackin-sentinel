@@ -74,6 +74,11 @@ run_setup L1
 run_setup L2
 check another_launch_is_counted "$(lines)" 2
 
+mk a_launch_id_that_extends_another_is_counted
+run_setup L10
+run_setup L1
+check a_launch_id_that_extends_another_is_counted "$(lines)" 2
+
 mk a_missing_launch_id_fails_the_hook
 env -i PATH="$PATH" sh "$t/setup.sh" 2>/dev/null
 rc=$?

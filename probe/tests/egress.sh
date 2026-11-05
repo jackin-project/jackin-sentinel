@@ -11,7 +11,7 @@ failures=0
 total=0
 
 mkdir "$scratch/tools"
-for tool in sh jq sed tr cat env awk grep mktemp rm wc; do
+for tool in sh jq sed tr cat env awk grep mktemp rm wc head; do
     found=$(command -v "$tool") || {
         echo "FAIL setup: $tool is not installed"
         exit 70
@@ -31,8 +31,21 @@ fi
 cat >"$scratch/stub-curl" <<'EOF'
 #!/bin/sh
 for last; do :; done
-while read -r url rc code; do
+out=
+header=
+prev=
+for arg; do
+    [ "$prev" = -o ] && out=$arg
+    [ "$prev" = -H ] && header=${arg#@}
+    prev=$arg
+done
+{
+    echo "curl $last"
+    [ -z "$header" ] || cat "$header"
+} >>"$STUB_LOG"
+while read -r url rc code body; do
     if [ "$url" = "$last" ]; then
+        [ -z "$body" ] || [ -z "$out" ] || cat "$body" >"$out"
         printf '%s' "$code"
         exit "$rc"
     fi
@@ -47,11 +60,12 @@ mk() {
     rm -rf "$t"
     mkdir -p "$t/bin" "$t/sandbox" "$t/tmp"
     : >"$t/table"
+    : >"$t/curl.log"
     pathvar=$t/bin:$scratch/tools
 }
 
 codex_says() {
-    printf '#!/bin/sh\necho "%s"\nexit %s\n' "$1" "$2" >"$t/bin/codex"
+    printf '#!/bin/sh\necho ran >>"%s"\necho "%s"\nexit %s\n' "$t/codex.ran" "$1" "$2" >"$t/bin/codex"
     chmod +x "$t/bin/codex"
 }
 
@@ -65,7 +79,36 @@ with_curl() {
 }
 
 answer() {
-    printf '%s %s %s\n' "$1" "$2" "$3" >>"$t/table"
+    printf '%s %s %s %s\n' "$1" "$2" "$3" "${4-}" >>"$t/table"
+}
+
+provider_body() {
+    printf '%s\n' "$1" >"$t/body"
+    echo "$t/body"
+}
+
+openai_401() {
+    provider_body "{\"error\": {\"message\": \"Incorrect API key provided: $1. You can find your API key at https://platform.openai.com/account/api-keys.\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": \"invalid_api_key\"}}"
+}
+
+expect_never_sent() {
+    if grep -q -e "$1" "$t/curl.log"; then
+        problems="$problems sent[$1]"
+    fi
+}
+
+expect_sent() {
+    grep -q -e "$1" "$t/curl.log" || problems="$problems not-sent[$1]"
+}
+
+expect_absent_from_report() {
+    if grep -q -e "$1" "$t/out"; then
+        problems="$problems reported[$1]"
+    fi
+}
+
+expect_codex_not_run() {
+    [ ! -e "$t/codex.ran" ] || problems="$problems codex-ran"
 }
 
 bounded() {
@@ -93,7 +136,7 @@ execute() {
     sed -e "s#/sandbox#$t/sandbox#g" -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/bin/codex#" "$probe" >"$t/probe"
     set -- "$@" sh "$t/probe" --only "${step#step_}"
     [ -z "$engine" ] || set -- "$@" --engine "$engine"
-    bounded 20 env -i PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" "$@"
+    bounded 20 env -i PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
     rc=$?
     cp "$scratch/bounded.out" "$t/out"
     cp "$scratch/bounded.err" "$t/err"
@@ -150,6 +193,12 @@ PROVIDER=https://api.openai.com/v1/models
 ENGINE=host.openshell.internal:2376
 PING=https://$ENGINE/_ping
 PLACEHOLDER=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN
+PLACEHOLDER_SHOWN='openshel*********************************OKEN'
+API_PLACEHOLDER=openshell:resolve:env:OPENAI_API_KEY
+API_PLACEHOLDER_SHOWN='openshel************************_KEY'
+INJECTED="$PLACEHOLDER
+X-Exfil: FAKE-REAL-SECRET-0123456789"
+INJECTED_JSON='openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN\nX-Exfil: FAKE-REAL-SECRET-0123456789'
 
 mk j09_policy_denial
 with_curl
@@ -203,8 +252,86 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_provider_refused step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'no HTTP response'
+finish_case
+
+mk j09_provider_401_that_shows_only_the_placeholder_passes
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 "$PLACEHOLDER_SHOWN")"
+begin j09_provider_401_that_shows_only_the_placeholder_passes step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential PASS 'no credential was applied'
+expect_sent "Authorization: Bearer $PLACEHOLDER"
+finish_case
+
+mk j09_provider_401_that_echoes_the_literal_placeholder_passes
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 "$PLACEHOLDER")"
+begin j09_provider_401_that_echoes_the_literal_placeholder_passes step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
 expect provider_no_credential PASS 'no credential was applied'
 finish_case
+
+mk j09_provider_401_for_another_key_fails
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 'sk-proj-***********************wxyz')"
+begin j09_provider_401_for_another_key_fails step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'may have seen another credential'
+expect_absent_from_report 'sk-proj'
+finish_case
+
+mk j09_provider_401_for_the_placeholder_of_another_variable_fails
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 "$API_PLACEHOLDER_SHOWN")"
+begin j09_provider_401_for_the_placeholder_of_another_variable_fails step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'may have seen another credential'
+finish_case
+
+mk j09_provider_401_without_the_invalid_key_code_fails
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(provider_body '{"error": {"message": "Incorrect API key provided: '"$PLACEHOLDER_SHOWN"'. FAKE-BODY-MARKER", "code": "other"}}')"
+begin j09_provider_401_without_the_invalid_key_code_fails step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'may have seen another credential'
+expect_absent_from_report FAKE-BODY-MARKER
+finish_case
+
+mk j09_provider_401_with_an_unparsable_body_fails
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(provider_body 'Unauthorized FAKE-BODY-MARKER')"
+begin j09_provider_401_with_an_unparsable_body_fails step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'may have seen another credential'
+expect_absent_from_report FAKE-BODY-MARKER
+finish_case
+
+mk j09_provider_401_with_an_empty_body_fails
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401
+begin j09_provider_401_with_an_empty_body_fails step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'may have seen another credential'
+finish_case
+
+for refusal in 403 429 500; do
+    mk "j09_provider_${refusal}_is_not_proof"
+    with_curl
+    answer "$OUTSIDE" 7 000
+    answer "$METADATA" 7 000
+    answer "$PROVIDER" 0 "$refusal" "$(openai_401 "$PLACEHOLDER_SHOWN")"
+    begin "j09_provider_${refusal}_is_not_proof" step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+    expect provider_no_credential FAIL "HTTP $refusal"
+    finish_case
+done
 
 mk j09_provider_answers_2xx
 with_curl
@@ -245,9 +372,10 @@ finish_case
 mk j09_codex_uses_the_api_key_of_auth_json
 with_curl
 codex_says 'ready' 0
-auth_json '{"OPENAI_API_KEY":"FAKE-api-key-value"}'
+auth_json "{\"OPENAI_API_KEY\":\"$API_PLACEHOLDER\"}"
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
 begin j09_codex_uses_the_api_key_of_auth_json step_J09 ''
 expect codex_reaches_api PASS 'codex exec answered'
 fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
@@ -271,7 +399,7 @@ codex_says 'ready' 0
 auth_json "{\"OPENAI_API_KEY\":\"$PLACEHOLDER\"}"
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
-answer "$PROVIDER" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 "$PLACEHOLDER_SHOWN")"
 begin j09_provider_check_passes_when_the_placeholder_of_auth_json_is_refused step_J09 ''
 expect provider_no_credential PASS 'no credential was applied'
 finish_case
@@ -285,7 +413,80 @@ answer "$METADATA" 7 000
 answer "$PROVIDER" 0 200
 begin j09_a_real_token_in_auth_json_is_never_sent step_J09 ''
 expect provider_no_credential SKIP 'no placeholder to send'
+expect codex_reaches_api SKIP 'not a full placeholder'
 fact '.provider_host' null
+fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
+expect_codex_not_run
+expect_never_sent FAKE-real-token
+finish_case
+
+never_used() {
+    expect provider_no_credential SKIP 'no placeholder to send'
+    expect codex_reaches_api SKIP 'not a full placeholder'
+    fact '.provider_host' null
+    fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
+    expect_codex_not_run
+    expect_never_sent X-Exfil
+    expect_never_sent 'curl https://api.openai.com'
+    finish_case
+}
+
+never_used_setup() {
+    mk "$1"
+    with_curl
+    codex_says 'ready' 0
+    answer "$OUTSIDE" 7 000
+    answer "$METADATA" 7 000
+    answer "$PROVIDER" 0 200
+}
+
+never_used_setup j09_a_newline_after_the_prefix_in_auth_json_is_never_used
+auth_json "{\"tokens\":{\"access_token\":\"$INJECTED_JSON\"}}"
+begin j09_a_newline_after_the_prefix_in_auth_json_is_never_used step_J09 ''
+never_used
+
+never_used_setup j09_a_newline_after_the_prefix_in_the_codex_variable_is_never_used
+begin j09_a_newline_after_the_prefix_in_the_codex_variable_is_never_used step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$INJECTED"
+never_used
+
+never_used_setup j09_a_newline_after_the_prefix_in_the_api_key_variable_is_never_used
+begin j09_a_newline_after_the_prefix_in_the_api_key_variable_is_never_used step_J09 '' OPENAI_API_KEY="$INJECTED"
+never_used
+
+never_used_setup j09_a_newline_after_the_prefix_in_the_api_key_of_auth_json_is_never_used
+auth_json "{\"OPENAI_API_KEY\":\"$INJECTED_JSON\"}"
+begin j09_a_newline_after_the_prefix_in_the_api_key_of_auth_json_is_never_used step_J09 ''
+never_used
+
+for partial in 'openshell:resolve:' 'openshell:resolve:env:' 'openshell:resolve:env:A B' 'openshell:resolve:env:1A' 'openshell:resolve:file:A' 'openshell:resolve:env:A-B'; do
+    partial_index=$((${partial_index:-0} + 1))
+    case_name=j09_the_partial_placeholder_${partial_index}_is_never_used
+    never_used_setup "$case_name"
+    begin "$case_name" step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$partial"
+    never_used
+done
+
+mk j09_a_real_api_key_variable_blocks_codex_exec_next_to_a_placeholder_in_auth_json
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+begin j09_a_real_api_key_variable_blocks_codex_exec_next_to_a_placeholder_in_auth_json step_J09 '' OPENAI_API_KEY=FAKE-real-key
+expect codex_reaches_api SKIP 'not a full placeholder'
+expect_codex_not_run
+finish_case
+
+mk j09_a_real_refresh_token_blocks_codex_exec_next_to_a_placeholder_access_token
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":\"FAKE-real-refresh\"}}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_a_real_refresh_token_blocks_codex_exec_next_to_a_placeholder_access_token step_J09 ''
+expect codex_reaches_api SKIP 'not a full placeholder'
+expect_codex_not_run
 finish_case
 
 mk j09_no_credential_skips_codex

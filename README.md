@@ -93,8 +93,8 @@ Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, 
 | J05 | The sha256 digest of every regular file below `/sandbox/project`, outside `.git`. |
 | J06 | The execution counts of the hooks, and the owner and mode of the installed hook files. |
 | J07 | The main process, its Codex child, and the answer of a `codex exec` call. |
-| J08 | Whether every credential variable and every token in `auth.json` is a placeholder, and which files hold a token-shaped string. The probe never prints a value. |
-| J09 | The `curl` exit code and HTTP code for a host outside the policy, the metadata address, and a Codex provider host. A denial is curl exit 7 with no HTTP response. Exit 6 (the name did not resolve), a missing `curl`, and any other exit are not a denial. |
+| J08 | Whether every credential variable (any letter case) and every token in `auth.json` is a full placeholder (`openshell:resolve:env:NAME` and nothing else), and which files hold a token-shaped string. The probe never prints a value. |
+| J09 | The `curl` exit code and HTTP code for a host outside the policy, the metadata address, and a Codex provider host. A denial is curl exit 7 with no HTTP response. Exit 6 (the name did not resolve), a missing `curl`, and any other exit are not a denial. The provider check sends only a full placeholder and passes only on the provider's HTTP 401 invalid-key answer that names that placeholder (the provider masks the middle of the key); the probe compares that body and never prints it. `codex exec` runs only when every credential in the sandbox is a full placeholder. |
 | J10 | Which file creations succeed under `/sandbox` and `/tmp` and which fail elsewhere. |
 | J11 | The Codex process with its pid and start time, for a comparison before and after a detach. |
 | J12 | The probe process, its controlling terminal, and whether it descends from the main process. |
