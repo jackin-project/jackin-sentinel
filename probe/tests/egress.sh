@@ -411,6 +411,30 @@ expect codex_reaches_api PASS 'codex exec answered'
 fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
 finish_case
 
+mk j09_codex_uses_the_access_token_variable
+with_curl
+codex_says 'ready' 0
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_codex_uses_the_access_token_variable step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect codex_reaches_api PASS 'codex exec answered'
+fact '.codex_exec | "\(.attempted) \(.credential)"' 'true chatgpt_login'
+finish_case
+
+mk j09_an_empty_access_token_in_auth_json_does_not_hide_the_api_key
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"\"},\"OPENAI_API_KEY\":\"$API_PLACEHOLDER\"}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 "$API_PLACEHOLDER_SHOWN")"
+begin j09_an_empty_access_token_in_auth_json_does_not_hide_the_api_key step_J09 ''
+expect provider_no_credential PASS 'no credential was applied'
+expect_sent "Authorization: Bearer $API_PLACEHOLDER"
+fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
+finish_case
+
 mk j09_provider_check_sends_the_placeholder_of_auth_json
 with_curl
 codex_says 'ready' 0

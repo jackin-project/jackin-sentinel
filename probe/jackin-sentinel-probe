@@ -280,6 +280,8 @@ ensure_codex_exec() {
     done
     if [ -n "$unsafe" ]; then
         why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
+    elif is_placeholder "${CODEX_AUTH_ACCESS_TOKEN-}"; then
+        credential=chatgpt_login
     elif [ -f "$auth" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$auth" >/dev/null 2>&1; then
         credential=chatgpt_login
     elif [ -n "${OPENAI_API_KEY-}" ]; then
@@ -899,7 +901,7 @@ step_J09() (
         bearer=$OPENAI_API_KEY
     fi
     if [ -z "$bearer" ] && [ -f "$CODEX_HOME_DIR/auth.json" ]; then
-        bearer=$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
+        bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
     fi
     provider=null
     if [ -n "$bearer" ] && is_placeholder "$bearer"; then
