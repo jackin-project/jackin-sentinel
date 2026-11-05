@@ -326,6 +326,9 @@ done
 
 PLACEHOLDER_ACCESS=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN
 PLACEHOLDER_REFRESH=openshell:resolve:env:CODEX_AUTH_REFRESH_TOKEN
+ID_TOKEN_HEADER=$(printf '%s' 'eyJhbGci' 'OiJub25l' 'IiwidHlw' 'IjoiSldU' 'In0')
+ID_TOKEN_PAYLOAD=$(printf '%s' 'eyJpc3Mi' 'OiJodHRw' 'czovL2F1' 'dGgub3Bl' 'bmFpLmNv' 'bSIsImF1' 'ZCI6ImNv' 'ZGV4Iiwi' 'c3ViIjoi' 'b3BlbnNo' 'ZWxsLWFw' 'cC1zZXJ2' 'ZXIifQ')
+ID_TOKEN_PLACEHOLDER="${ID_TOKEN_HEADER}.${ID_TOKEN_PAYLOAD}.placeholder"
 
 auth_json() {
     mkdir -p "$t/sandbox/.codex"
@@ -373,6 +376,29 @@ auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token
 report file_scan_flags_real_refresh_token
 expect auth_file FAIL 'not a placeholder'
 expect file_scan FAIL 'auth.json'
+finish_case
+
+mk file_scan_flags_a_multiline_refresh_token_outside_the_project_without_disclosing_it
+state waiting
+record "$R_W0"
+multiline_refresh=$(printf '%s%s' 'refresh-' 'token-value-0123456789')
+printf '{\n  "refresh_token":\n    "%s"\n}\n' "$multiline_refresh" >"$t/sandbox/session.json"
+report file_scan_flags_a_multiline_refresh_token_outside_the_project_without_disclosing_it
+expect file_scan FAIL 'session.json'
+fact '.leaks | length' 1
+if grep -Fq "$multiline_refresh" "$t/out"; then
+    problems="$problems report-disclosed-refresh-token"
+fi
+finish_case
+
+mk file_scan_accepts_multiline_refresh_placeholders_and_empty_values
+state waiting
+record "$R_W0"
+printf '{\n  "refresh_token":\n    "%s"\n}\n' "$PLACEHOLDER_REFRESH" >"$t/sandbox/placeholder-session.json"
+printf '{\n  "refresh_token":\n    ""\n}\n' >"$t/sandbox/empty-session.json"
+report file_scan_accepts_multiline_refresh_placeholders_and_empty_values
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
 finish_case
 
 mk file_scan_flags_token_in_file_over_two_mebibytes
@@ -500,19 +526,59 @@ else
     echo "skip j10_a_directory_without_search_permission_is_not_proof_of_a_policy: running as root"
 fi
 
-mk j10_a_refusal_in_a_directory_the_mode_allows_is_attributed_to_the_policy
+mk j10_eexist_in_a_mode_writable_directory_is_not_attributed_to_policy
 mkdir "$t/denied_policy"
 j10_seams "$t/denied_policy"
 cat >"$t/occupy_then_probe.sh" <<'WRAP'
 : >"$1/jackin-sentinel-j10-$$"
 exec sh "$2" --only J10
 WRAP
-begin j10_a_refusal_in_a_directory_the_mode_allows_is_attributed_to_the_policy \
+begin j10_eexist_in_a_mode_writable_directory_is_not_attributed_to_policy \
     sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
 expect_rc 0
 expect_report J10 sandbox
 expect denied_writes PASS 'no file could be created'
-expect denial_by_policy PASS 'denied_policy'
+expect denial_by_policy FAIL 'not proven'
+fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
+j10_stays_inside
+finish_case
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk j10_eacces_in_a_mode_writable_directory_supports_policy_attribution
+    mkdir "$t/denied_policy"
+    j10_seams "$t/denied_policy"
+    cat >"$t/occupy_then_probe.sh" <<'WRAP'
+mkfifo "$1/jackin-sentinel-j10-$$"
+chmod 000 "$1/jackin-sentinel-j10-$$"
+exec sh "$2" --only J10
+WRAP
+    begin j10_eacces_in_a_mode_writable_directory_supports_policy_attribution \
+        sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
+    chmod 600 "$t/denied_policy/jackin-sentinel-j10-$$" 2>/dev/null || true
+    expect_rc 0
+    expect_report J10 sandbox
+    expect denied_writes PASS 'no file could be created'
+    expect denial_by_policy PASS 'denied_policy'
+    fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
+    j10_stays_inside
+    finish_case
+else
+    echo "skip j10_eacces_case: running as root"
+fi
+
+mk j10_eisdir_in_a_mode_writable_directory_is_not_attributed_to_policy
+mkdir "$t/denied_policy"
+j10_seams "$t/denied_policy"
+cat >"$t/occupy_then_probe.sh" <<'WRAP'
+mkdir "$1/jackin-sentinel-j10-$$"
+exec sh "$2" --only J10
+WRAP
+begin j10_eisdir_in_a_mode_writable_directory_is_not_attributed_to_policy \
+    sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
+expect_rc 0
+expect_report J10 sandbox
+expect denied_writes PASS 'no file could be created'
+expect denial_by_policy FAIL 'not proven'
 fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
 j10_stays_inside
 finish_case
@@ -570,6 +636,47 @@ proc_codex
 proc_codex_child 102
 processes j11_two_codex_children_are_not_a_pass J11
 expect codex_child FAIL '2 Codex processes'
+finish_case
+
+proc_tty_process() {
+    mkdir -p "$t/proc/$1"
+    printf '%s\0' "$2" >"$t/proc/$1/cmdline"
+    printf '%s (%s) S %s %s %s %s -1 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' \
+        "$1" "$3" "$4" "$1" "$1" "$5" "$1" >"$t/proc/$1/stat"
+}
+
+j12_case() {
+    name=$1
+    first_tty=$2
+    second_tty=$3
+    mk "$name"
+    state 'running 1'
+    proc_tty_process 100 /usr/local/bin/jackin-start jackin-start 1 0
+    proc_tty_process 101 'codex\0--sandbox\0' codex 100 "$first_tty"
+    proc_tty_process 102 'codex\0--sandbox\0' codex 100 "$second_tty"
+    cat >"$t/run-probe.sh" <<'EOF'
+#!/bin/sh
+pid=$$
+mkdir -p "$1/$pid"
+printf 'sh\0' >"$1/$pid/cmdline"
+printf '%s (sh) S 1 %s %s 256 -1 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$pid" "$pid" "$pid" "$pid" >"$1/$pid/stat"
+exec sh "$2" --only J12
+EOF
+    begin "$name" sh "$t/run-probe.sh" "$t/proc" "$t/probe"
+    expect_rc 0
+    expect_report J12 sandbox
+}
+
+j12_case j12_all_codex_children_have_distinct_ttys 512 768
+expect distinct_tty PASS 'every Codex child'
+finish_case
+
+j12_case j12_second_codex_child_sharing_the_probe_tty_fails 512 256
+expect distinct_tty FAIL 'share'
+finish_case
+
+j12_case j12_first_codex_child_sharing_the_probe_tty_fails 256 768
+expect distinct_tty FAIL 'share'
 finish_case
 
 mk j08_a_second_codex_child_with_a_real_credential_is_not_a_pass
@@ -653,14 +760,61 @@ if [ "$(id -u)" -ne 0 ]; then
     mk j06_a_hook_tree_without_a_writable_ancestor_is_immutable
     hook_tree
     chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
-    begin j06_a_hook_tree_without_a_writable_ancestor_is_immutable sh "$t/probe" --only J06
+    mkdir "$t/bin"
+    real_stat=$(command -v stat)
+    cat >"$t/bin/stat" <<EOF
+#!/bin/sh
+for last; do :; done
+case \$last in
+    */hookroot/lib/hooks/setup | */hookroot/lib/hooks/preflight) printf '0 444\\n' ;;
+    *) exec $real_stat "\$@" ;;
+esac
+EOF
+    chmod +x "$t/bin/stat"
+    begin j06_a_hook_tree_without_a_writable_ancestor_is_immutable env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J06
     chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
     expect_rc 0
     expect_report J06 sandbox
+    expect hooks_immutable PASS 'not symlinked'
     hook_writable false,false
     finish_case
 else
     echo "skip j06 ancestor cases: running as root"
+fi
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk j06_a_root_owned_hook_symlink_to_a_writable_physical_ancestor_fails
+    mkdir -p "$t/hookroot/lib/hooks" "$t/physical" "$t/sandbox/.sentinel"
+    printf 'setup\n' >"$t/sandbox/.sentinel/setup.log"
+    printf 'preflight\n' >"$t/sandbox/.sentinel/preflight.log"
+    printf 'target\n' >"$t/physical/setup"
+    : >"$t/hookroot/lib/hooks/preflight"
+    chmod 444 "$t/physical/setup" "$t/hookroot/lib/hooks/preflight"
+    ln -s "$t/physical/setup" "$t/hookroot/lib/hooks/setup"
+    chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+    seam HOOK_DIR "$t/hookroot/lib/hooks"
+    seam HOOK_TOP "$t/hookroot"
+    mkdir "$t/bin"
+    real_stat=$(command -v stat)
+    cat >"$t/bin/stat" <<EOF
+#!/bin/sh
+for last; do :; done
+case \$last in
+    $t/hookroot/lib/hooks/setup) printf '0 777\\n' ;;
+    $t/hookroot/lib/hooks/preflight | $t/physical/setup) printf '0 444\\n' ;;
+    *) exec $real_stat "\$@" ;;
+esac
+EOF
+    chmod +x "$t/bin/stat"
+    begin j06_a_root_owned_hook_symlink_to_a_writable_physical_ancestor_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J06
+    chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+    expect_rc 0
+    expect_report J06 sandbox
+    expect hooks_immutable FAIL 'symlinked'
+    hook_writable true,false
+    finish_case
+else
+    echo "skip j06_physical_symlink_case: running as root"
 fi
 
 mk only_rejects_whitespace
@@ -804,11 +958,45 @@ finish_case
 mk file_scan_accepts_a_placeholder_id_token
 state waiting
 record "$R_W0"
-auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"$PLACEHOLDER_REFRESH\",\"id_token\":\"$JWT_HEADER.$JWT_WITH_SUB.placeholder\"}}"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"$PLACEHOLDER_REFRESH\",\"id_token\":\"$ID_TOKEN_PLACEHOLDER\"}}"
 report file_scan_accepts_a_placeholder_id_token
 expect auth_file PASS 'only placeholders'
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+finish_case
+
+mk auth_file_rejects_an_id_token_with_only_the_placeholder_suffix
+state waiting
+record "$R_W0"
+auth_json '{"tokens":{"id_token":"real-secret.placeholder"}}'
+report auth_file_rejects_an_id_token_with_only_the_placeholder_suffix
+expect auth_file FAIL 'not a placeholder'
+finish_case
+
+mk auth_file_rejects_an_id_token_with_an_extra_segment
+state waiting
+record "$R_W0"
+auth_json "{\"tokens\":{\"id_token\":\"${ID_TOKEN_PLACEHOLDER%.placeholder}.extra.placeholder\"}}"
+report auth_file_rejects_an_id_token_with_an_extra_segment
+expect auth_file FAIL 'not a placeholder'
+finish_case
+
+mk auth_file_rejects_an_id_token_with_an_altered_segment
+state waiting
+record "$R_W0"
+altered_id_token=$(printf '%s' "$ID_TOKEN_PLACEHOLDER" | sed 's/^eyJ/eyK/')
+auth_json "{\"tokens\":{\"id_token\":\"$altered_id_token\"}}"
+report auth_file_rejects_an_id_token_with_an_altered_segment
+expect auth_file FAIL 'not a placeholder'
+finish_case
+
+mk auth_file_rejects_a_multiline_id_token_ending_in_the_placeholder_suffix
+state waiting
+record "$R_W0"
+multiline_id_token=${ID_TOKEN_PLACEHOLDER%.placeholder}
+auth_json "{\"tokens\":{\"id_token\":\"${multiline_id_token}\\n.placeholder\"}}"
+report auth_file_rejects_a_multiline_id_token_ending_in_the_placeholder_suffix
+expect auth_file FAIL 'not a placeholder'
 finish_case
 
 mk file_scan_flags_token_in_name_with_newline

@@ -25,10 +25,13 @@ SCAN_MAX_KIB=262144
 SCAN_GREP_SECONDS=20
 LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
 LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
-LEAK_JWT_SAFE='\.placeholder$'
+ID_TOKEN_HEADER=$(printf '%s' 'eyJhbGci' 'OiJub25l' 'IiwidHlw' 'IjoiSldU' 'In0')
+ID_TOKEN_PAYLOAD=$(printf '%s' 'eyJpc3Mi' 'OiJodHRw' 'czovL2F1' 'dGgub3Bl' 'bmFpLmNv' 'bSIsImF1' 'ZCI6ImNv' 'ZGV4Iiwi' 'c3ViIjoi' 'b3BlbnNo' 'ZWxsLWFw' 'cC1zZXJ2' 'ZXIifQ')
+LEAK_JWT_SAFE="^${ID_TOKEN_HEADER}\\.${ID_TOKEN_PAYLOAD}\\.placeholder$"
 LEAK_RT='"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"'
-LEAK_RT_SAFE=':[[:space:]]*"openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*"$'
+LEAK_RT_SAFE=':\s*"openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*"$'
 PLACEHOLDER_RE='^openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*'
+PLACEHOLDER_ID_TOKEN="${ID_TOKEN_HEADER}.${ID_TOKEN_PAYLOAD}.placeholder"
 J10_ALLOWED="$STATE_DIR /tmp"
 J10_DENIED="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
 PROMPT='Reply with the word ready'
@@ -120,7 +123,7 @@ count_matches() {
 }
 
 file_meta() {
-    stat -c '%u %a' "$1" 2>/dev/null
+    stat -L -c '%u %a' "$1" 2>/dev/null
 }
 
 git_in() {
@@ -133,14 +136,34 @@ in_work_tree() {
 
 path_or_ancestor_writable() {
     candidate=$1
+    top=${2:-$HOOK_TOP}
     while :; do
         [ -w "$candidate" ] && return 0
-        [ "$candidate" = "$HOOK_TOP" ] && return 1
+        [ "$candidate" = "$top" ] && return 1
         parent=${candidate%/*}
         [ -n "$parent" ] || parent=/
         [ "$parent" != "$candidate" ] || return 1
         candidate=$parent
     done
+}
+
+physical_path() {
+    candidate=$1
+    hops=0
+    while [ -L "$candidate" ]; do
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        target=$(readlink "$candidate") || return 1
+        case $target in
+            /*) candidate=$target ;;
+            *) candidate=$(dirname "$candidate")/$target ;;
+        esac
+    done
+    parent=$(
+        unset CDPATH
+        cd -P "$(dirname "$candidate")" 2>/dev/null && pwd -P
+    ) || return 1
+    printf '%s/%s\n' "${parent%/}" "${candidate##*/}"
 }
 
 proc_args() {
@@ -385,12 +408,16 @@ denial_check() {
     fi
 }
 
+proxy_variables() {
+    env | awk -F= '$1 ~ /^[A-Za-z_][A-Za-z0-9_]*_(PROXY|proxy)$/ { print $1 }'
+}
+
 token_kinds() {
-    jq -r --arg re "$PLACEHOLDER_RE" '
+    jq -r --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
         def kind($v; $jwt):
             if $v == null then "absent"
             elif $v == "" then "empty"
-            elif $jwt then (if ($v | endswith(".placeholder")) then "placeholder" else "other" end)
+            elif $jwt then (if $v == $id_token then "placeholder" else "other" end)
             elif ($v | type == "string" and test($re + "\\z")) then "placeholder"
             else "other" end;
         def worst:
@@ -436,8 +463,12 @@ emit() {
         echo "the scan could not record a $1" >&2
 }
 listed() {
-    { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
-        SAFE=$2 awk '$0 == "SCAN_ERROR" { bad = 1; next } $0 !~ ENVIRON["SAFE"] { hit = 1 } END { print bad ? "error" : (hit ? "hit" : "none") }'
+    { timeout "$SCAN_GREP_SECONDS" grep -azoE -e "$1" "$3" || [ $? -eq 1 ] || printf 'SCAN_ERROR\0'; } |
+        jq -Rrs --arg safe "$2" '
+            split("\u0000") | map(select(. != ""))
+            | if any(.[]; . == "SCAN_ERROR") then "error"
+              elif any(.[]; (test($safe) | not)) then "hit"
+              else "none" end' 2>/dev/null || printf error
 }
 jwt_listed() {
     { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
@@ -473,9 +504,16 @@ for file; do
         continue
     fi
     timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" -e "$LEAK_JWT" -e "$LEAK_RT" "$file"
-    case $? in
+    candidate=$?
+    if [ "$candidate" -eq 1 ]; then
+        timeout "$SCAN_GREP_SECONDS" grep -azqE -e "$LEAK_RT" "$file"
+        candidate=$?
+        if [ "$candidate" -eq 1 ]; then
+            continue
+        fi
+    fi
+    case $candidate in
         0) ;;
-        1) continue ;;
         124)
             emit unscanned "$file" "grep timed out"
             continue
@@ -520,10 +558,13 @@ EOF
 }
 
 try_create() {
-    (
-        set -C
-        : >"$1"
-    ) 2>/dev/null
+    if LC_ALL=C sh -c 'set -C; : >"$1"' sh "$1" 2>"$work/create.err"; then
+        return 0
+    fi
+    if grep -Fq 'Permission denied' "$work/create.err"; then
+        return 1
+    fi
+    return 2
 }
 
 step_J00() (
@@ -630,15 +671,23 @@ step_J06() (
     exposed=
     for name in setup preflight; do
         path=$HOOK_DIR/$name
-        meta=$(file_meta "$path") || meta="65534 000"
+        symlinked=false
+        [ -L "$path" ] && symlinked=true
+        physical=$(physical_path "$path") || physical=
+        meta_path=${physical:-$path}
+        meta=$(file_meta "$meta_path") || meta="65534 000"
         read -r uid mode <<EOF
 $meta
 EOF
         writable=false
-        if path_or_ancestor_writable "$path"; then
+        physical_top=$(
+            unset CDPATH
+            cd -P "$HOOK_TOP" 2>/dev/null && pwd -P
+        ) || physical_top=$HOOK_TOP
+        if { [ -n "$physical" ] && path_or_ancestor_writable "$physical" "$physical_top"; } || path_or_ancestor_writable "$path" "$HOOK_TOP"; then
             writable=true
         fi
-        if [ ! -e "$path" ] || [ "$writable" = true ] || [ "$uid" != 0 ]; then
+        if [ ! -e "$path" ] || [ "$symlinked" = true ] || [ "$writable" = true ] || [ "$uid" != 0 ]; then
             exposed="$exposed $name"
         fi
         jq -cn --arg name "$name" --arg path "$path" --argjson uid "$uid" --arg mode "$mode" --argjson writable "$writable" \
@@ -655,9 +704,9 @@ EOF
         fail preflight_runs "preflight never ran"
     fi
     if [ -z "$exposed" ]; then
-        pass hooks_immutable "both hooks are root-owned and not writable"
+        pass hooks_immutable "both hooks are root-owned, not symlinked, and not writable"
     else
-        fail hooks_immutable "missing, not root-owned or writable:$exposed"
+        fail hooks_immutable "missing, symlinked, not root-owned or writable:$exposed"
     fi
     jq -n --arg state_dir "$STATE_DIR" --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
         --argjson failures "$preflight_failures" --slurpfile hooks "$work/hooks.ndjson" \
@@ -920,6 +969,7 @@ step_J09() (
     ensure_codex_exec
     outside=$(egress https://example.com)
     metadata=$(egress http://169.254.169.254/latest/meta-data/)
+    proxies=$(proxy_variables | tr '\n' ' ' | sed 's/ $//')
     bearer=
     if [ "${CODEX_AUTH_ACCESS_TOKEN-}" != "" ]; then
         bearer=$CODEX_AUTH_ACCESS_TOKEN
@@ -943,8 +993,13 @@ step_J09() (
     else
         skip codex_reaches_api "$(cat "$work/codex_exec.why")"
     fi
-    denial_check outside_host_denied example.com "$outside"
-    denial_check metadata_denied 169.254.169.254 "$metadata"
+    if [ -n "$proxies" ]; then
+        fail outside_host_denied "proxy variables are set: $proxies"
+        fail metadata_denied "proxy variables are set: $proxies"
+    else
+        denial_check outside_host_denied example.com "$outside"
+        denial_check metadata_denied 169.254.169.254 "$metadata"
+    fi
     if [ "$provider" = null ]; then
         skip provider_no_credential "no placeholder to send"
     elif [ "$(egress_outcome "$provider")" = curl_missing ]; then
@@ -990,6 +1045,11 @@ step_J10() (
             created=false
             if try_create "$path"; then
                 created=true
+                create_result=0
+            else
+                create_result=$?
+            fi
+            if [ "$created" = true ]; then
                 rm -f "$path"
             fi
             if [ "$expected" = allowed ] && [ "$created" = false ]; then
@@ -998,7 +1058,7 @@ step_J10() (
             if [ "$expected" = denied ] && [ "$created" = true ]; then
                 denied_created="$denied_created $dir"
             fi
-            if [ "$expected" = denied ] && [ "$created" = false ] && [ "$dac" = true ]; then
+            if [ "$expected" = denied ] && [ "$created" = false ] && [ "$dac" = true ] && [ "$create_result" -eq 1 ]; then
                 attributed="$attributed $dir"
             fi
             jq -cn --arg path "$path" --arg expected "$expected" --argjson dac "$dac" --argjson created "$created" \
@@ -1037,13 +1097,15 @@ step_J12() (
         fail not_descendant "the probe runs below the main process"
     fi
     self_tty=$(jq -r '.self.tty // ""' "$work/processes.json")
-    codex_tty=$(jq -r '.codex[0].tty // ""' "$work/processes.json")
-    if [ -z "$self_tty" ] || [ -z "$codex_tty" ]; then
+    codex_children=$(jq -r '.codex | length' "$work/processes.json")
+    codex_ttys_known=$(jq -r 'all(.codex[]; .tty != null and .tty != "")' "$work/processes.json")
+    shared_ttys=$(jq -r --arg tty "$self_tty" '[.codex[] | select(.tty == $tty)] | length' "$work/processes.json")
+    if [ -z "$self_tty" ] || [ "$codex_children" -eq 0 ] || [ "$codex_ttys_known" != true ]; then
         skip distinct_tty "the tty of the probe or of Codex is unknown"
-    elif [ "$self_tty" != "$codex_tty" ]; then
-        pass distinct_tty "probe $self_tty, Codex $codex_tty"
+    elif [ "$shared_ttys" -eq 0 ]; then
+        pass distinct_tty "probe $self_tty, every Codex child has a distinct tty"
     else
-        fail distinct_tty "the probe and Codex share $self_tty"
+        fail distinct_tty "$shared_ttys Codex child process(es) share the probe tty $self_tty"
     fi
     jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
 )
@@ -1227,6 +1289,7 @@ step_J16() (
     binary=false
     have docker && binary=true
     variables=$(env | sed -n 's/^\(DOCKER_[A-Za-z0-9_]*\)=.*/\1/p' | jq -Rn '[inputs]')
+    proxies=$(proxy_variables | tr '\n' ' ' | sed 's/ $//')
     attempted=false
     curl_found=false
     have curl && curl_found=true
@@ -1247,7 +1310,9 @@ step_J16() (
     else
         fail docker_variables "set: $(printf '%s' "$variables" | jq -r 'join(" ")')"
     fi
-    if [ "$attempted" = false ]; then
+    if [ -n "$proxies" ]; then
+        fail engine_denied "proxy variables are set: $proxies"
+    elif [ "$attempted" = false ]; then
         skip engine_denied "no --engine endpoint was given"
     else
         case $(egress_outcome "$reply") in

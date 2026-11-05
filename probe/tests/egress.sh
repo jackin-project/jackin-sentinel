@@ -232,14 +232,17 @@ expect metadata_denied FAIL 'answered HTTP 200'
 fact '.outside_host | "\(.curl_exit) \(.http_code)"' '0 200'
 finish_case
 
-mk j09_a_proxy_variable_of_the_sandbox_user_cannot_turn_an_allowed_host_into_a_denial
-with_curl
-answer "$OUTSIDE" 0 200
-answer "$METADATA" 0 200
-begin j09_a_proxy_variable_of_the_sandbox_user_cannot_turn_an_allowed_host_into_a_denial step_J09 '' HTTPS_PROXY=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9
-expect outside_host_denied FAIL 'answered HTTP 200'
-expect metadata_denied FAIL 'answered HTTP 200'
-finish_case
+for proxy in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+    proxy_case=j09_${proxy}_presence_fails
+    mk "$proxy_case"
+    with_curl
+    answer "$OUTSIDE" 7 000
+    answer "$METADATA" 7 000
+    begin "$proxy_case" step_J09 '' "$proxy="
+    expect outside_host_denied FAIL 'proxy variables are set'
+    expect metadata_denied FAIL 'proxy variables are set'
+    finish_case
+done
 
 mk j09_dns_failure_is_not_a_denial
 with_curl
@@ -588,6 +591,17 @@ answer "$OUTSIDE" 7 000
 begin j16_a_curlrc_of_the_sandbox_user_cannot_turn_an_answering_engine_into_a_denial step_J16 "$ENGINE" CURL_HOME="$t/sandbox"
 expect engine_denied FAIL 'answered HTTP 200'
 finish_case
+
+for proxy in HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; do
+    proxy_case=j16_${proxy}_presence_fails
+    mk "$proxy_case"
+    with_curl
+    answer "$PING" 7 000
+    answer "$OUTSIDE" 7 000
+    begin "$proxy_case" step_J16 "$ENGINE" "$proxy="
+    expect engine_denied FAIL 'proxy variables are set'
+    finish_case
+done
 
 mk j16_curl_missing
 begin j16_curl_missing step_J16 "$ENGINE"
