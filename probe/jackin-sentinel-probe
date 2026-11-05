@@ -16,6 +16,7 @@ CODEX_COMM=codex
 START_BIN=/usr/local/bin/jackin-start
 HELLO_IMAGE='hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef'
 HOOK_DIR=/usr/local/lib/jackin/hooks
+HOOK_TOP=/
 RECORD_FILE=$JACKIN_DIR/run/env-kinds
 RUN_STATE_FILE=$JACKIN_DIR/run/state
 RECORD_MAX=65536
@@ -124,6 +125,22 @@ file_meta() {
 
 git_in() {
     git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$PROJECT" "$@"
+}
+
+in_work_tree() {
+    [ "$(git_in rev-parse --is-inside-work-tree 2>/dev/null)" = true ]
+}
+
+path_or_ancestor_writable() {
+    candidate=$1
+    while :; do
+        [ -w "$candidate" ] && return 0
+        [ "$candidate" = "$HOOK_TOP" ] && return 1
+        parent=${candidate%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$candidate" ] || return 1
+        candidate=$parent
+    done
 }
 
 proc_args() {
@@ -539,7 +556,7 @@ step_J04() (
     docker_binary=false
     if have sudo; then
         sudo_found=true
-        if timeout 5 sudo -n true >/dev/null 2>&1 </dev/null; then
+        if timeout 5 sudo -n true >/dev/null 2>&1 </dev/null || timeout 5 sudo -n -l >/dev/null 2>&1 </dev/null; then
             sudo_works=true
         fi
     fi
@@ -574,7 +591,7 @@ step_J05() (
     sums_rc=0
     if [ -d "$PROJECT" ]; then
         pass project_dir "$PROJECT"
-        if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if in_work_tree; then
             git_work_tree=true
         fi
         (cd "$PROJECT" && find . -path ./.git -prune -o -type f -exec sha256sum --zero {} +) >"$work/sums" 2>"$work/sums.err"
@@ -613,7 +630,7 @@ step_J06() (
 $meta
 EOF
         writable=false
-        if [ -w "$path" ] || [ -w "$HOOK_DIR" ]; then
+        if path_or_ancestor_writable "$path"; then
             writable=true
         fi
         if [ ! -e "$path" ] || [ "$writable" = true ] || [ "$uid" != 0 ]; then
@@ -960,7 +977,7 @@ step_J10() (
             [ -d "$dir" ] || [ "$expected" = allowed ] || continue
             path="$dir/jackin-sentinel-j10-$$"
             dac=false
-            [ -w "$dir" ] && dac=true
+            [ -w "$dir" ] && [ -x "$dir" ] && dac=true
             created=false
             if try_create "$path"; then
                 created=true
@@ -1031,7 +1048,7 @@ step_J13() (
     refs_known=false
     stash=0
     branches='[]'
-    if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if in_work_tree; then
         work_tree=true
         branch=$(git_in symbolic-ref --short -q HEAD 2>/dev/null)
         head=$(git_in rev-parse -q --verify HEAD 2>/dev/null)
@@ -1041,9 +1058,12 @@ step_J13() (
         else
             clean=false
         fi
-        stash=$(git_in stash list 2>/dev/null | wc -l | tr -d ' ')
-        if refs=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>"$work/refs.err") && [ ! -s "$work/refs.err" ]; then
+        : >"$work/refs.err"
+        if refs=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>>"$work/refs.err") &&
+            git_in for-each-ref refs/stash >/dev/null 2>>"$work/refs.err" &&
+            stashes=$(git_in stash list 2>>"$work/refs.err") && [ ! -s "$work/refs.err" ]; then
             refs_known=true
+            [ -z "$stashes" ] || stash=$(printf '%s\n' "$stashes" | wc -l | tr -d ' ')
             if [ -n "$refs" ]; then
                 branches=$(printf '%s\n' "$refs" | jq -Rn '[inputs | split(" ") | {name: .[0], tip: .[1]}]') || refs_known=false
             fi

@@ -483,20 +483,119 @@ j10_stays_inside
 finish_case
 
 if [ "$(id -u)" -ne 0 ]; then
-    mk j10_denial_that_the_mode_allows_is_attributed_to_the_policy
-    mkdir "$t/denied_policy"
-    chmod 622 "$t/denied_policy"
-    j10_seams "$t/denied_policy"
-    begin j10_denial_that_the_mode_allows_is_attributed_to_the_policy sh "$t/probe" --only J10
-    chmod 755 "$t/denied_policy"
+    mk j10_a_directory_without_search_permission_is_not_proof_of_a_policy
+    mkdir "$t/denied_nosearch"
+    chmod 622 "$t/denied_nosearch"
+    j10_seams "$t/denied_nosearch"
+    begin j10_a_directory_without_search_permission_is_not_proof_of_a_policy sh "$t/probe" --only J10
+    chmod 755 "$t/denied_nosearch"
     expect_rc 0
     expect_report J10 sandbox
     expect denied_writes PASS 'no file could be created'
-    expect denial_by_policy PASS 'denied_policy'
+    expect denial_by_policy FAIL 'not proven'
+    fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' false
     j10_stays_inside
     finish_case
 else
-    echo "skip j10_denial_that_the_mode_allows_is_attributed_to_the_policy: running as root"
+    echo "skip j10_a_directory_without_search_permission_is_not_proof_of_a_policy: running as root"
+fi
+
+mk j10_a_refusal_in_a_directory_the_mode_allows_is_attributed_to_the_policy
+mkdir "$t/denied_policy"
+j10_seams "$t/denied_policy"
+cat >"$t/occupy_then_probe.sh" <<'WRAP'
+: >"$1/jackin-sentinel-j10-$$"
+exec sh "$2" --only J10
+WRAP
+begin j10_a_refusal_in_a_directory_the_mode_allows_is_attributed_to_the_policy \
+    sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
+expect_rc 0
+expect_report J10 sandbox
+expect denied_writes PASS 'no file could be created'
+expect denial_by_policy PASS 'denied_policy'
+fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
+j10_stays_inside
+finish_case
+
+sudo_shim() {
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\ncase "$*" in\n    "-n true") exit %s ;;\n    "-n -l") echo "    (root) NOPASSWD: /bin/sh"; exit %s ;;\nesac\nexit 1\n' "$1" "$2" >"$t/bin/sudo"
+    chmod +x "$t/bin/sudo"
+}
+
+mk j04_a_passwordless_grant_other_than_true_fails_the_sudo_check
+sudo_shim 1 0
+begin j04_a_passwordless_grant_other_than_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect sudo FAIL 'sudo works'
+fact '.sudo.works' true
+finish_case
+
+mk j04_a_passwordless_true_fails_the_sudo_check
+sudo_shim 0 1
+begin j04_a_passwordless_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect sudo FAIL 'sudo works'
+fact '.sudo.works' true
+finish_case
+
+mk j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check
+sudo_shim 1 1
+begin j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect sudo PASS 'found=true works=false'
+fact '.sudo.works' false
+finish_case
+
+hook_tree() {
+    mkdir -p "$t/hookroot/lib/hooks"
+    : >"$t/hookroot/lib/hooks/setup"
+    : >"$t/hookroot/lib/hooks/preflight"
+    chmod 444 "$t/hookroot/lib/hooks/setup" "$t/hookroot/lib/hooks/preflight"
+    seam HOOK_DIR "$t/hookroot/lib/hooks"
+    seam HOOK_TOP "$t/hookroot"
+}
+
+hook_writable() {
+    fact '[.hooks[].writable] | map(tostring) | join(",")' "$1"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk j06_a_writable_parent_of_the_hook_directory_makes_the_hooks_mutable
+    hook_tree
+    chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot"
+    begin j06_a_writable_parent_of_the_hook_directory_makes_the_hooks_mutable sh "$t/probe" --only J06
+    chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot"
+    expect_rc 0
+    expect_report J06 sandbox
+    expect hooks_immutable FAIL 'writable'
+    hook_writable true,true
+    finish_case
+
+    mk j06_a_writable_top_of_the_hook_tree_makes_the_hooks_mutable
+    hook_tree
+    chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib"
+    begin j06_a_writable_top_of_the_hook_tree_makes_the_hooks_mutable sh "$t/probe" --only J06
+    chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib"
+    expect_rc 0
+    expect_report J06 sandbox
+    hook_writable true,true
+    finish_case
+
+    mk j06_a_hook_tree_without_a_writable_ancestor_is_immutable
+    hook_tree
+    chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+    begin j06_a_hook_tree_without_a_writable_ancestor_is_immutable sh "$t/probe" --only J06
+    chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+    expect_rc 0
+    expect_report J06 sandbox
+    hook_writable false,false
+    finish_case
+else
+    echo "skip j06 ancestor cases: running as root"
 fi
 
 mk only_rejects_whitespace
@@ -802,6 +901,58 @@ if git_project; then
     finish_case
 else
     setup_failed j13_branches_are_listed_when_the_refs_are_readable
+fi
+
+mk j13_a_broken_stash_ref_fails_the_refs_check
+if git_project; then
+    echo garbage >"$t/sandbox/project/.git/refs/stash"
+    begin j13_a_broken_stash_ref_fails_the_refs_check sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect refs FAIL 'broken ref'
+    finish_case
+else
+    setup_failed j13_a_broken_stash_ref_fails_the_refs_check
+fi
+
+mk j13_a_readable_stash_is_counted
+if git_project; then
+    printf s >"$t/sandbox/project/stashed.txt"
+    git_in_project add stashed.txt &&
+        git_in_project -c core.hooksPath=/dev/null -c user.name=probe -c user.email=probe@example.invalid stash -q
+    begin j13_a_readable_stash_is_counted sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect refs PASS '1 local branches'
+    fact '.stash' 1
+    finish_case
+else
+    setup_failed j13_a_readable_stash_is_counted
+fi
+
+mk j13_a_bare_repository_is_not_a_work_tree
+if git_in_project init -q --bare; then
+    begin j13_a_bare_repository_is_not_a_work_tree sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree FAIL 'not a git work tree'
+    expect work_tree_status SKIP 'git status not run'
+    fact '.work_tree' false
+    finish_case
+else
+    setup_failed j13_a_bare_repository_is_not_a_work_tree
+fi
+
+mk j05_a_bare_repository_is_not_a_work_tree
+if git_in_project init -q --bare; then
+    begin j05_a_bare_repository_is_not_a_work_tree sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect git_work_tree FAIL 'not a git work tree'
+    fact '.git_work_tree' false
+    finish_case
+else
+    setup_failed j05_a_bare_repository_is_not_a_work_tree
 fi
 
 mk j13_not_a_work_tree_does_not_claim_git_status_ran
