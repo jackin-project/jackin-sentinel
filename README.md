@@ -37,11 +37,11 @@ Jackin runs each hook through exec as the user `sandbox`, in `/sandbox/project`,
 
 | Hook | Runs | Log line |
 |---|---|---|
-| `hooks/setup.sh` | Once for each launch | `setup flag=<value>` in `setup.log` |
+| `hooks/setup.sh` | Once for each launch | `setup launch=<launch-id> flag=<value>` in `setup.log` |
 | `hooks/preflight.sh` | Before each Codex start | `preflight ok flag=<value>` in `preflight.log` |
 | `hooks/preflight.sh` | Before each Codex start, when `SENTINEL_FAIL_PREFLIGHT` is `1` | `preflight fail flag=1` in `preflight.log`, then exit code 17 |
 
-A non-zero exit stops the launch. The sandbox stays `Ready`. Each log line is one execution. The probe counts them, so a hook that runs twice is a visible failure. The hook files in the image are owned by root. The agent cannot change them.
+A non-zero exit stops the launch. The sandbox stays `Ready`. Each log line is one execution. `setup` adds no second line when a crash before the done marker runs it again for the same launch, but it adds one when the done marker of the launch already exists. The probe counts the lines, so a hook that jackin runs twice after success is a visible failure. The hook files in the image are owned by root. The agent cannot change them.
 
 ## Use the role
 

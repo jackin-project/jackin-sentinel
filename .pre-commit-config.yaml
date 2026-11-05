@@ -28,6 +28,12 @@ repos:
         entry: sh probe/tests/j08.sh
         files: ^probe/(jackin-sentinel-probe|tests/j08\.sh)$
         pass_filenames: false
+      - id: hooks-setup
+        name: setup hook cases
+        language: system
+        entry: sh probe/tests/hooks.sh
+        files: ^(hooks/setup\.sh|probe/tests/hooks\.sh)$
+        pass_filenames: false
       - id: probe-egress
         name: probe egress cases
         language: system
