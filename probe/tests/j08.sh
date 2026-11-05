@@ -142,6 +142,12 @@ fact() {
     [ "$got" = "$want" ] || problems="$problems fact[$filter]=[$got](want [$want])"
 }
 
+not_disclosed() {
+    if grep -Fq "$1" "$t/out" || grep -Fq "$1" "$t/err"; then
+        problems="$problems credential-disclosed"
+    fi
+}
+
 expect_usage() {
     expect_rc 64
     [ ! -s "$t/out" ] || problems="$problems stdout-not-empty"
@@ -677,6 +683,35 @@ finish_case
 
 j12_case j12_first_codex_child_sharing_the_probe_tty_fails 256 768
 expect distinct_tty FAIL 'share'
+finish_case
+
+j12_case j12_shared_tty_wins_when_the_first_child_tty_is_unknown 256 0
+expect distinct_tty FAIL 'share'
+finish_case
+
+j12_case j12_shared_tty_wins_when_the_second_child_tty_is_unknown 0 256
+expect distinct_tty FAIL 'share'
+finish_case
+
+j12_case j12_all_unknown_child_ttys_remain_unknown 0 0
+expect distinct_tty SKIP 'unknown'
+finish_case
+
+mk j12_no_codex_children_remain_unknown
+state 'running 1'
+proc_tty_process 100 /usr/local/bin/jackin-start jackin-start 1 0
+cat >"$t/run-probe.sh" <<'EOF'
+#!/bin/sh
+pid=$$
+mkdir -p "$1/$pid"
+printf 'sh\0' >"$1/$pid/cmdline"
+printf '%s (sh) S 1 %s %s 256 -1 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$pid" "$pid" "$pid" "$pid" >"$1/$pid/stat"
+exec sh "$2" --only J12
+EOF
+begin j12_no_codex_children_remain_unknown sh "$t/run-probe.sh" "$t/proc" "$t/probe"
+expect_rc 0
+expect_report J12 sandbox
+expect distinct_tty SKIP 'unknown'
 finish_case
 
 mk j08_a_second_codex_child_with_a_real_credential_is_not_a_pass
@@ -1383,6 +1418,59 @@ proc_main
     printf 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY\nX-Exfil: FAKE-REAL-SECRET-0123456789\0'
 } >"$t/proc/100/environ"
 verify environment_reads_the_continuation_of_a_credential_in_the_main_environment FAIL 'OPENAI_API_KEY' absent
+
+mk environment_flags_an_assignment_shaped_continuation_in_the_probe_environment
+state 'exited 1 0'
+record "$R_OK1"
+begin environment_flags_an_assignment_shaped_continuation_in_the_probe_environment env OPENAI_API_KEY="openshell:resolve:env:OPENAI_API_KEY
+EXFIL=FAKE-REAL-SECRET-0123456789" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'OPENAI_API_KEY'
+not_disclosed 'FAKE-REAL-SECRET-0123456789'
+finish_case
+
+mk environment_keeps_a_separate_noncredential_entry_separate
+state 'exited 1 0'
+record "$R_OK1"
+begin environment_keeps_a_separate_noncredential_entry_separate env OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY GITHUB_TOKEN= EXFIL=FAKE-REAL-SECRET-0123456789 sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment PASS 'every credential variable is a placeholder or empty'
+fact '.environment[] | select(.name == "OPENAI_API_KEY" and .source == "probe") | .kind' placeholder
+fact '.environment[] | select(.name == "GITHUB_TOKEN" and .source == "probe") | .kind' empty
+not_disclosed 'FAKE-REAL-SECRET-0123456789'
+finish_case
+
+mk main_environment_flags_an_assignment_shaped_continuation
+state 'exited 1 0'
+record "$R_OK1"
+proc_main
+proc_codex
+environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY
+EXFIL=FAKE-REAL-SECRET-0123456789'
+environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+begin main_environment_flags_an_assignment_shaped_continuation sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'OPENAI_API_KEY'
+not_disclosed 'FAKE-REAL-SECRET-0123456789'
+finish_case
+
+mk codex_environment_flags_an_assignment_shaped_continuation
+state 'exited 1 0'
+record "$R_OK1"
+proc_main
+proc_codex
+environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY
+EXFIL=FAKE-REAL-SECRET-0123456789'
+begin codex_environment_flags_an_assignment_shaped_continuation sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'OPENAI_API_KEY'
+not_disclosed 'FAKE-REAL-SECRET-0123456789'
+finish_case
 
 for partial in 'openshell:resolve:' 'openshell:resolve:env:' 'openshell:resolve:env:A B' 'openshell:resolve:env:1A' 'openshell:resolve:file:A' 'openshell:resolve:env:A-B'; do
     partial_index=$((${partial_index:-0} + 1))

@@ -185,7 +185,7 @@ proc_stat() {
 }
 
 proc_environ() {
-    { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null
+    { cat "/proc/$1/environ"; } 2>/dev/null
 }
 
 environ_state() {
@@ -431,25 +431,21 @@ token_kinds() {
 }
 
 credential_variables() {
-    awk -v source="$1" -v re="$PLACEHOLDER_RE" '
-        function flush() {
-            if (current != "") print current "\t" kind "\t" source
-            current = ""
-        }
-        /^[A-Za-z_][A-Za-z0-9_]*=/ {
-            flush()
-            name = $0
-            sub(/=.*/, "", name)
-            upper = toupper(name)
-            if (upper != "SSH_AUTH_SOCK" && upper ~ /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)/) {
-                value = substr($0, length(name) + 2)
-                current = name
-                kind = (value == "") ? "empty" : ((value ~ (re "$")) ? "placeholder" : "other")
-            }
-            next
-        }
-        { if (current != "") kind = "other" }
-        END { flush() }'
+    jq -Rrs --arg source "$1" --arg re "$PLACEHOLDER_RE" '
+        def kind($value):
+            if $value == "" then "empty"
+            elif ($value | test($re + "\\z")) then "placeholder"
+            else "other" end;
+        split("\u0000")[]
+        | select(length > 0)
+        | (index("=")) as $separator
+        | select($separator != null)
+        | .[0:$separator] as $name
+        | .[($separator + 1):] as $value
+        | select($name | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+        | ($name | ascii_upcase) as $upper
+        | select($upper != "SSH_AUTH_SOCK" and ($upper | test("(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)")))
+        | [$name, kind($value), $source] | @tsv'
 }
 
 is_placeholder() {
@@ -847,12 +843,13 @@ step_J08() (
         codex_pid=$(jq -r '.codex[0].pid // empty' "$work/processes.json")
         codex_children=$(jq -r '.codex | length' "$work/processes.json")
     fi
-    env | credential_variables probe >>"$work/variables.tsv"
+    env -0 | credential_variables probe >>"$work/variables.tsv"
     launch_files=0
     for file in "$JACKIN_DIR"/env-*; do
         [ -f "$file" ] || continue
         launch_files=$((launch_files + 1))
-        sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$file" 2>/dev/null | credential_variables launch_env >>"$work/variables.tsv"
+        sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$file" 2>/dev/null |
+            awk '{ printf "%s%c", $0, 0 }' | credential_variables launch_env >>"$work/variables.tsv"
     done
     read_from="the probe environment, $launch_files launch env file(s)"
     unread_from=
@@ -1100,12 +1097,14 @@ step_J12() (
     codex_children=$(jq -r '.codex | length' "$work/processes.json")
     codex_ttys_known=$(jq -r 'all(.codex[]; .tty != null and .tty != "")' "$work/processes.json")
     shared_ttys=$(jq -r --arg tty "$self_tty" '[.codex[] | select(.tty == $tty)] | length' "$work/processes.json")
-    if [ -z "$self_tty" ] || [ "$codex_children" -eq 0 ] || [ "$codex_ttys_known" != true ]; then
+    if [ -z "$self_tty" ] || [ "$codex_children" -eq 0 ]; then
         skip distinct_tty "the tty of the probe or of Codex is unknown"
-    elif [ "$shared_ttys" -eq 0 ]; then
-        pass distinct_tty "probe $self_tty, every Codex child has a distinct tty"
-    else
+    elif [ "$shared_ttys" -gt 0 ]; then
         fail distinct_tty "$shared_ttys Codex child process(es) share the probe tty $self_tty"
+    elif [ "$codex_ttys_known" != true ]; then
+        skip distinct_tty "the tty of the probe or of Codex is unknown"
+    else
+        pass distinct_tty "probe $self_tty, every Codex child has a distinct tty"
     fi
     jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
 )
