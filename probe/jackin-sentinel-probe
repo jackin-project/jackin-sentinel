@@ -266,10 +266,15 @@ process_checks() {
     else
         fail main_process "no process runs $START_BIN"
     fi
+    run_state=$state
     case $state in
         running*)
-            if [ "$codex_count" -gt 0 ]; then
-                pass codex_child "$codex_count Codex process as a child of the main process"
+            if ! run_state_attempt >/dev/null; then
+                fail codex_child "the lifecycle state '$state' is not a valid running state: expected 'running <attempt>'"
+            elif [ "$codex_count" -eq 1 ]; then
+                pass codex_child "1 Codex process as a child of the main process"
+            elif [ "$codex_count" -gt 1 ]; then
+                fail codex_child "$codex_count Codex processes are children of the main process, expected one"
             else
                 fail codex_child "state is $state but the main process has no Codex child"
             fi
@@ -787,9 +792,11 @@ step_J08() (
     : >"$work/variables.tsv"
     main_pid=
     codex_pid=
+    codex_children=0
     if collect_processes 2>/dev/null; then
         main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
         codex_pid=$(jq -r '.codex[0].pid // empty' "$work/processes.json")
+        codex_children=$(jq -r '.codex | length' "$work/processes.json")
     fi
     env | credential_variables probe >>"$work/variables.tsv"
     launch_files=0
@@ -866,6 +873,8 @@ EOF
         fail environment "malformed start record"
     elif [ -n "$others" ]; then
         fail environment "not a placeholder: $others${disagree:+ (/proc and the start record disagree for: $disagree)}"
+    elif [ "$codex_children" -gt 1 ]; then
+        fail environment "$codex_children Codex processes are children of the main process, expected one: the probe reads the environment of one of them"
     elif [ "$record_state" != read ]; then
         case $record_state in
             absent) skip environment "no start record at $RECORD_FILE; the environments are unknown, never clean" ;;

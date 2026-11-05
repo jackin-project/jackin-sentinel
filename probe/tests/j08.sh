@@ -102,7 +102,7 @@ begin() {
     name=$1
     shift
     problems=
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc#$t/proc#g" "$probe" >"$t/probe"
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" "$probe" >"$t/probe"
     if [ -f "$t/seams.sed" ]; then
         sed -f "$t/seams.sed" "$t/probe" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe"
     fi
@@ -516,6 +516,71 @@ expect denial_by_policy PASS 'denied_policy'
 fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
 j10_stays_inside
 finish_case
+
+proc_codex_child() {
+    mkdir -p "$t/proc/$1"
+    printf 'codex\0--sandbox\0' >"$t/proc/$1/cmdline"
+    printf '%s (codex) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$1" >"$t/proc/$1/stat"
+}
+
+processes() {
+    begin "$1" sh "$t/probe" --only "$2"
+    expect_rc 0
+    expect_report "$2" sandbox
+}
+
+mk j11_one_codex_child_in_a_running_state_passes
+state 'running 1'
+proc_main
+proc_codex
+processes j11_one_codex_child_in_a_running_state_passes J11
+expect codex_child PASS 'as a child of the main process'
+finish_case
+
+mk j11_a_state_that_is_not_running_skips_the_codex_child_check
+state waiting
+proc_main
+processes j11_a_state_that_is_not_running_skips_the_codex_child_check J11
+expect codex_child SKIP 'not running'
+finish_case
+
+for variant in 'running-bad' 'running' 'running ' 'running 0' 'running 01' 'running x' 'running -1'; do
+    case_name=j11_the_state_$(printf '%s' "$variant" | tr -c 'A-Za-z0-9' _)_is_not_a_pass
+    mk "$case_name"
+    state "$variant"
+    proc_main
+    proc_codex
+    processes "$case_name" J11
+    expect codex_child FAIL 'not a valid running state'
+    finish_case
+done
+
+mk j07_a_malformed_running_state_is_not_a_pass
+state running-bad
+proc_main
+proc_codex
+processes j07_a_malformed_running_state_is_not_a_pass J07
+expect codex_child FAIL 'not a valid running state'
+finish_case
+
+mk j11_two_codex_children_are_not_a_pass
+state 'running 1'
+proc_main
+proc_codex
+proc_codex_child 102
+processes j11_two_codex_children_are_not_a_pass J11
+expect codex_child FAIL '2 Codex processes'
+finish_case
+
+mk j08_a_second_codex_child_with_a_real_credential_is_not_a_pass
+state 'exited 1 0'
+proc_main
+proc_codex
+proc_codex_child 102
+environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+environ 102 'OPENAI_API_KEY=sk-real-value-0123456789abcdef'
+record "$R_OK1"
+verify j08_a_second_codex_child_with_a_real_credential_is_not_a_pass FAIL '2 Codex processes' read
 
 sudo_shim() {
     mkdir -p "$t/bin"
