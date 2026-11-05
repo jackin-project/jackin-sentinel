@@ -4,9 +4,7 @@ repos:
       - id: gitleaks
         name: gitleaks
         language: system
-        entry: gitleaks dir --redact --no-banner .
-        pass_filenames: false
-        always_run: true
+        entry: sh -c 'for file; do gitleaks dir --redact --no-banner "$file" || exit 1; done' gitleaks
       - id: shellcheck
         name: shellcheck
         language: system
