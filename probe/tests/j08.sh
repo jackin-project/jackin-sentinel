@@ -405,6 +405,33 @@ expect auth_file FAIL 'not a placeholder'
 expect credential SKIP 'no credential placeholder'
 finish_case
 
+mk auth_file_flags_a_top_level_key_behind_a_nested_placeholder
+state waiting
+record "$R_EMPTY"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\"},\"OPENAI_API_KEY\":\"FAKE-real-key\"}"
+report auth_file_flags_a_top_level_key_behind_a_nested_placeholder
+expect auth_file FAIL 'not a placeholder'
+fact '.auth_file.access_token' other
+finish_case
+
+mk auth_file_flags_a_nested_token_behind_a_top_level_placeholder
+state waiting
+record "$R_EMPTY"
+auth_json "{\"tokens\":{\"access_token\":\"FAKE-real-token\"},\"OPENAI_API_KEY\":\"$PLACEHOLDER_ACCESS\"}"
+report auth_file_flags_a_nested_token_behind_a_top_level_placeholder
+expect auth_file FAIL 'not a placeholder'
+fact '.auth_file.access_token' other
+finish_case
+
+mk auth_file_accepts_two_placeholders_and_an_empty_key
+state waiting
+record "$R_EMPTY"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\"},\"OPENAI_API_KEY\":\"\"}"
+report auth_file_accepts_two_placeholders_and_an_empty_key
+expect auth_file PASS 'only placeholders'
+fact '.auth_file.access_token' placeholder
+finish_case
+
 j10_seams() {
     mkdir -p "$t/allowed"
     seam J10_ALLOWED "\"\$STATE_DIR $t/allowed\""
@@ -558,6 +585,30 @@ expect file_scan FAIL 'logs.sqlite'
 fact '.leaks | length' 1
 finish_case
 
+jwt_flagged() {
+    mk "$1"
+    state waiting
+    record "$R_W0"
+    printf 'head\0token=%s.%s.%s\0tail\n' "$2" "$3" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+    report "$1"
+    expect file_scan FAIL 'logs.sqlite'
+    fact '.leaks | length' 1
+    finish_case
+}
+
+jwt_flagged file_scan_flags_a_subless_jwt_of_another_issuer "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"iss":"other-service"}')"
+jwt_flagged file_scan_flags_a_subless_jwt_of_another_audience "$JWT_HEADER" "$(b64url '{"aud":["api.example.com"],"exp":1,"iss":"edge-gateway"}')"
+jwt_flagged file_scan_flags_a_subless_jwt_without_an_audience "$JWT_HEADER" "$(b64url '{"exp":1,"iss":"edge-gateway"}')"
+jwt_flagged file_scan_flags_a_subless_jwt_of_another_key "$(b64url '{"alg":"ES256","kid":"other-v1","typ":"JWT"}')" "$JWT_NO_SUB"
+
+mk file_scan_passes_the_cookie_with_a_string_audience
+state waiting
+record "$R_W0"
+printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$(b64url '{"aud":"chatgpt.com","exp":1,"iss":"edge-gateway"}')" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
+report file_scan_passes_the_cookie_with_a_string_audience
+expect file_scan PASS 'no token-shaped string'
+finish_case
+
 mk file_scan_flags_a_jwt_shaped_string_that_does_not_decode
 state waiting
 record "$R_W0"
@@ -638,6 +689,20 @@ expect_report J08 sandbox
 expect file_scan FAIL 'secret.txt'
 finish_case
 
+mk file_scan_skip_keeps_its_reason_before_a_long_path
+state waiting
+record "$R_W0"
+mkdir "$t/bin"
+exit_shim grep '*bad.dat' 2
+long=$(printf 'd%.0s' $(seq 1 120))
+mkdir -p "$t/sandbox/$long/$long"
+printf 'plain\n' >"$t/sandbox/$long/$long/bad.dat"
+begin file_scan_skip_keeps_its_reason_before_a_long_path env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan SKIP '(grep failed)'
+finish_case
+
 mk file_scan_skips_when_grep_times_out
 state waiting
 record "$R_W0"
@@ -707,6 +772,30 @@ if git_project; then
     finish_case
 else
     setup_failed j13_unreadable_index_is_not_a_clean_work_tree
+fi
+
+mk j13_a_broken_ref_fails_the_refs_check
+if git_project; then
+    echo garbage >"$t/sandbox/project/.git/refs/heads/other"
+    begin j13_a_broken_ref_fails_the_refs_check sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect refs FAIL 'broken ref'
+    finish_case
+else
+    setup_failed j13_a_broken_ref_fails_the_refs_check
+fi
+
+mk j13_branches_are_listed_when_the_refs_are_readable
+if git_project; then
+    begin j13_branches_are_listed_when_the_refs_are_readable sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect refs PASS '1 local branches'
+    fact '.branches | length' 1
+    finish_case
+else
+    setup_failed j13_branches_are_listed_when_the_refs_are_readable
 fi
 
 mk j13_not_a_work_tree_does_not_claim_git_status_ran
@@ -786,6 +875,39 @@ expect_rc 0
 expect_report J15 sandbox
 expect hello_world PASS '@sha256:'
 fact '.run.hello' true
+finish_case
+
+codex_prints() {
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\nprintf "%%s" "%s"\nexit %s\n' "$1" "$2" >"$t/bin/codex"
+    chmod +x "$t/bin/codex"
+    seam CODEX_BIN "$t/bin/codex"
+}
+
+mk j00_a_silent_codex_version_is_not_a_pass
+codex_prints '' 0
+begin j00_a_silent_codex_version_is_not_a_pass sh "$t/probe" --only J00
+expect_rc 0
+expect_report J00 sandbox
+expect codex_version FAIL 'printed nothing'
+fact '.codex.version' null
+finish_case
+
+mk j00_a_printed_codex_version_passes
+codex_prints 'codex-cli 9.9.9' 0
+begin j00_a_printed_codex_version_passes sh "$t/probe" --only J00
+expect_rc 0
+expect_report J00 sandbox
+expect codex_version PASS 'codex-cli 9.9.9'
+fact '.codex.version' 'codex-cli 9.9.9'
+finish_case
+
+mk j00_a_failing_codex_version_fails
+codex_prints 'codex-cli 9.9.9' 3
+begin j00_a_failing_codex_version_fails sh "$t/probe" --only J00
+expect_rc 0
+expect_report J00 sandbox
+expect codex_version FAIL 'failed'
 finish_case
 
 mk name_rule

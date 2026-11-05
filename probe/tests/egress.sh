@@ -253,6 +253,41 @@ expect codex_reaches_api PASS 'codex exec answered'
 fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
 finish_case
 
+mk j09_provider_check_sends_the_placeholder_of_auth_json
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 200
+begin j09_provider_check_sends_the_placeholder_of_auth_json step_J09 ''
+expect provider_no_credential FAIL 'HTTP 200'
+fact '.provider_host | "\(.curl_exit) \(.http_code)"' '0 200'
+finish_case
+
+mk j09_provider_check_passes_when_the_placeholder_of_auth_json_is_refused
+with_curl
+codex_says 'ready' 0
+auth_json "{\"OPENAI_API_KEY\":\"$PLACEHOLDER\"}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_provider_check_passes_when_the_placeholder_of_auth_json_is_refused step_J09 ''
+expect provider_no_credential PASS 'no credential was applied'
+finish_case
+
+mk j09_a_real_token_in_auth_json_is_never_sent
+with_curl
+codex_says 'ready' 0
+auth_json '{"tokens":{"access_token":"FAKE-real-token"}}'
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 200
+begin j09_a_real_token_in_auth_json_is_never_sent step_J09 ''
+expect provider_no_credential SKIP 'no placeholder to send'
+fact '.provider_host' null
+finish_case
+
 mk j09_no_credential_skips_codex
 with_curl
 answer "$OUTSIDE" 7 000

@@ -336,14 +336,20 @@ denial_check() {
 
 token_kinds() {
     jq -r '
-        def kind($k):
-            ((.tokens[$k] // (if $k == "access_token" then .OPENAI_API_KEY else null end))) as $v
-            | if $v == null then "absent"
-              elif $v == "" then "empty"
-              elif $k == "id_token" then (if ($v | endswith(".placeholder")) then "placeholder" else "other" end)
-              elif ($v | startswith("openshell:resolve:")) then "placeholder"
-              else "other" end;
-        [kind("access_token"), kind("refresh_token"), kind("id_token")] | @tsv' "$1"
+        def kind($v; $jwt):
+            if $v == null then "absent"
+            elif $v == "" then "empty"
+            elif $jwt then (if ($v | endswith(".placeholder")) then "placeholder" else "other" end)
+            elif ($v | startswith("openshell:resolve:")) then "placeholder"
+            else "other" end;
+        def worst:
+            if any(. == "other") then "other"
+            elif any(. == "placeholder") then "placeholder"
+            elif any(. == "empty") then "empty"
+            else "absent" end;
+        [([kind(.tokens.access_token; false), kind(.OPENAI_API_KEY; false)] | worst),
+         kind(.tokens.refresh_token; false),
+         kind(.tokens.id_token; true)] | @tsv' "$1"
 }
 
 credential_variables() {
@@ -376,10 +382,15 @@ jwt_listed() {
                 | (length % 4) as $m
                 | if $m == 2 then . + "==" elif $m == 3 then . + "=" elif $m == 1 then error("length") else . end
                 | @base64d;
+            def part($i): split(".")[$i] | b64 | fromjson;
+            def audience: if type == "string" then . == "chatgpt.com" elif type == "array" then . == ["chatgpt.com"] else false end;
+            def known_cookie:
+                (part(0) | type == "object" and .kid == "oailb-v1")
+                and (part(1) | type == "object" and .iss == "edge-gateway" and (has("sub") | not) and (.aud | audience));
             def verdict:
                 if . == "SCAN_ERROR" then "error"
                 elif test($safe) then "none"
-                else (try (split(".")[1] | b64 | fromjson | if type == "object" and (has("sub") | not) then "none" else "hit" end) catch "hit")
+                else (try (if known_cookie then "none" else "hit" end) catch "hit")
                 end;
             reduce (inputs | verdict) as $v ("none";
                 if . == "error" or $v == "error" then "error" elif . == "hit" or $v == "hit" then "hit" else "none" end)'
@@ -435,8 +446,11 @@ EOF
         | {leaks: ([$found[] | select(.kind == "leak") | .path] | .[0:50]),
            unscanned: ([$found[] | select(.kind == "unscanned") | "\(.path) (\(.why))"]
                        + $e
-                       + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end))}') ||
-        scan_result='{"leaks": [], "unscanned": ["the scan output could not be read"]}'
+                       + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end)),
+           reasons: (([$found[] | select(.kind == "unscanned") | .why]
+                      + (if ($e | length) > 0 then ["find error"] else [] end)
+                      + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end)) | unique | join(", "))}') ||
+        scan_result='{"leaks": [], "unscanned": ["the scan output could not be read"], "reasons": "the scan output could not be read"}'
 }
 
 try_create() {
@@ -456,11 +470,13 @@ step_J00() (
     fi
     if [ "$executable" = true ]; then
         home=$(mktemp -d "$work/codexhome.XXXXXX")
-        if version=$(CODEX_HOME=$home timeout 30 "$CODEX_BIN" --version 2>/dev/null </dev/null); then
-            pass codex_version "$version"
-        else
+        if ! version=$(CODEX_HOME=$home timeout 30 "$CODEX_BIN" --version 2>/dev/null </dev/null); then
             version=
             fail codex_version "codex --version failed"
+        elif [ -z "$version" ]; then
+            fail codex_version "codex --version printed nothing"
+        else
+            pass codex_version "$version"
         fi
     else
         fail codex_binary "$CODEX_BIN is not an executable file"
@@ -727,7 +743,7 @@ step_J08() (
     leaks=$(printf '%s' "$scan_result" | jq -c '.leaks')
     unscanned=$(printf '%s' "$scan_result" | jq -r '.unscanned | length')
     if [ "$unscanned" -gt 0 ]; then
-        unscanned_text="$unscanned paths under $SCAN_ROOT not scanned: $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
+        unscanned_text="$unscanned paths under $SCAN_ROOT not scanned ($(printf '%s' "$scan_result" | jq -r '.reasons')): $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
         unread_from="${unread_from:+$unread_from; }$unscanned_text"
     fi
     run_state=$(head -n 1 "$RUN_STATE_FILE" 2>/dev/null) || run_state=
@@ -833,6 +849,9 @@ step_J09() (
         bearer=$CODEX_AUTH_ACCESS_TOKEN
     elif [ "${OPENAI_API_KEY-}" != "" ]; then
         bearer=$OPENAI_API_KEY
+    fi
+    if [ -z "$bearer" ] && [ -f "$CODEX_HOME_DIR/auth.json" ]; then
+        bearer=$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
     fi
     case $bearer in
         openshell:resolve:*) provider=$(egress https://api.openai.com/v1/models "$bearer") ;;
@@ -950,6 +969,7 @@ step_J13() (
     head=
     clean=true
     status_known=false
+    refs_known=false
     stash=0
     branches='[]'
     if git_in rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -963,8 +983,12 @@ step_J13() (
             clean=false
         fi
         stash=$(git_in stash list 2>/dev/null | wc -l | tr -d ' ')
-        branches=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>/dev/null |
-            jq -Rn '[inputs | split(" ") | {name: .[0], tip: .[1]}]')
+        if refs=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>"$work/refs.err") && [ ! -s "$work/refs.err" ]; then
+            refs_known=true
+            if [ -n "$refs" ]; then
+                branches=$(printf '%s\n' "$refs" | jq -Rn '[inputs | split(" ") | {name: .[0], tip: .[1]}]') || refs_known=false
+            fi
+        fi
     fi
     if [ "$work_tree" = true ]; then
         pass work_tree "$PROJECT"
@@ -982,6 +1006,13 @@ step_J13() (
         pass work_tree_status "git status ran"
     else
         fail work_tree_status "git status failed, so the cleanliness of the work tree is unknown"
+    fi
+    if [ "$work_tree" = false ]; then
+        skip refs "git for-each-ref not run: $PROJECT is not a git work tree"
+    elif [ "$refs_known" = true ]; then
+        pass refs "$(printf '%s' "$branches" | jq 'length') local branches"
+    else
+        fail refs "git for-each-ref failed or reported a broken ref: $(head -n 3 "$work/refs.err" 2>/dev/null | tr '\n' ';')"
     fi
     jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
         --argjson branches "$branches" --argjson clean "$clean" --argjson stash "$stash" \
