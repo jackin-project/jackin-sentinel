@@ -21,6 +21,8 @@ run_setup() {
     launch=$1
     shift
     env -i PATH="$PATH" JACKIN_LAUNCH_ID="$launch" "$@" sh "$t/setup.sh"
+    rc=$?
+    check "${t##*/} exits zero" "$rc" 0
 }
 
 lines() {
