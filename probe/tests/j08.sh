@@ -244,6 +244,13 @@ finish_case() {
     fi
 }
 
+finish_git_case() {
+    if [ -n "$problems" ]; then
+        cat "$t/out"
+    fi
+    finish_case
+}
+
 verify() {
     begin "$1" sh "$t/probe" --only J08
     expect_rc 0
@@ -1565,12 +1572,92 @@ else
 fi
 
 git_in_project() {
-    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -C "$t/sandbox/project" "$@"
+    git_fixture -C "$t/sandbox/project" "$@"
 }
 
 git_project() {
     git_in_project init -q &&
         git_in_project -c core.hooksPath=/dev/null -c commit.gpgsign=false -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m init
+}
+
+git_fixture() {
+    env -i PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
+
+git_global_fixture() {
+    env -i PATH="$PATH" HOME="$t/home" GIT_CONFIG_NOSYSTEM=1 git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+}
+
+git_public_state() {
+    git_state_repo=$1
+    git_state_index=$(git_fixture -C "$git_state_repo" rev-parse --git-path index) || return 1
+    case "$git_state_index" in
+        /*) git_state_index_file=$git_state_index ;;
+        *) git_state_index_file=$git_state_repo/$git_state_index ;;
+    esac
+    git_fixture -C "$git_state_repo" rev-parse --verify HEAD &&
+        git_fixture -C "$git_state_repo" for-each-ref --format='%(refname) %(objectname)' &&
+        git_fixture -C "$git_state_repo" status --porcelain --untracked-files=all &&
+        if [ -f "$git_state_index_file" ]; then
+            git_state_index_digest=$(sha256sum "$git_state_index_file") || return 1
+            printf 'index present %s\n' "${git_state_index_digest%% *}"
+        else
+            printf 'index absent\n'
+        fi
+}
+
+git_foreign_repo() {
+    git_foreign_path=$1
+    mkdir -p "$git_foreign_path" &&
+        git_fixture -C "$git_foreign_path" init -q &&
+        git_fixture -C "$git_foreign_path" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m foreign &&
+        git_fixture -C "$git_foreign_path" tag foreign-tag
+}
+
+git_submodule_project() {
+    mkdir -p "$t/submodule-source" &&
+        git_fixture -C "$t/submodule-source" init -q &&
+        printf child >"$t/submodule-source/tracked.txt" &&
+        git_fixture -C "$t/submodule-source" add tracked.txt &&
+        git_fixture -C "$t/submodule-source" -c user.name=probe -c user.email=probe@example.invalid commit -q -m child &&
+        git_in_project -c protocol.file.allow=always submodule add -q "$t/submodule-source" child &&
+        git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m submodule
+}
+
+git_flagged_submodule_project() {
+    git_child_flag=$1
+    git_project && git_submodule_project &&
+        git_fixture -C "$t/sandbox/project/child" update-index "$git_child_flag" -- tracked.txt || return 1
+    git_child_flag_entry=$(git_fixture -C "$t/sandbox/project/child" ls-files -v -- tracked.txt) || return 1
+    case "$git_child_flag:$git_child_flag_entry" in
+        --assume-unchanged:h\ tracked.txt) ;;
+        --skip-worktree:S\ tracked.txt) ;;
+        *) return 1 ;;
+    esac
+    printf changed >"$t/sandbox/project/child/tracked.txt" || return 1
+    git_child_parent_status=$(git_in_project status --porcelain --untracked-files=all --ignore-submodules=none) || return 1
+    [ -z "$git_child_parent_status" ]
+}
+
+git_flagged_project() {
+    git_flag=$1
+    git_change=$2
+    git_project &&
+        printf original >"$t/sandbox/project/tracked.txt" &&
+        git_in_project add tracked.txt &&
+        git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m tracked &&
+        git_in_project update-index "$git_flag" -- tracked.txt || return 1
+    git_flag_entry=$(git_in_project ls-files -v -- tracked.txt) || return 1
+    case "$git_flag:$git_flag_entry" in
+        --assume-unchanged:h\ tracked.txt) ;;
+        --skip-worktree:S\ tracked.txt) ;;
+        *) return 1 ;;
+    esac
+    if [ "$git_change" = changed ]; then
+        printf changed >"$t/sandbox/project/tracked.txt" || return 1
+    fi
+    git_flag_status=$(git_in_project status --porcelain --untracked-files=all) || return 1
+    [ -z "$git_flag_status" ]
 }
 
 mk j13_clean_work_tree
@@ -1682,6 +1769,372 @@ expect_report J13 sandbox
 expect work_tree FAIL 'not a git work tree'
 expect work_tree_status SKIP 'git status not run'
 finish_case
+
+mk j05_parent_repository_is_not_the_project_repository
+if git_fixture -C "$t/sandbox" init -q && git_fixture -C "$t/sandbox" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m parent && git_fixture -C "$t/sandbox" tag parent-tag && printf project >"$t/sandbox/project/file.txt" && parent_state=$(git_public_state "$t/sandbox"); then
+    begin j05_parent_repository_is_not_the_project_repository sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect git_work_tree FAIL 'not a git work tree'
+    fact '.git_work_tree' false
+    parent_state_after=$(git_public_state "$t/sandbox") || problems="$problems parent-state-unreadable"
+    [ "$parent_state_after" = "$parent_state" ] || problems="$problems parent-state-changed"
+    finish_git_case
+else
+    setup_failed j05_parent_repository_is_not_the_project_repository
+fi
+
+mk j13_parent_repository_is_not_the_project_repository
+if git_fixture -C "$t/sandbox" init -q && git_fixture -C "$t/sandbox" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m parent && git_fixture -C "$t/sandbox" tag parent-tag && printf project >"$t/sandbox/project/file.txt" && parent_head=$(git_fixture -C "$t/sandbox" rev-parse --verify HEAD) && parent_state=$(git_public_state "$t/sandbox"); then
+    begin j13_parent_repository_is_not_the_project_repository sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree FAIL 'not a git work tree'
+    expect work_tree_status SKIP 'git status not run'
+    fact '.branch' null
+    fact '.head' null
+    [ -n "$parent_head" ] || problems="$problems parent-head-not-captured"
+    parent_state_after=$(git_public_state "$t/sandbox") || problems="$problems parent-state-unreadable"
+    [ "$parent_state_after" = "$parent_state" ] || problems="$problems parent-state-changed"
+    finish_git_case
+else
+    setup_failed j13_parent_repository_is_not_the_project_repository
+fi
+
+mk j13_symlinked_project_root_is_accepted
+if mkdir -p "$t/sandbox/real-project" && git_fixture -C "$t/sandbox/real-project" init -q && git_fixture -C "$t/sandbox/real-project" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m project && project_head=$(git_fixture -C "$t/sandbox/real-project" rev-parse --verify HEAD) && project_branch=$(git_fixture -C "$t/sandbox/real-project" symbolic-ref --short HEAD) && rmdir "$t/sandbox/project" && ln -s "$t/sandbox/real-project" "$t/sandbox/project"; then
+    begin j13_symlinked_project_root_is_accepted sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree PASS "$t/sandbox/project"
+    expect work_tree_status PASS 'git status ran'
+    fact '.branch' "$project_branch"
+    fact '.head' "$project_head"
+    fact '.clean' true
+    finish_git_case
+else
+    setup_failed j13_symlinked_project_root_is_accepted
+fi
+
+mk j13_untracked_file_is_dirty_despite_local_configuration
+if git_project && git_in_project config status.showUntrackedFiles no && printf x >"$t/sandbox/project/untracked.txt"; then
+    begin j13_untracked_file_is_dirty_despite_local_configuration sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_untracked_file_is_dirty_despite_local_configuration
+fi
+
+mk j13_tracked_edit_is_dirty
+if git_project && printf tracked >"$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m tracked && printf changed >"$t/sandbox/project/tracked.txt"; then
+    begin j13_tracked_edit_is_dirty sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_tracked_edit_is_dirty
+fi
+
+mk j13_unchanged_tracked_mode_is_clean_under_configuration
+if git_project && printf '#!/bin/sh\n' >"$t/sandbox/project/tracked.sh" && chmod 0644 "$t/sandbox/project/tracked.sh" && git_in_project add tracked.sh && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m executable && git_in_project config core.filemode false; then
+    begin j13_unchanged_tracked_mode_is_clean_under_configuration sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' true
+    finish_git_case
+else
+    setup_failed j13_unchanged_tracked_mode_is_clean_under_configuration
+fi
+
+mk j13_tracked_executable_mode_change_is_dirty_despite_configuration
+if git_project && printf '#!/bin/sh\n' >"$t/sandbox/project/tracked.sh" && chmod 0644 "$t/sandbox/project/tracked.sh" && git_in_project add tracked.sh && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m executable && git_in_project config core.filemode false && chmod 0755 "$t/sandbox/project/tracked.sh" && [ -x "$t/sandbox/project/tracked.sh" ] && ordinary_status=$(git_in_project status --porcelain --untracked-files=all) && [ -z "$ordinary_status" ] && required_status=$(git_in_project -c core.fileMode=true -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all) && [ -n "$required_status" ]; then
+    begin j13_tracked_executable_mode_change_is_dirty_despite_configuration sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_tracked_executable_mode_change_is_dirty_despite_configuration
+fi
+
+mk j13_dirty_submodule_file_is_dirty_despite_local_ignore
+if git_project && git_submodule_project && git_in_project config submodule.child.ignore all && printf changed >"$t/sandbox/project/child/tracked.txt" && ordinary_status=$(git_in_project status --porcelain --untracked-files=all) && [ -z "$ordinary_status" ] && required_status=$(git_in_project status --porcelain --untracked-files=all --ignore-submodules=none) && [ -n "$required_status" ]; then
+    begin j13_dirty_submodule_file_is_dirty_despite_local_ignore sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_dirty_submodule_file_is_dirty_despite_local_ignore
+fi
+
+mk j13_changed_submodule_head_is_dirty_despite_global_ignore
+if git_project && git_submodule_project && mkdir -p "$t/home" && git_fixture config --file "$t/home/.gitconfig" diff.ignoreSubmodules all && printf next >"$t/submodule-source/tracked.txt" && git_fixture -C "$t/submodule-source" add tracked.txt && git_fixture -C "$t/submodule-source" -c user.name=probe -c user.email=probe@example.invalid commit -q -m next && child_head=$(git_fixture -C "$t/submodule-source" rev-parse --verify HEAD) && git_fixture -C "$t/sandbox/project/child" fetch -q "$t/submodule-source" && git_fixture -C "$t/sandbox/project/child" checkout -q "$child_head" && ordinary_status=$(git_global_fixture -C "$t/sandbox/project" status --porcelain --untracked-files=all) && [ -z "$ordinary_status" ] && required_status=$(git_global_fixture -C "$t/sandbox/project" status --porcelain --untracked-files=all --ignore-submodules=none) && [ -n "$required_status" ]; then
+    begin j13_changed_submodule_head_is_dirty_despite_global_ignore env HOME="$t/home" GIT_CONFIG_NOSYSTEM=1 sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_changed_submodule_head_is_dirty_despite_global_ignore
+fi
+
+mk j13_clean_submodule_is_clean
+if git_project && git_submodule_project; then
+    begin j13_clean_submodule_is_clean sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' true
+    finish_git_case
+else
+    setup_failed j13_clean_submodule_is_clean
+fi
+
+mk j13_child_assume_unchanged_edit_is_dirty
+if git_flagged_submodule_project --assume-unchanged; then
+    begin j13_child_assume_unchanged_edit_is_dirty sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_child_assume_unchanged_edit_is_dirty
+fi
+
+mk j13_child_skip_worktree_edit_is_dirty
+if git_flagged_submodule_project --skip-worktree; then
+    begin j13_child_skip_worktree_edit_is_dirty sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_child_skip_worktree_edit_is_dirty
+fi
+
+mk j13_assume_unchanged_edit_is_dirty
+if git_flagged_project --assume-unchanged changed; then
+    begin j13_assume_unchanged_edit_is_dirty sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_assume_unchanged_edit_is_dirty
+fi
+
+mk j13_assume_unchanged_entry_is_dirty_without_an_edit
+if git_flagged_project --assume-unchanged unchanged; then
+    begin j13_assume_unchanged_entry_is_dirty_without_an_edit sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_assume_unchanged_entry_is_dirty_without_an_edit
+fi
+
+mk j13_skip_worktree_edit_is_dirty
+if git_flagged_project --skip-worktree changed; then
+    begin j13_skip_worktree_edit_is_dirty sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_skip_worktree_edit_is_dirty
+fi
+
+mk j13_skip_worktree_entry_is_dirty_without_an_edit
+if git_flagged_project --skip-worktree unchanged; then
+    begin j13_skip_worktree_entry_is_dirty_without_an_edit sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_skip_worktree_entry_is_dirty_without_an_edit
+fi
+
+mk j13_stat_cache_configuration_cannot_hide_a_tracked_edit
+if git_project && printf aaaa >"$t/sandbox/project/tracked.txt" && touch -t 200001010000.00 "$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m tracked && git_in_project config core.trustctime false && git_in_project config core.checkStat minimal && printf bbbb >"$t/sandbox/project/replacement.txt" && touch -t 200001010000.00 "$t/sandbox/project/replacement.txt" && chmod 0644 "$t/sandbox/project/replacement.txt" && mv -f "$t/sandbox/project/replacement.txt" "$t/sandbox/project/tracked.txt" && ordinary_status=$(git_in_project status --porcelain --untracked-files=all) && [ -z "$ordinary_status" ] && required_status=$(git_in_project -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all) && [ -n "$required_status" ]; then
+    begin j13_stat_cache_configuration_cannot_hide_a_tracked_edit sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_stat_cache_configuration_cannot_hide_a_tracked_edit
+fi
+
+mk j13_stat_cache_configuration_keeps_unchanged_file_clean
+if git_project && printf aaaa >"$t/sandbox/project/tracked.txt" && touch -t 200001010000.00 "$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m tracked && git_in_project config core.trustctime false && git_in_project config core.checkStat minimal; then
+    begin j13_stat_cache_configuration_keeps_unchanged_file_clean sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' true
+    finish_git_case
+else
+    setup_failed j13_stat_cache_configuration_keeps_unchanged_file_clean
+fi
+
+mk j13_untracked_file_is_dirty_despite_global_configuration
+if git_project && mkdir -p "$t/home" && git_fixture config --file "$t/home/.gitconfig" status.showUntrackedFiles no && printf x >"$t/sandbox/project/untracked.txt"; then
+    begin j13_untracked_file_is_dirty_despite_global_configuration env HOME="$t/home" GIT_CONFIG_NOSYSTEM=1 sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_untracked_file_is_dirty_despite_global_configuration
+fi
+
+mk j13_untracked_file_is_dirty_despite_config_count_injection
+if git_project && printf x >"$t/sandbox/project/untracked.txt"; then
+    begin j13_untracked_file_is_dirty_despite_config_count_injection env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=status.showUntrackedFiles GIT_CONFIG_VALUE_0=no sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_untracked_file_is_dirty_despite_config_count_injection
+fi
+
+mk j13_untracked_file_is_dirty_despite_config_parameters_injection
+if git_project && printf x >"$t/sandbox/project/untracked.txt"; then
+    begin j13_untracked_file_is_dirty_despite_config_parameters_injection env "GIT_CONFIG_PARAMETERS='status.showUntrackedFiles=no'" sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_untracked_file_is_dirty_despite_config_parameters_injection
+fi
+
+mk j13_replace_ref_base_cannot_change_project_cleanliness
+if git_project && printf original >"$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m original && original_head=$(git_in_project rev-parse --verify HEAD) && printf changed >"$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m changed && changed_head=$(git_in_project rev-parse --verify HEAD) && git_in_project checkout -q "$original_head" && git_in_project update-ref "refs/custom/replace/$original_head" "$changed_head"; then
+    begin j13_replace_ref_base_cannot_change_project_cleanliness env GIT_REPLACE_REF_BASE=refs/custom/replace/ sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.head' "$original_head"
+    fact '.clean' true
+    finish_git_case
+else
+    setup_failed j13_replace_ref_base_cannot_change_project_cleanliness
+fi
+
+mk j13_no_replace_objects_cannot_change_project_cleanliness
+if git_project && printf original >"$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m original && original_head=$(git_in_project rev-parse --verify HEAD) && printf changed >"$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m changed && changed_head=$(git_in_project rev-parse --verify HEAD) && git_in_project checkout -q "$original_head" && git_in_project update-ref "refs/replace/$original_head" "$changed_head"; then
+    begin j13_no_replace_objects_cannot_change_project_cleanliness env GIT_NO_REPLACE_OBJECTS=1 sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.head' "$original_head"
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_no_replace_objects_cannot_change_project_cleanliness
+fi
+
+mk j05_foreign_git_dir_cannot_select_a_nonrepo_project
+if git_foreign_repo "$t/foreign" && printf project >"$t/sandbox/project/file.txt" && foreign_head=$(git_fixture -C "$t/foreign" rev-parse --verify HEAD) && foreign_state=$(git_public_state "$t/foreign"); then
+    begin j05_foreign_git_dir_cannot_select_a_nonrepo_project env GIT_DIR="$t/foreign/.git" GIT_WORK_TREE="$t/sandbox/project" sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect git_work_tree FAIL 'not a git work tree'
+    fact '.git_work_tree' false
+    [ -n "$foreign_head" ] || problems="$problems foreign-head-not-captured"
+    foreign_state_after=$(git_public_state "$t/foreign") || problems="$problems foreign-state-unreadable"
+    [ "$foreign_state_after" = "$foreign_state" ] || problems="$problems foreign-state-changed"
+    finish_git_case
+else
+    setup_failed j05_foreign_git_dir_cannot_select_a_nonrepo_project
+fi
+
+mk j13_foreign_git_dir_cannot_select_a_nonrepo_project
+if git_foreign_repo "$t/foreign" && printf project >"$t/sandbox/project/file.txt" && foreign_head=$(git_fixture -C "$t/foreign" rev-parse --verify HEAD) && foreign_state=$(git_public_state "$t/foreign"); then
+    begin j13_foreign_git_dir_cannot_select_a_nonrepo_project env GIT_DIR="$t/foreign/.git" GIT_WORK_TREE="$t/sandbox/project" sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree FAIL 'not a git work tree'
+    expect work_tree_status SKIP 'git status not run'
+    fact '.branch' null
+    fact '.head' null
+    [ -n "$foreign_head" ] || problems="$problems foreign-head-not-captured"
+    foreign_state_after=$(git_public_state "$t/foreign") || problems="$problems foreign-state-unreadable"
+    [ "$foreign_state_after" = "$foreign_state" ] || problems="$problems foreign-state-changed"
+    finish_git_case
+else
+    setup_failed j13_foreign_git_dir_cannot_select_a_nonrepo_project
+fi
+
+mk j13_foreign_common_dir_cannot_change_project_state
+if mkdir -p "$t/source" && git_fixture -C "$t/source" init -q && git_fixture -C "$t/source" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m project && git_fixture -C "$t/source" worktree add -q -b project-only "$t/sandbox/project" && git_foreign_repo "$t/foreign" && project_head=$(git_fixture -C "$t/sandbox/project" rev-parse --verify HEAD) && foreign_state=$(git_public_state "$t/foreign"); then
+    begin j13_foreign_common_dir_cannot_change_project_state env GIT_COMMON_DIR="$t/foreign/.git" sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.branch' project-only
+    fact '.head' "$project_head"
+    fact '.clean' true
+    foreign_state_after=$(git_public_state "$t/foreign") || problems="$problems foreign-state-unreadable"
+    [ "$foreign_state_after" = "$foreign_state" ] || problems="$problems foreign-state-changed"
+    finish_git_case
+else
+    setup_failed j13_foreign_common_dir_cannot_change_project_state
+fi
+
+mk j13_foreign_index_cannot_change_project_cleanliness
+if git_project && printf project >"$t/sandbox/project/tracked.txt" && git_in_project add tracked.txt && git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m project && project_head=$(git_in_project rev-parse --verify HEAD) && git_foreign_repo "$t/foreign" && printf foreign >"$t/foreign/tracked.txt" && git_fixture -C "$t/foreign" add tracked.txt && git_fixture -C "$t/foreign" -c user.name=probe -c user.email=probe@example.invalid commit -q -m foreign-file && foreign_state=$(git_public_state "$t/foreign"); then
+    begin j13_foreign_index_cannot_change_project_cleanliness env GIT_INDEX_FILE="$t/foreign/.git/index" sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.head' "$project_head"
+    fact '.clean' true
+    foreign_state_after=$(git_public_state "$t/foreign") || problems="$problems foreign-state-unreadable"
+    [ "$foreign_state_after" = "$foreign_state" ] || problems="$problems foreign-state-changed"
+    finish_git_case
+else
+    setup_failed j13_foreign_index_cannot_change_project_cleanliness
+fi
+
+mk j13_foreign_object_directory_cannot_break_project_status
+if git_project && project_head=$(git_in_project rev-parse --verify HEAD) && git_foreign_repo "$t/foreign" && foreign_state=$(git_public_state "$t/foreign"); then
+    begin j13_foreign_object_directory_cannot_break_project_status env GIT_OBJECT_DIRECTORY="$t/foreign/.git/objects" sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.head' "$project_head"
+    fact '.clean' true
+    foreign_state_after=$(git_public_state "$t/foreign") || problems="$problems foreign-state-unreadable"
+    [ "$foreign_state_after" = "$foreign_state" ] || problems="$problems foreign-state-changed"
+    finish_git_case
+else
+    setup_failed j13_foreign_object_directory_cannot_break_project_status
+fi
 
 mk j05_hashes_every_file_by_its_exact_name
 if git_project; then
