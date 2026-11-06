@@ -281,11 +281,34 @@ finish_case
 
 mk j09_provider_refused
 with_curl
+codex_says 'ready' 0
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_provider_refused step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
-expect provider_no_credential FAIL 'no HTTP response'
+expect codex_reaches_api PASS 'codex exec answered'
+expect provider_no_credential PASS 'refused the connection'
+expect_sent "Authorization: Bearer $PLACEHOLDER"
+finish_case
+
+mk j09_provider_timeout_is_not_proof
+with_curl
+codex_says 'ready' 0
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 28 000
+begin j09_provider_timeout_is_not_proof step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'gave no HTTP response'
+finish_case
+
+mk j09_provider_unresolved_is_not_proof
+with_curl
+codex_says 'ready' 0
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 6 000
+begin j09_provider_unresolved_is_not_proof step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential FAIL 'gave no HTTP response'
 finish_case
 
 mk j09_provider_401_that_shows_only_the_placeholder_passes

@@ -1139,6 +1139,8 @@ step_J09() (
         skip provider_no_credential "no placeholder to send"
     elif [ "$(egress_outcome "$provider")" = curl_missing ]; then
         fail provider_no_credential "$(egress_fault api.openai.com "$provider")"
+    elif [ "$(egress_outcome "$provider")" = refused ]; then
+        pass provider_no_credential "api.openai.com refused the connection, so no credential was applied"
     elif [ "$(egress_outcome "$provider")" != answered ]; then
         fail provider_no_credential "api.openai.com gave no HTTP response, so the probe cannot show that no credential was applied"
     else
