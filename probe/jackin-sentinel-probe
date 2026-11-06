@@ -224,16 +224,23 @@ EOF
 
 read_run_state() {
     run_state=
-    state_size=$(wc -c <"$RUN_STATE_FILE" 2>/dev/null) || return 0
+    [ -f "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] || return 0
+    if ! timeout 2 dd if="$RUN_STATE_FILE" of="$work/run-state.raw" bs=65 count=1 iflag=nonblock,nofollow 2>/dev/null; then
+        return 0
+    fi
+    [ -f "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] || return 0
+    state_size=$(wc -c <"$work/run-state.raw" 2>/dev/null) || return 0
     state_size=$(printf '%s' "$state_size" | tr -d '[:space:]')
     case $state_size in
         '' | *[!0-9]*) return 0 ;;
     esac
-    if [ "$state_size" -gt 64 ]; then
-        state_prefix=$(head -c 7 "$RUN_STATE_FILE" 2>/dev/null) || state_prefix=
+    state_prefix=$(head -c 7 "$work/run-state.raw" 2>/dev/null) || state_prefix=
+    state_nuls=$(LC_ALL=C tr -cd '\000' <"$work/run-state.raw" | wc -c | tr -d ' ')
+    if [ "$state_size" -gt 64 ] || [ "$state_nuls" -ne 0 ]; then
         case $state_prefix in
             running*) run_state='running invalid' ;;
             exited*) run_state='exited invalid' ;;
+            waiting*) run_state='waiting invalid' ;;
         esac
         return 0
     fi
@@ -257,7 +264,7 @@ read_run_state() {
             else if (first ~ /^running/) print "running invalid"
             else if (first ~ /^exited/) print "exited invalid"
             else if (first == "waiting") print "waiting invalid"
-        }' "$RUN_STATE_FILE" 2>/dev/null) || run_state=
+        }' "$work/run-state.raw" 2>/dev/null) || run_state=
 }
 
 collect_processes() {
@@ -944,7 +951,6 @@ step_J08() (
         unscanned_text="$unscanned paths under $SCAN_ROOT not scanned ($(printf '%s' "$scan_result" | jq -r '.reasons')): $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
         unread_from="${unread_from:+$unread_from; }$unscanned_text"
     fi
-    read_run_state
     record_load
     state_attempt=$(run_state_attempt) || state_attempt=
     if [ "$record_state" = read ] && [ "$record_attempt" != "$state_attempt" ]; then
@@ -965,25 +971,40 @@ step_J08() (
     main_env=$(agent_env main "$work/live.main.tsv" "$main_pid")
     codex_env=absent
     codex_read_failed=0
+    codex_read_count=0
+    codex_fail_count=0
     : >"$work/live.codex.tsv"
     for pid in $codex_pids; do
-        codex_env='read'
         child_env=$(agent_env codex "$work/live.codex.$pid.tsv" "$pid")
         if [ "$child_env" = read ]; then
+            codex_read_count=$((codex_read_count + 1))
             cat "$work/live.codex.$pid.tsv" >>"$work/live.codex.tsv"
         else
             codex_read_failed=1
+            codex_fail_count=$((codex_fail_count + 1))
         fi
     done
-    if [ "$codex_read_failed" -eq 1 ]; then
+    if [ "$codex_read_count" -gt 0 ]; then
+        codex_env='read'
+    elif [ "$codex_read_failed" -eq 1 ]; then
         codex_env=denied
-        : >"$work/live.codex.tsv"
+    fi
+    codex_read_label="$codex_read_count child environments"
+    codex_fail_label="$codex_fail_count child environments"
+    [ "$codex_read_count" -eq 1 ] && codex_read_label='1 child environment'
+    [ "$codex_fail_count" -eq 1 ] && codex_fail_label='1 child environment'
+    if [ "$codex_fail_count" -gt 0 ] && [ "$codex_known" -ne 1 ]; then
+        unread_from="${unread_from:+$unread_from; }$codex_fail_count Codex child environment(s) could not be read"
     fi
     disagree=
     settle main "$main_env" "$main_known"
     main_env=$settled
     settle codex "$codex_env" "$codex_known"
     codex_env=$settled
+    if [ "$codex_read_count" -gt 0 ] && [ "$codex_fail_count" -gt 0 ] && [ "$codex_known" -eq 1 ]; then
+        cat "$work/rec.codex.tsv" >>"$work/variables.tsv"
+        read_from="$read_from, the fresh aggregate Codex record"
+    fi
     sort -u -o "$work/variables.tsv" "$work/variables.tsv"
     environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
     others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | unique | join(" ")')
@@ -1016,10 +1037,28 @@ EOF
     fi
     if [ "$record_state" = malformed ]; then
         fail environment "malformed start record"
-    elif [ "$codex_children" -gt 1 ]; then
-        fail environment "$codex_children Codex processes are children of the main process, expected one: the probe reads the environment of one of them"
     elif [ -n "$others" ]; then
-        fail environment "not a placeholder: $others${disagree:+ (/proc and the start record disagree for: $disagree)}"
+        detail="not a placeholder: $others"
+        if [ "$codex_children" -gt 1 ]; then
+            detail="$detail; $codex_children Codex processes, read $codex_read_label"
+            if [ "$codex_fail_count" -gt 0 ]; then
+                if [ "$codex_known" -eq 1 ]; then
+                    detail="$detail; $codex_fail_label unread; the fresh aggregate Codex record is retained"
+                else
+                    detail="$detail; $codex_fail_label unread"
+                fi
+            fi
+        fi
+        fail environment "$detail${disagree:+ (/proc and the start record disagree for: $disagree)}"
+    elif [ "$codex_children" -gt 1 ]; then
+        detail="$codex_children Codex processes are children of the main process; read $codex_read_label"
+        if [ "$codex_fail_count" -gt 0 ]; then
+            detail="$detail; $codex_fail_label could not be read"
+            if [ "$codex_known" -eq 1 ]; then
+                detail="$detail; the fresh aggregate Codex record is retained"
+            fi
+        fi
+        fail environment "$detail"
     elif [ "$record_state" != read ]; then
         case $record_state in
             absent) skip environment "no start record at $RECORD_FILE; the environments are unknown, never clean" ;;
