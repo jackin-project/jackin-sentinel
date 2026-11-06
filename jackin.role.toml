@@ -20,7 +20,6 @@ default = "0"
 prompt = "Fail the preflight hook (1) or pass it (0):"
 
 [agents.codex]
-model = "gpt-5.1-codex"
 instructions = "instructions/codex.md"
 
 [agents.omp]
