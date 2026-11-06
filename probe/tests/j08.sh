@@ -14,6 +14,8 @@ R_OK1='jackin-env-kinds 1\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_K
 R_W0='jackin-env-kinds 1\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
 R_EMPTY='jackin-env-kinds 1\nattempt 0\nmain GITHUB_TOKEN empty\n'
 R_NOCODEX='jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\n'
+R_OTHER_MAIN='jackin-env-kinds 1\nattempt 1\nmain P73_FAKE_API_KEY other\ncodex OPENAI_API_KEY placeholder\n'
+R_OTHER_CODEX='jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET other\n'
 
 mk() {
     t=$scratch/$1
@@ -48,6 +50,22 @@ environ() {
     for pair in "$@"; do
         printf '%s\0' "$pair" >>"$t/proc/$pid/environ"
     done
+}
+
+cat_fail_for_proc() {
+    target=$1
+    prefix_bytes=$2
+    real_cat=$(command -v cat) || return 1
+    mkdir -p "$t/bin"
+    cat >"$t/bin/cat" <<EOF
+#!/bin/sh
+if [ "\$#" -eq 1 ] && [ "\$1" = "$target" ]; then
+    "$real_cat" "\$1" | head -c "$prefix_bytes"
+    exit 1
+fi
+exec "$real_cat" "\$@"
+EOF
+    chmod +x "$t/bin/cat"
 }
 
 seam() {
@@ -216,6 +234,70 @@ environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 verify skip_proc_clean_without_record SKIP 'no start record' absent
 
+mk main_environ_partial_read_falls_back_to_the_other_start_record
+state 'exited 1 0'
+proc_main
+proc_codex
+environ 100 'OPENAI_API_KEY=sk-FAKE-REAL-SECRET-0123456789abcdef'
+environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+record "$R_OTHER_MAIN"
+cat_fail_for_proc "$t/proc/100/environ" 12
+begin main_environ_partial_read_falls_back_to_the_other_start_record env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'P73_FAKE_API_KEY'
+fact '.agent_environment.main' record
+fact '.start_record.state' read
+not_disclosed 'sk-FAKE-REAL-SECRET-0123456789abcdef'
+finish_case
+
+mk codex_environ_failed_read_falls_back_to_the_other_start_record
+state 'exited 1 0'
+proc_main
+proc_codex
+environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+environ 101 'GITHUB_TOKEN=sk-FAKE-CODEX-SECRET-0123456789abcdef'
+record "$R_OTHER_CODEX"
+cat_fail_for_proc "$t/proc/101/environ" 0
+begin codex_environ_failed_read_falls_back_to_the_other_start_record env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'STRIPE_SECRET'
+fact '.agent_environment.codex' record
+fact '.start_record.state' read
+not_disclosed 'sk-FAKE-CODEX-SECRET-0123456789abcdef'
+finish_case
+
+mk main_environ_failed_read_uses_a_clean_start_record
+state 'exited 1 0'
+proc_main
+proc_codex
+environ 100 'OPENAI_API_KEY=sk-FAKE-REAL-SECRET-0123456789abcdef'
+environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+record "$R_OK1"
+cat_fail_for_proc "$t/proc/100/environ" 12
+begin main_environ_failed_read_uses_a_clean_start_record env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment PASS 'via record'
+fact '.agent_environment.main' record
+not_disclosed 'sk-FAKE-REAL-SECRET-0123456789abcdef'
+finish_case
+
+mk main_environ_failed_read_without_a_fresh_record_remains_unknown
+state waiting
+proc_main
+environ 100 'OPENAI_API_KEY=sk-FAKE-REAL-SECRET-0123456789abcdef'
+cat_fail_for_proc "$t/proc/100/environ" 0
+begin main_environ_failed_read_without_a_fresh_record_remains_unknown env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment SKIP 'never clean'
+fact '.agent_environment.main' denied
+fact '.start_record.state' absent
+not_disclosed 'sk-FAKE-REAL-SECRET-0123456789abcdef'
+finish_case
+
 if [ "$(id -u)" -ne 0 ]; then
     mk skip_unreadable
     state waiting
@@ -239,6 +321,20 @@ mk skip_state_garbled
 state 'bogus 1'
 record "$R_W0"
 verify skip_state_garbled SKIP 'stale' stale
+
+mk skip_malformed_running_state_with_matching_start_record
+state 'running 1 garbage'
+proc_main
+proc_codex
+environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+record "$R_OK1"
+begin skip_malformed_running_state_with_matching_start_record sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment SKIP 'stale'
+fact '.start_record.state' stale
+finish_case
 
 mk skip_codex_not_yet_started
 state waiting
@@ -616,7 +712,16 @@ processes j11_a_state_that_is_not_running_skips_the_codex_child_check J11
 expect codex_child SKIP 'not running'
 finish_case
 
-for variant in 'running-bad' 'running' 'running ' 'running 0' 'running 01' 'running x' 'running -1'; do
+mk j07_one_codex_child_in_a_running_state_passes
+state 'running 1'
+proc_main
+proc_codex
+processes j07_one_codex_child_in_a_running_state_passes J07
+expect codex_child PASS 'as a child of the main process'
+finish_case
+
+multiline_running_state=$(printf 'running 1\nextra')
+for variant in 'running-bad' 'running' 'running ' 'running 0' 'running 01' 'running x' 'running -1' 'running 1 garbage' 'running 1 ' 'running 1 2' "$multiline_running_state"; do
     case_name=j11_the_state_$(printf '%s' "$variant" | tr -c 'A-Za-z0-9' _)_is_not_a_pass
     mk "$case_name"
     state "$variant"
@@ -627,13 +732,16 @@ for variant in 'running-bad' 'running' 'running ' 'running 0' 'running 01' 'runn
     finish_case
 done
 
-mk j07_a_malformed_running_state_is_not_a_pass
-state running-bad
-proc_main
-proc_codex
-processes j07_a_malformed_running_state_is_not_a_pass J07
-expect codex_child FAIL 'not a valid running state'
-finish_case
+for variant in 'running 1 garbage' 'running 1 ' 'running 1 2' "$multiline_running_state"; do
+    case_name=j07_the_state_$(printf '%s' "$variant" | tr -c 'A-Za-z0-9' _)_is_not_a_pass
+    mk "$case_name"
+    state "$variant"
+    proc_main
+    proc_codex
+    processes "$case_name" J07
+    expect codex_child FAIL 'not a valid running state'
+    finish_case
+done
 
 mk j11_two_codex_children_are_not_a_pass
 state 'running 1'

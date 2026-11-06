@@ -222,9 +222,47 @@ EOF
         "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, comm: $comm, args: $args, start_ticks: $ticks, tty: ($tty | n)}'
 }
 
+read_run_state() {
+    run_state=
+    state_size=$(wc -c <"$RUN_STATE_FILE" 2>/dev/null) || return 0
+    state_size=$(printf '%s' "$state_size" | tr -d '[:space:]')
+    case $state_size in
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    if [ "$state_size" -gt 64 ]; then
+        state_prefix=$(head -c 7 "$RUN_STATE_FILE" 2>/dev/null) || state_prefix=
+        case $state_prefix in
+            running*) run_state='running invalid' ;;
+            exited*) run_state='exited invalid' ;;
+        esac
+        return 0
+    fi
+    run_state=$(LC_ALL=C awk '
+        function valid(s, attempt, fields, count) {
+            if (s == "waiting") return 1
+            if (s ~ /^running [1-9][0-9]*$/) {
+                attempt = substr(s, 9)
+                return length(attempt) <= 18
+            }
+            if (s ~ /^exited [1-9][0-9]* (0|[1-9][0-9]*)$/) {
+                count = split(s, fields, " ")
+                return count == 3 && length(fields[2]) <= 18 && length(fields[3]) <= 3 && fields[3] + 0 <= 255
+            }
+            return 0
+        }
+        NR == 1 { first = $0; next }
+        { extra = 1 }
+        END {
+            if (NR == 1 && !extra && valid(first)) print first
+            else if (first ~ /^running/) print "running invalid"
+            else if (first ~ /^exited/) print "exited invalid"
+            else if (first == "waiting") print "waiting invalid"
+        }' "$RUN_STATE_FILE" 2>/dev/null) || run_state=
+}
+
 collect_processes() {
     boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
-    run_state=$(head -n 1 "$JACKIN_DIR/run/state" 2>/dev/null) || run_state=
+    read_run_state
     main_pid=
     for dir in /proc/[0-9]*; do
         pid=${dir#/proc/}
@@ -729,11 +767,39 @@ step_J07() (
 
 agent_env() {
     [ -n "$3" ] || {
+        : >"$2"
         echo absent
         return 0
     }
     state=$(environ_state "$3")
-    [ "$state" != read ] || proc_environ "$3" | credential_variables "$1" >"$2"
+    if [ "$state" = read ]; then
+        fifo="$work/proc-env.$1.$3"
+        parsed="$work/proc-env.$1.$3.tsv"
+        rm -f "$fifo" "$parsed"
+        if ! mkfifo "$fifo" 2>/dev/null; then
+            : >"$2"
+            echo denied
+            return 0
+        fi
+        proc_environ "$3" >"$fifo" 2>/dev/null &
+        producer=$!
+        filter_status=0
+        if ! credential_variables "$1" <"$fifo" >"$parsed" 2>/dev/null; then
+            filter_status=1
+        fi
+        producer_status=0
+        wait "$producer" || producer_status=1
+        rm -f "$fifo"
+        if [ "$filter_status" -eq 0 ] && [ "$producer_status" -eq 0 ] && mv "$parsed" "$2" 2>/dev/null; then
+            echo read
+            return 0
+        fi
+        rm -f "$parsed"
+        : >"$2"
+        echo denied
+        return 0
+    fi
+    : >"$2"
     echo "$state"
 }
 
@@ -796,13 +862,31 @@ record_load() {
 run_state_attempt() {
     case $run_state in
         waiting) echo 0 ;;
-        'running '* | 'exited '*)
-            n=${run_state#* }
-            n=${n%% *}
+        'running '*)
+            n=${run_state#running }
             case $n in
                 '' | 0* | *[!0-9]*) return 1 ;;
             esac
             [ "${#n}" -le 18 ] || return 1
+            echo "$n"
+            ;;
+        'exited '*)
+            rest=${run_state#exited }
+            case $rest in
+                *' '*)
+                    n=${rest%% *}
+                    status=${rest#* }
+                    ;;
+                *) return 1 ;;
+            esac
+            case $n in
+                '' | 0* | *[!0-9]*) return 1 ;;
+            esac
+            case $status in
+                0) ;;
+                '' | 0* | *[!0-9]*) return 1 ;;
+            esac
+            [ "${#n}" -le 18 ] && [ "${#status}" -le 3 ] && [ "$status" -le 255 ] || return 1
             echo "$n"
             ;;
         *) return 1 ;;
@@ -836,11 +920,11 @@ settle() {
 step_J08() (
     : >"$work/variables.tsv"
     main_pid=
-    codex_pid=
+    codex_pids=
     codex_children=0
     if collect_processes 2>/dev/null; then
         main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
-        codex_pid=$(jq -r '.codex[0].pid // empty' "$work/processes.json")
+        codex_pids=$(jq -r '.codex[].pid' "$work/processes.json")
         codex_children=$(jq -r '.codex | length' "$work/processes.json")
     fi
     env -0 | credential_variables probe >>"$work/variables.tsv"
@@ -860,7 +944,7 @@ step_J08() (
         unscanned_text="$unscanned paths under $SCAN_ROOT not scanned ($(printf '%s' "$scan_result" | jq -r '.reasons')): $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
         unread_from="${unread_from:+$unread_from; }$unscanned_text"
     fi
-    run_state=$(head -n 1 "$RUN_STATE_FILE" 2>/dev/null) || run_state=
+    read_run_state
     record_load
     state_attempt=$(run_state_attempt) || state_attempt=
     if [ "$record_state" = read ] && [ "$record_attempt" != "$state_attempt" ]; then
@@ -879,7 +963,22 @@ step_J08() (
         fi
     fi
     main_env=$(agent_env main "$work/live.main.tsv" "$main_pid")
-    codex_env=$(agent_env codex "$work/live.codex.tsv" "$codex_pid")
+    codex_env=absent
+    codex_read_failed=0
+    : >"$work/live.codex.tsv"
+    for pid in $codex_pids; do
+        codex_env='read'
+        child_env=$(agent_env codex "$work/live.codex.$pid.tsv" "$pid")
+        if [ "$child_env" = read ]; then
+            cat "$work/live.codex.$pid.tsv" >>"$work/live.codex.tsv"
+        else
+            codex_read_failed=1
+        fi
+    done
+    if [ "$codex_read_failed" -eq 1 ]; then
+        codex_env=denied
+        : >"$work/live.codex.tsv"
+    fi
     disagree=
     settle main "$main_env" "$main_known"
     main_env=$settled
@@ -917,10 +1016,10 @@ EOF
     fi
     if [ "$record_state" = malformed ]; then
         fail environment "malformed start record"
-    elif [ -n "$others" ]; then
-        fail environment "not a placeholder: $others${disagree:+ (/proc and the start record disagree for: $disagree)}"
     elif [ "$codex_children" -gt 1 ]; then
         fail environment "$codex_children Codex processes are children of the main process, expected one: the probe reads the environment of one of them"
+    elif [ -n "$others" ]; then
+        fail environment "not a placeholder: $others${disagree:+ (/proc and the start record disagree for: $disagree)}"
     elif [ "$record_state" != read ]; then
         case $record_state in
             absent) skip environment "no start record at $RECORD_FILE; the environments are unknown, never clean" ;;
