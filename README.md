@@ -118,7 +118,7 @@ jackin-sentinel-probe | jq .
 jackin-sentinel-probe --docker on --only J15 | jq .
 ```
 
-J07 and J09 run `codex exec` only when the sandbox has a configured OpenShell placeholder credential. The bounded stdout capture can wait up to 280 seconds, separate from the deadlines for other journey checks. The `output_bytes` fact counts the observed stdout prefix, up to 65,537 bytes. Byte 65,537 marks overflow, so output longer than 65,536 bytes fails even when `ready` appears in the prefix. J15 pulls `hello-world` through the engine and takes up to five minutes.
+J07 and J09 run `codex exec` only when the sandbox has a configured OpenShell placeholder credential. The bounded stdout capture can wait up to 280 seconds, separate from the deadlines for other journey checks. The `output_bytes` fact counts the observed stdout prefix, up to 65,537 bytes. Byte 65,537 marks overflow, so output longer than 65,536 bytes fails even when `ready` appears in the prefix. J15 pulls `hello-world` through the engine. Its run and info commands accept at most 65,536 output bytes each; overflow or incomplete capture fails the affected check. Run captures merged stdout and stderr; info captures stdout. Producer and capture deadlines are 300 seconds for run and 60 seconds for info, with a further drain deadline of 30 seconds and a five-second kill grace. These bounds do not establish descendant cleanup.
 
 ## Docker capability
 

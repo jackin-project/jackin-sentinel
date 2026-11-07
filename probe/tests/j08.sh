@@ -211,6 +211,10 @@ expect_report() {
     jq -e --arg step "$1" --arg mode "$2" \
         '.schema == 2 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
         problems="$problems report-shape"
+    if [ "$1" = J15 ]; then
+        [ -f "$t/bin/docker-data/run.called" ] || problems="$problems run-not-invoked"
+        [ -f "$t/bin/docker-data/info.called" ] || problems="$problems info-not-invoked"
+    fi
 }
 
 expect() {
@@ -2439,21 +2443,479 @@ else
 fi
 
 mk j15_runs_the_hello_world_image_by_digest
-mkdir -p "$t/bin"
+mkdir -p "$t/bin/docker-data"
 cat >"$t/bin/docker" <<'EOF'
 #!/bin/sh
-case "$*" in
-    "run --rm hello-world@sha256:"*) echo "Hello from Docker!" ;;
-    *) exit 1 ;;
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef")
+        : >"$data/run.called"
+        if [ "$(cat "$data/run.stream")" = stderr ]; then
+            cat "$data/run.out" >&2 || exit 91
+        else
+            cat "$data/run.out" || exit 91
+        fi
+        status=$(cat "$data/run.status")
+        printf '%s\n' "$status" >"$data/run.complete"
+        exit "$status"
+        ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}")
+        : >"$data/info.called"
+        cat "$data/info.out" || exit 92
+        status=$(cat "$data/info.status")
+        printf '%s\n' "$status" >"$data/info.complete"
+        exit "$status"
+        ;;
+    *) exit 93 ;;
 esac
 EOF
 chmod +x "$t/bin/docker"
-begin j15_runs_the_hello_world_image_by_digest env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
+
+j15_docker_case() {
+    printf '%b' "$1" >"$t/bin/docker-data/run.out"
+    printf '%b' "$2" >"$t/bin/docker-data/info.out"
+    printf '%s\n' "${3:-0}" >"$t/bin/docker-data/run.status"
+    printf '%s\n' "${4:-0}" >"$t/bin/docker-data/info.status"
+    printf '%s\n' "${5:-stdout}" >"$t/bin/docker-data/run.stream"
+    rm -f "$t/bin/docker-data"/*.called "$t/bin/docker-data"/*.complete
+}
+
+j15_begin() {
+    begin "$1" env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
+    expect_rc 0
+    expect_report J15 sandbox
+    [ -f "$t/bin/docker-data/run.called" ] || problems="$problems run-not-invoked"
+    [ -f "$t/bin/docker-data/info.called" ] || problems="$problems info-not-invoked"
+    [ -f "$t/bin/docker-data/run.complete" ] || problems="$problems run-not-drained"
+    [ -f "$t/bin/docker-data/info.complete" ] || problems="$problems info-not-drained"
+}
+
+j15_marker() {
+    path=$1
+    want=$2
+    got=$(cat "$path" 2>/dev/null)
+    [ "$got" = "$want" ] || problems="$problems marker[$path]=[$got](want [$want])"
+}
+
+j15_install_receipt_fixture() {
+    mkdir -p "$t/bin/docker-data"
+    cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; status=$(cat "$data/run.status") || exit 92; printf '%s\n' "$status" >"$data/run.complete"; exit "$status" ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 93; status=$(cat "$data/info.status") || exit 94; printf '%s\n' "$status" >"$data/info.complete"; exit "$status" ;;
+    *) exit 95 ;;
+esac
+EOF
+    chmod +x "$t/bin/docker"
+}
+
+j15_docker_case 'prefix Hello from Docker! suffix\n' 'ENGINE-ID 1.2.3\n'
+j15_begin j15_docker_run_and_info_are_recognized_independently
+expect hello_world PASS '@sha256:'
+expect engine PASS 'ENGINE-ID'
+fact '.run.hello' true
+fact '.run.exit_code' 0
+fact '.engine.id' ENGINE-ID
+fact '.engine.server_version' 1.2.3
+finish_case
+
+j15_docker_case 'prefix Hello from Docker! suffix\n' ' ENGINE-ID 1.2.3\n' 0 0 stderr
+j15_begin j15_docker_run_merged_stderr_and_info_whitespace_are_accepted
+expect hello_world PASS '@sha256:'
+expect engine PASS 'ENGINE-ID'
+fact '.run.hello' true
+fact '.engine.id' ENGINE-ID
+fact '.engine.server_version' 1.2.3
+finish_case
+
+mk j15_odd_nibble_greeting_is_not_a_run_greeting
+j15_install_receipt_fixture
+python3 - "$t/bin/docker-data/run.out" <<'PY'
+import sys
+
+greeting = b"Hello from Docker!"
+data = bytes.fromhex("0" + greeting.hex() + "0")
+if greeting.hex() not in data.hex() or data.hex().find(greeting.hex()) != 1 or greeting in data:
+    raise SystemExit(1)
+with open(sys.argv[1], "wb") as output:
+    output.write(data)
+PY
+fixture_rc=$?
+printf 'ENGINE-ID 1.2.3\n' >"$t/bin/docker-data/info.out"
+printf '0\n' >"$t/bin/docker-data/run.status"
+printf '0\n' >"$t/bin/docker-data/info.status"
+if [ "$fixture_rc" -eq 0 ]; then
+    j15_begin j15_odd_nibble_greeting_is_not_a_run_greeting
+    j15_marker "$t/bin/docker-data/run.complete" 0
+    j15_marker "$t/bin/docker-data/info.complete" 0
+    expect hello_world FAIL ''
+    fact '.run.hello' false
+    fact '.run.exit_code' 0
+    expect engine PASS 'ENGINE-ID'
+    fact '.engine.id' ENGINE-ID
+    fact '.engine.server_version' 1.2.3
+    finish_case
+else
+    setup_failed j15_odd_nibble_greeting_is_not_a_run_greeting
+fi
+
+mk j15_aligned_greeting_after_odd_nibble_match_is_found
+j15_install_receipt_fixture
+python3 - "$t/bin/docker-data/run.out" <<'PY'
+import sys
+
+greeting = b"Hello from Docker!"
+misleading = bytes.fromhex("0" + greeting.hex() + "0")
+data = misleading + greeting
+if greeting.hex() not in data.hex() or data.hex().find(greeting.hex()) != 1:
+    raise SystemExit(1)
+if data.find(greeting) != len(misleading):
+    raise SystemExit(1)
+with open(sys.argv[1], "wb") as output:
+    output.write(data)
+PY
+fixture_rc=$?
+printf 'ENGINE-ID 1.2.3\n' >"$t/bin/docker-data/info.out"
+printf '0\n' >"$t/bin/docker-data/run.status"
+printf '0\n' >"$t/bin/docker-data/info.status"
+if [ "$fixture_rc" -eq 0 ]; then
+    j15_begin j15_aligned_greeting_after_odd_nibble_match_is_found
+    j15_marker "$t/bin/docker-data/run.complete" 0
+    j15_marker "$t/bin/docker-data/info.complete" 0
+    expect hello_world PASS '@sha256:'
+    fact '.run.hello' true
+    fact '.run.exit_code' 0
+    expect engine PASS 'ENGINE-ID'
+    fact '.engine.id' ENGINE-ID
+    fact '.engine.server_version' 1.2.3
+    finish_case
+else
+    setup_failed j15_aligned_greeting_after_odd_nibble_match_is_found
+fi
+
+mk j15_info_preserves_first_line_version_remainder
+j15_install_receipt_fixture
+printf 'Hello from Docker!\n' >"$t/bin/docker-data/run.out"
+python3 - "$t/bin/docker-data/info.out" <<'PY'
+import sys
+
+with open(sys.argv[1], "wb") as output:
+    output.write(b" \tENGINE-ID  1.2.3  build\tflavor \t\nSECOND-ID 9.9\n")
+PY
+printf '0\n' >"$t/bin/docker-data/run.status"
+printf '0\n' >"$t/bin/docker-data/info.status"
+j15_ifs=$(printf ' \t\n')
+IFS=$j15_ifs read -r j15_expected_id j15_expected_version <"$t/bin/docker-data/info.out"
+expected_version=$(printf '1.2.3  build\tflavor')
+if [ "$j15_expected_id" != ENGINE-ID ] || [ "$j15_expected_version" != "$expected_version" ]; then
+    setup_failed j15_info_preserves_first_line_version_remainder
+else
+    j15_begin j15_info_preserves_first_line_version_remainder
+    j15_marker "$t/bin/docker-data/run.complete" 0
+    j15_marker "$t/bin/docker-data/info.complete" 0
+    expect hello_world PASS '@sha256:'
+    fact '.run.hello' true
+    fact '.run.exit_code' 0
+    expect engine PASS 'ENGINE-ID'
+    fact '.engine.id' ENGINE-ID
+    fact '.engine.server_version' "$expected_version"
+    finish_case
+fi
+
+mk j15_greeting_crosses_encoded_line_boundary
+mkdir -p "$t/bin/docker-data"
+cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; : >"$data/run.complete"; exit 0 ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; printf 'ENGINE-ID 1.2.3\n'; : >"$data/info.complete"; exit 0 ;;
+    *) exit 93 ;;
+esac
+EOF
+chmod +x "$t/bin/docker"
+j15_docker_case 'x' ' \tENGINE-ID 1.2.3\n'
+python3 - "$t/bin/docker-data/run.out" <<'PY'
+import sys
+
+with open(sys.argv[1], "wb") as output:
+    output.write(b"x" * 15 + b"Hello from Docker!\n")
+PY
+begin j15_greeting_crosses_encoded_line_boundary env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
 expect_rc 0
 expect_report J15 sandbox
 expect hello_world PASS '@sha256:'
+expect engine PASS 'ENGINE-ID'
 fact '.run.hello' true
+fact '.engine.id' ENGINE-ID
+fact '.engine.server_version' 1.2.3
+[ -f "$t/bin/docker-data/run.complete" ] || problems="$problems run-not-drained"
+[ -f "$t/bin/docker-data/info.complete" ] || problems="$problems info-not-drained"
 finish_case
+
+j15_write_exact() {
+    output=$1
+    size=$2
+    prefix=$3
+    python3 - "$output" "$size" "$prefix" <<'PY'
+import sys
+
+path, size, prefix = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode().decode("unicode_escape").encode()
+if len(prefix) > size:
+    raise SystemExit(2)
+with open(path, "wb") as output:
+    output.write(prefix)
+    output.write(b"x" * (size - len(prefix)))
+PY
+}
+
+j15_run_below=1000
+j15_run_exact=65536
+j15_run_over=65537
+j15_run_pipe=4194304
+j15_info_below=1000
+j15_info_exact=65536
+j15_info_over=65537
+j15_info_pipe=4194304
+
+for size in "$j15_run_below" "$j15_run_exact"; do
+    mk "j15_run_complete_$size"
+    mkdir -p "$t/bin/docker-data"
+    cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; printf '0\n' >"$data/run.complete"; exit 0 ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 92; printf '0\n' >"$data/info.complete"; exit 0 ;;
+    *) exit 93 ;;
+esac
+EOF
+    chmod +x "$t/bin/docker"
+    j15_write_exact "$t/bin/docker-data/run.out" "$size" 'Hello from Docker!'
+    printf 'ENGINE-ID 1.2.3\n' >"$t/bin/docker-data/info.out"
+    printf 0 >"$t/bin/docker-data/run.status"
+    printf 0 >"$t/bin/docker-data/info.status"
+    printf stdout >"$t/bin/docker-data/run.stream"
+    begin "j15_run_complete_$size" env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
+    expect_rc 0
+    expect_report J15 sandbox
+    expect hello_world PASS '@sha256:'
+    expect engine PASS 'ENGINE-ID'
+    fact '.run.hello' true
+    fact '.run.exit_code' 0
+    fact '.engine.id' ENGINE-ID
+    j15_marker "$t/bin/docker-data/run.complete" 0
+    j15_marker "$t/bin/docker-data/info.complete" 0
+    finish_case
+done
+
+for size in "$j15_info_below" "$j15_info_exact"; do
+    mk "j15_info_complete_$size"
+    mkdir -p "$t/bin/docker-data"
+    cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; printf 'Hello from Docker!\n'; printf '0\n' >"$data/run.complete"; exit 0 ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 92; printf '0\n' >"$data/info.complete"; exit 0 ;;
+    *) exit 93 ;;
+esac
+EOF
+    chmod +x "$t/bin/docker"
+    printf 'Hello from Docker!\n' >"$t/bin/docker-data/run.out"
+    j15_write_exact "$t/bin/docker-data/info.out" "$size" ' ENGINE-ID 1.2.3\n'
+    printf 0 >"$t/bin/docker-data/run.status"
+    printf 0 >"$t/bin/docker-data/info.status"
+    printf stdout >"$t/bin/docker-data/run.stream"
+    begin "j15_info_complete_$size" env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
+    expect_rc 0
+    expect_report J15 sandbox
+    expect engine PASS 'ENGINE-ID'
+    expect hello_world PASS '@sha256:'
+    fact '.run.hello' true
+    fact '.run.exit_code' 0
+    fact '.engine.id' ENGINE-ID
+    fact '.engine.server_version' 1.2.3
+    j15_marker "$t/bin/docker-data/run.complete" 0
+    j15_marker "$t/bin/docker-data/info.complete" 0
+    finish_case
+done
+
+j15_capture_overflow_case() {
+    command=$1
+    size=$2
+    mk "j15_${command}_overflow_$size"
+    mkdir -p "$t/bin/docker-data"
+    cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; printf '0\n' >"$data/run.complete"; exit 0 ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 92; printf '0\n' >"$data/info.complete"; exit 0 ;;
+    *) exit 93 ;;
+esac
+EOF
+    chmod +x "$t/bin/docker"
+    printf 'Hello from Docker!\n' >"$t/bin/docker-data/run.out"
+    printf 'ENGINE-ID 1.2.3\n' >"$t/bin/docker-data/info.out"
+    if [ "$command" = run ]; then
+        j15_write_exact "$t/bin/docker-data/run.out" "$size" 'prefix Hello from Docker!\n!P\t17\n!H\n4869\n!O\t0\n!D\t0\n!E\t0\t0\t0\n'
+    else
+        j15_write_exact "$t/bin/docker-data/info.out" "$size" 'ENGINE-ID 1.2.3\n!P\t17\n!H\n4869\n!O\t0\n!D\t0\n!E\t0\t0\t0\n'
+    fi
+    printf 0 >"$t/bin/docker-data/run.status"
+    printf 0 >"$t/bin/docker-data/info.status"
+    printf stdout >"$t/bin/docker-data/run.stream"
+    begin "j15_${command}_overflow_$size" env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
+    expect_rc 0
+    expect_report J15 sandbox
+    if [ "$command" = run ]; then
+        expect hello_world FAIL 'incomplete'
+        fact '.run.hello' false
+        fact '.run.exit_code' 0
+        expect engine PASS 'ENGINE-ID'
+        fact '.engine.id' ENGINE-ID
+    else
+        expect hello_world PASS '@sha256:'
+        fact '.run.hello' true
+        expect engine FAIL ''
+        fact '.engine.id' null
+        fact '.engine.server_version' null
+    fi
+    j15_marker "$t/bin/docker-data/run.complete" 0
+    j15_marker "$t/bin/docker-data/info.complete" 0
+    finish_case
+}
+
+for size in "$j15_run_over" "$j15_run_pipe"; do j15_capture_overflow_case run "$size"; done
+for size in "$j15_info_over" "$j15_info_pipe"; do j15_capture_overflow_case info "$size"; done
+
+mk j15_run_nonzero_preserves_complete_greeting_and_exit_status
+mkdir -p "$t/bin/docker-data"
+cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; status=$(cat "$data/run.status"); printf '%s\n' "$status" >"$data/run.complete"; exit "$status" ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 92; status=$(cat "$data/info.status"); printf '%s\n' "$status" >"$data/info.complete"; exit "$status" ;;
+    *) exit 93 ;;
+esac
+EOF
+chmod +x "$t/bin/docker"
+j15_docker_case 'Hello from Docker!\n' 'ENGINE-ID 1.2.3\n' 23 0
+j15_begin j15_run_nonzero_preserves_complete_greeting_and_exit_status
+j15_marker "$t/bin/docker-data/run.complete" 23
+j15_marker "$t/bin/docker-data/info.complete" 0
+expect hello_world FAIL '@sha256:'
+fact '.run.hello' true
+fact '.run.exit_code' 23
+expect engine PASS 'ENGINE-ID'
+finish_case
+
+mk j15_info_nonzero_does_not_trust_engine_data
+mkdir -p "$t/bin/docker-data"
+cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; status=$(cat "$data/run.status"); printf '%s\n' "$status" >"$data/run.complete"; exit "$status" ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 92; status=$(cat "$data/info.status"); printf '%s\n' "$status" >"$data/info.complete"; exit "$status" ;;
+    *) exit 93 ;;
+esac
+EOF
+chmod +x "$t/bin/docker"
+j15_docker_case 'Hello from Docker!\n' 'ENGINE-ID 1.2.3\n' 0 24
+j15_begin j15_info_nonzero_does_not_trust_engine_data
+j15_marker "$t/bin/docker-data/run.complete" 0
+j15_marker "$t/bin/docker-data/info.complete" 24
+expect hello_world PASS '@sha256:'
+expect engine FAIL ''
+fact '.engine.id' null
+fact '.engine.server_version' null
+finish_case
+
+j15_docker_case 'no greeting\n' '\n'
+j15_begin j15_missing_greeting_and_empty_engine_id_fail
+expect hello_world FAIL '@sha256:'
+fact '.run.hello' false
+fact '.run.exit_code' 0
+expect engine FAIL ''
+fact '.engine.id' null
+fact '.engine.server_version' null
+finish_case
+
+mk j15_od_execution_failure
+mkdir -p "$t/bin/docker-data" "$t/private-tools"
+for tool in awk basename cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
+    found=$(command -v "$tool") || exit 70
+    ln -s "$found" "$t/private-tools/$tool"
+done
+cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; status=$(cat "$data/run.status") || exit 92; printf '%s\n' "$status" >"$data/run.complete"; exit "$status" ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 93; status=$(cat "$data/info.status") || exit 94; printf '%s\n' "$status" >"$data/info.complete"; exit "$status" ;;
+    *) exit 93 ;;
+esac
+EOF
+chmod +x "$t/bin/docker"
+printf 'Hello from Docker!\n' >"$t/bin/docker-data/run.out"
+printf 'ENGINE-ID 1.2.3\n' >"$t/bin/docker-data/info.out"
+printf '0\n' >"$t/bin/docker-data/run.status"
+printf '0\n' >"$t/bin/docker-data/info.status"
+seam SANDBOX_PATH "$t/bin:$scratch/shim:$t/private-tools"
+begin j15_private_od_control_succeeds env PATH="$t/bin:$scratch/shim:$t/private-tools" sh "$t/probe" --only J15 --docker on
+expect_rc 0
+expect_report J15 sandbox
+expect hello_world PASS '@sha256:'
+expect engine PASS 'ENGINE-ID'
+fact '.run.hello' true
+fact '.engine.id' ENGINE-ID
+[ -f "$t/bin/docker-data/run.called" ] || problems="$problems run-not-invoked"
+[ -f "$t/bin/docker-data/info.called" ] || problems="$problems info-not-invoked"
+[ -f "$t/bin/docker-data/run.complete" ] || problems="$problems run-not-drained"
+[ -f "$t/bin/docker-data/info.complete" ] || problems="$problems info-not-drained"
+finish_case
+rm -f "$t/seams.sed"
+
+rm -f "$t/bin/docker-data"/*.called "$t/bin/docker-data"/*.complete
+printf '11\n' >"$t/bin/docker-data/run.status"
+printf '12\n' >"$t/bin/docker-data/info.status"
+rm "$t/private-tools/od"
+: >"$t/private-tools/od"
+chmod -x "$t/private-tools/od"
+if env PATH="$t/bin:$scratch/shim:$t/private-tools" timeout 5 od </dev/null >/dev/null 2>&1; then
+    setup_failed j15_od_execution_failure_unavailable
+else
+    od_rc=$?
+    if [ "$od_rc" -ne 126 ]; then
+        setup_failed j15_od_execution_failure_unavailable
+    else
+        seam SANDBOX_PATH "$t/bin:$scratch/shim:$t/private-tools"
+        begin j15_od_execution_failure_does_not_trust_either_capture env PATH="$t/bin:$scratch/shim:$t/private-tools" sh "$t/probe" --only J15 --docker on
+        expect_rc 0
+        expect_report J15 sandbox
+        expect hello_world FAIL 'incomplete'
+        fact '.run.hello' false
+        fact '.run.exit_code' "$(cat "$t/bin/docker-data/run.complete" 2>/dev/null)"
+        expect engine FAIL ''
+        fact '.engine.id' null
+        fact '.engine.server_version' null
+        j15_marker "$t/bin/docker-data/run.complete" 11
+        j15_marker "$t/bin/docker-data/info.complete" 12
+        [ -f "$t/bin/docker-data/run.called" ] || problems="$problems run-not-invoked"
+        [ -f "$t/bin/docker-data/info.called" ] || problems="$problems info-not-invoked"
+        [ -f "$t/bin/docker-data/run.complete" ] || problems="$problems run-not-drained"
+        [ -f "$t/bin/docker-data/info.complete" ] || problems="$problems info-not-drained"
+        finish_case
+        rm -f "$t/seams.sed"
+    fi
+fi
+rm -f "$t/private-tools/od"
+ln -s "$(command -v od)" "$t/private-tools/od"
 
 codex_prints() {
     mkdir -p "$t/bin"

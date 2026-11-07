@@ -1746,6 +1746,175 @@ step_J14() (
         '{boot_id: $boot_id, marker: {path: $path, id: $id, created: $created}, setup_runs: $setup, preflight_runs: $preflight}' >"$work/facts"
 )
 
+docker_capture() (
+    unset _jks_docker_deadline _jks_docker_stream _jks_docker_producer_status
+    unset _jks_docker_od_status _jks_docker_drain_status _jks_docker_encoded
+    _jks_docker_deadline=$1
+    _jks_docker_stream=$2
+    shift 2
+    case $_jks_docker_stream in
+        merged | stdout) ;;
+        *) exit 64 ;;
+    esac
+    [ "$#" -gt 0 ] || exit 64
+    (
+        exec 3>&1 || exit 1
+        (
+            _jks_docker_producer_status=0
+            case $_jks_docker_stream in
+                merged)
+                    if timeout --kill-after=5 "$_jks_docker_deadline" "$@" 3>&- 2>&1 </dev/null; then
+                        :
+                    else
+                        _jks_docker_producer_status=$?
+                    fi
+                    ;;
+                stdout)
+                    if timeout --kill-after=5 "$_jks_docker_deadline" "$@" 3>&- 2>/dev/null </dev/null; then
+                        :
+                    else
+                        _jks_docker_producer_status=$?
+                    fi
+                    ;;
+            esac
+            printf '!P\t%s\n' "$_jks_docker_producer_status" >&3 || exit 1
+        ) | {
+            _jks_docker_od_status=0
+            _jks_docker_encoded=
+            if _jks_docker_encoded=$(LC_ALL=C timeout --kill-after=5 "$_jks_docker_deadline" od -An -N65537 -v -tx1 3>&- 2>/dev/null); then
+                :
+            else
+                _jks_docker_od_status=$?
+            fi
+            _jks_docker_drain_status=0
+            timeout --kill-after=5 30 cat >/dev/null 3>&- 2>/dev/null || _jks_docker_drain_status=$?
+            if ! {
+                if [ -n "$_jks_docker_encoded" ]; then
+                    printf '!H\n%s\n!O\t%s\n!D\t%s\n!Z\n' "$_jks_docker_encoded" "$_jks_docker_od_status" "$_jks_docker_drain_status"
+                else
+                    printf '!H\n!O\t%s\n!D\t%s\n!Z\n' "$_jks_docker_od_status" "$_jks_docker_drain_status"
+                fi
+            } >&3; then
+                unset _jks_docker_encoded
+                unset _jks_docker_od_status _jks_docker_drain_status
+                exit 1
+            fi
+            unset _jks_docker_encoded
+            unset _jks_docker_od_status _jks_docker_drain_status
+        }
+    )
+)
+
+docker_capture_result() {
+    LC_ALL=C awk -v capture_status="$1" -v consumer="$2" '
+        function valid_status(value) {
+            if (value !~ /^[0-9]+$/ || length(value) > 3) return 0
+            if (length(value) > 1 && substr(value, 1, 1) == "0") return 0
+            return value + 0 <= 255
+        }
+        function hex_value(value, first, second) {
+            value = tolower(value)
+            first = index("0123456789abcdef", substr(value, 1, 1)) - 1
+            second = index("0123456789abcdef", substr(value, 2, 1)) - 1
+            return first * 16 + second
+        }
+        {
+            line = $0
+            if (index(line, "!P") == 1) {
+                producer_records++
+                producer_value = ""
+                if (index(line, "!P\t") == 1) producer_value = substr(line, 4)
+                if (valid_status(producer_value)) {
+                    producer_valid_records++
+                    producer_code = producer_value
+                }
+            }
+            if (state == 0) {
+                if (index(line, "!P\t") == 1 && valid_status(substr(line, 4))) state = 1
+                else grammar_bad = 1
+            } else if (state == 1) {
+                if (line == "!H") state = 2
+                else grammar_bad = 1
+            } else if (state == 2) {
+                if (index(line, "!O\t") == 1) {
+                    od_status = substr(line, 4)
+                    if (valid_status(od_status)) {
+                        od_records++
+                        state = 3
+                    } else grammar_bad = 1
+                } else {
+                    trimmed = line
+                    sub(/^[[:space:]]+/, "", trimmed)
+                    sub(/[[:space:]]+$/, "", trimmed)
+                    if (trimmed == "") {
+                        grammar_bad = 1
+                    } else {
+                        token_count = split(trimmed, tokens, /[[:space:]]+/)
+                        for (i = 1; i <= token_count; i++) {
+                            token = tolower(tokens[i])
+                            if (length(token) != 2 || token !~ /^[[:xdigit:]][[:xdigit:]]$/) {
+                                grammar_bad = 1
+                            } else {
+                                byte_count++
+                                if (byte_count > 65537) grammar_bad = 1
+                                hex_stream = hex_stream token
+                                if (token == "00") nul_seen = 1
+                                if (!first_line_done) {
+                                    if (token == "0a") first_line_done = 1
+                                    else info_line = info_line sprintf("%c", hex_value(token))
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (state == 3) {
+                if (index(line, "!D\t") == 1) {
+                    drain_status = substr(line, 4)
+                    if (valid_status(drain_status)) {
+                        drain_records++
+                        state = 4
+                    } else grammar_bad = 1
+                } else grammar_bad = 1
+            } else if (state == 4) {
+                if (line == "!Z") state = 5
+                else grammar_bad = 1
+            } else grammar_bad = 1
+        }
+        END {
+            producer = "null"
+            complete = 0
+            hello = 0
+            engine_id = ""
+            engine_version = ""
+            if (producer_records == 1 && producer_valid_records == 1) producer = producer_code
+            if (state == 5 && !grammar_bad && producer_records == 1 && producer_valid_records == 1 && od_records == 1 && drain_records == 1 && capture_status == 0 && od_status == 0 && drain_status == 0 && byte_count <= 65536 && !nul_seen) complete = 1
+            if (consumer == "run" && complete) {
+                greeting_hex = "48656c6c6f2066726f6d20446f636b657221"
+                greeting_length = length(greeting_hex)
+                for (hex_offset = 1; hex_offset <= length(hex_stream) - greeting_length + 1; hex_offset += 2) {
+                    if (substr(hex_stream, hex_offset, greeting_length) == greeting_hex) {
+                        hello = 1
+                        break
+                    }
+                }
+            }
+            if (consumer == "info" && complete && producer == "0") {
+                sub(/^[ \t]+/, "", info_line)
+                sub(/[ \t]+$/, "", info_line)
+                if (info_line != "") {
+                    if (match(info_line, /[ \t]+/)) {
+                        engine_id = substr(info_line, 1, RSTART - 1)
+                        engine_version = substr(info_line, RSTART + RLENGTH)
+                    } else {
+                        engine_id = info_line
+                    }
+                }
+            }
+            printf "%s %d %d %s %s\n", producer, complete, hello, engine_id, engine_version
+        }
+    ' 3>&- 2>/dev/null
+}
+
 step_J15() (
     if [ "$docker" != on ]; then
         skip docker_capability "the Docker capability is off (--docker on selects this step)"
@@ -1771,22 +1940,90 @@ EOF
     host=${DOCKER_HOST-}
     tls=${DOCKER_TLS_VERIFY-}
     cert_path=${DOCKER_CERT_PATH-}
+    unset _jks_docker_run_capture _jks_docker_run_capture_status _jks_docker_run_parsed
+    unset _jks_docker_run_parse_status _jks_docker_run_extra _jks_docker_run_producer
+    unset _jks_docker_run_complete _jks_docker_run_hello
+    unset _jks_docker_info_capture _jks_docker_info_capture_status _jks_docker_info_parsed
+    unset _jks_docker_info_parse_status _jks_docker_info_extra _jks_docker_info_producer
+    unset _jks_docker_info_complete _jks_docker_info_hello _jks_docker_engine_id _jks_docker_engine_version
+    unset _jks_docker_run_complete_fact
+    _jks_docker_run_complete_fact=false
     run_exit=
     hello=false
     engine_id=
     engine_version=
     if [ "$found" = true ]; then
-        out=$(timeout 300 docker run --rm "$HELLO_IMAGE" 2>&1 </dev/null)
-        run_exit=$?
-        if printf '%s' "$out" | grep -q 'Hello from Docker!'; then
-            hello=true
+        _jks_docker_run_capture_status=0
+        if _jks_docker_run_capture=$(docker_capture 300 merged docker run --rm "$HELLO_IMAGE"); then
+            :
+        else
+            _jks_docker_run_capture_status=$?
         fi
-        if info=$(timeout 60 docker info --format '{{.ID}} {{.ServerVersion}}' 2>/dev/null </dev/null); then
-            read -r engine_id engine_version <<EOF
-$info
+        _jks_docker_run_parse_status=0
+        _jks_docker_run_parsed=
+        if _jks_docker_run_parsed=$(printf '%s' "$_jks_docker_run_capture" | docker_capture_result "$_jks_docker_run_capture_status" run); then
+            :
+        else
+            _jks_docker_run_parse_status=$?
+        fi
+        _jks_docker_run_extra=
+        _jks_docker_run_producer=null
+        _jks_docker_run_complete=0
+        _jks_docker_run_hello=0
+        if [ "$_jks_docker_run_parse_status" -eq 0 ] && IFS=' ' read -r _jks_docker_run_producer _jks_docker_run_complete _jks_docker_run_hello _jks_docker_run_extra <<EOF
+$_jks_docker_run_parsed
 EOF
+        then
+            case $_jks_docker_run_producer in
+                null) ;;
+                '' | *[!0-9]*) ;;
+                *)
+                    if [ "$_jks_docker_run_producer" -le 255 ]; then
+                        run_exit=$_jks_docker_run_producer
+                    fi
+                    ;;
+            esac
+            if [ "$_jks_docker_run_complete" = 1 ] && [ "$_jks_docker_run_hello" = 1 ]; then
+                hello=true
+            fi
+            if [ "$_jks_docker_run_complete" = 1 ]; then
+                _jks_docker_run_complete_fact=true
+            fi
+        fi
+        _jks_docker_info_capture_status=0
+        if _jks_docker_info_capture=$(docker_capture 60 stdout docker info --format '{{.ID}} {{.ServerVersion}}'); then
+            :
+        else
+            _jks_docker_info_capture_status=$?
+        fi
+        _jks_docker_info_parse_status=0
+        _jks_docker_info_parsed=
+        if _jks_docker_info_parsed=$(printf '%s' "$_jks_docker_info_capture" | docker_capture_result "$_jks_docker_info_capture_status" info); then
+            :
+        else
+            _jks_docker_info_parse_status=$?
+        fi
+        _jks_docker_info_producer=null
+        _jks_docker_info_complete=0
+        _jks_docker_info_hello=0
+        _jks_docker_engine_id=
+        _jks_docker_engine_version=
+        if [ "$_jks_docker_info_parse_status" -eq 0 ] && IFS=' ' read -r _jks_docker_info_producer _jks_docker_info_complete _jks_docker_info_hello _jks_docker_engine_id _jks_docker_engine_version <<EOF
+$_jks_docker_info_parsed
+EOF
+        then
+            if [ "$_jks_docker_info_complete" = 1 ] && [ "$_jks_docker_info_producer" = 0 ]; then
+                engine_id=$_jks_docker_engine_id
+                engine_version=$_jks_docker_engine_version
+            fi
         fi
     fi
+    unset _jks_docker_run_capture _jks_docker_run_capture_status _jks_docker_run_parsed
+    unset _jks_docker_run_parse_status _jks_docker_run_extra _jks_docker_run_producer
+    unset _jks_docker_run_complete _jks_docker_run_hello
+    unset _jks_docker_info_capture _jks_docker_info_capture_status _jks_docker_info_parsed
+    unset _jks_docker_info_parse_status _jks_docker_info_extra _jks_docker_info_producer
+    unset _jks_docker_info_complete _jks_docker_info_hello _jks_docker_engine_id _jks_docker_engine_version
     if [ "$found" = true ]; then
         pass docker_binary "$docker_path"
     else
@@ -1807,16 +2044,21 @@ EOF
     else
         fail certificates "problem:$cert_problem"
     fi
-    if [ "$hello" = true ] && [ "$run_exit" = 0 ]; then
+    if [ "$_jks_docker_run_complete_fact" != true ]; then
+        fail hello_world "docker run --rm $HELLO_IMAGE output capture incomplete"
+    elif [ "$hello" = true ] && [ "$run_exit" = 0 ]; then
         pass hello_world "docker run --rm $HELLO_IMAGE printed the hello text"
-    else
+    elif [ "$hello" = true ]; then
         fail hello_world "docker run --rm $HELLO_IMAGE exit ${run_exit:-none}"
+    else
+        fail hello_world "docker run --rm $HELLO_IMAGE did not print the hello text (exit ${run_exit:-none})"
     fi
     if [ -n "$engine_id" ]; then
         pass engine "$engine_id"
     else
         fail engine "docker info gave no engine id"
     fi
+    unset _jks_docker_run_complete_fact
     jq -n --argjson found "$found" --arg path "$docker_path" --arg host "$host" --arg tls "$tls" --arg cert_path "$cert_path" \
         --slurpfile certs "$work/certs.ndjson" --arg run_exit "$run_exit" --argjson hello "$hello" \
         --arg engine_id "$engine_id" --arg engine_version "$engine_version" \
