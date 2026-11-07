@@ -11,7 +11,7 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh jq sed tr cat env awk grep mktemp rm wc head od; do
+for tool in sh jq sed tr cat env awk grep mktemp rm wc head od mkdir cp; do
     found=$(command -v "$tool") || {
         echo "FAIL setup: $tool is not installed"
         exit 70
@@ -72,10 +72,24 @@ chmod +x "$scratch/stub-curl"
 mk() {
     t=$scratch/$1
     rm -rf "$t"
-    mkdir -p "$t/bin" "$t/home" "$t/sandbox" "$t/tmp"
+    mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox" "$t/tmp"
     : >"$t/table"
     : >"$t/curl.log"
-    pathvar=$t/bin:$scratch/tools
+    pathvar=$t/bad-bin:$t/bin:$scratch/tools
+}
+
+prepare_probe() {
+    fixture_path=$t/bin:$scratch/tools
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/bin/codex#" "$probe" >"$t/probe"
+    if grep -q '^SANDBOX_PATH=' "$t/probe"; then
+        sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe" >"$t/probe.next" || return 1
+        mv "$t/probe.next" "$t/probe" || return 1
+        grep -Fq "SANDBOX_PATH=$fixture_path" "$t/probe" || return 1
+        if grep -Fq 'SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin' "$t/probe"; then
+            return 1
+        fi
+    fi
+    chmod +x "$t/probe"
 }
 
 codex_says() {
@@ -263,7 +277,11 @@ execute() {
     step=$1
     engine=${2-}
     shift 2
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/bin/codex#" "$probe" >"$t/probe"
+    fixture_setup_failed=0
+    prepare_probe || {
+        fixture_setup_failed=1
+        return 70
+    }
     set -- "$@" sh "$t/probe" --only "${step#step_}"
     [ -z "$engine" ] || set -- "$@" --engine "$engine"
     bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
@@ -279,7 +297,11 @@ begin() {
     shift
     problems=
     if ! execute "$@"; then
-        problems=" the probe did not finish in time or failed"
+        if [ "$fixture_setup_failed" -eq 1 ]; then
+            problems=" setup failure: sandbox path fixture substitution failed"
+        else
+            problems=" the probe did not finish in time or failed"
+        fi
     elif ! jq -e --arg step "${1#step_}" '.schema == 2 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
         problems=" report-shape"
     fi
@@ -845,6 +867,27 @@ mk j16_curl_missing
 begin j16_curl_missing step_J16 "$ENGINE"
 expect engine_denied FAIL 'curl is not installed'
 fact '.connection | "\(.attempted) \(.curl_found) \(.curl_exit) \(.http_code)"' 'true false null 0'
+finish_case
+
+mk j16_inherited_curl_cannot_fill_missing_trusted_curl
+printf '#!/bin/sh\necho selected >>"%s/curl.selected"\nprintf 200\nexit 0\n' "$t" >"$t/bad-bin/curl"
+chmod +x "$t/bad-bin/curl"
+begin j16_inherited_curl_cannot_fill_missing_trusted_curl step_J16 "$ENGINE"
+expect engine_denied FAIL 'curl is not installed'
+fact '.connection | "\(.attempted) \(.curl_found) \(.curl_exit) \(.http_code)"' 'true false null 0'
+[ ! -e "$t/curl.selected" ] || problems="$problems inherited-curl-selected"
+finish_case
+
+mk j16_curl_shadow_uses_curated_boundary_fixture
+with_curl
+answer "$PING" 7 000
+answer "$OUTSIDE" 7 000
+printf '#!/bin/sh\necho selected >>"%s/curl.selected"\nexit 91\n' "$t" >"$t/bad-bin/curl"
+chmod +x "$t/bad-bin/curl"
+begin j16_curl_shadow_uses_curated_boundary_fixture step_J16 "$ENGINE"
+expect engine_denied PASS 'refused the connection (curl exit 7'
+fact '.connection | "\(.attempted) \(.curl_found) \(.curl_exit) \(.http_code)"' 'true true 7 0'
+[ ! -e "$t/curl.selected" ] || problems="$problems inherited-curl-selected"
 finish_case
 
 mk j16_engine_answers

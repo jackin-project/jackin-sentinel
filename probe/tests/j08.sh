@@ -10,6 +10,17 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 
+mkdir -p "$scratch/tools" "$scratch/shim"
+for tool in awk basename cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
+    found=$(command -v "$tool") || {
+        echo "FAIL setup: $tool is not installed"
+        exit 70
+    }
+    ln -s "$found" "$scratch/tools/$tool"
+done
+real_id=$(command -v id) || exit 70
+real_uname=$(command -v uname) || exit 70
+
 R_OK1='jackin-env-kinds 1\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_KEY placeholder\ncodex GITHUB_TOKEN empty\ncodex OPENAI_API_KEY placeholder\n'
 R_W0='jackin-env-kinds 1\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
 R_EMPTY='jackin-env-kinds 1\nattempt 0\nmain GITHUB_TOKEN empty\n'
@@ -20,7 +31,21 @@ R_OTHER_CODEX='jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\nc
 mk() {
     t=$scratch/$1
     rm -rf "$t"
-    mkdir -p "$t/sandbox/.jackin/run" "$t/sandbox/project" "$t/proc/sys/kernel/random" "$t/tmp"
+    mkdir -p "$t/bin" "$t/bad-bin" "$t/sandbox/.jackin/run" "$t/sandbox/project" "$t/proc/sys/kernel/random" "$t/tmp"
+}
+
+prepare_probe() {
+    fixture_path=${1:-$t/bin:$scratch/shim:$scratch/tools}
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" "$probe" >"$t/probe"
+    if grep -q '^SANDBOX_PATH=' "$t/probe"; then
+        sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe" >"$t/probe.next" || return 1
+        mv "$t/probe.next" "$t/probe" || return 1
+        grep -Fq "SANDBOX_PATH=$fixture_path" "$t/probe" || return 1
+        if grep -Fq 'SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin' "$t/probe"; then
+            return 1
+        fi
+    fi
+    chmod +x "$t/probe"
 }
 
 state() {
@@ -124,9 +149,6 @@ bounded() {
     wait "$pid"
 }
 
-mkdir "$scratch/shim"
-real_id=$(command -v id) || exit 70
-command -v python3 >/dev/null 2>&1 || exit 70
 printf '#!/bin/sh\necho Linux\n' >"$scratch/shim/uname"
 printf '#!/bin/sh\n[ "$*" = -un ] && echo sandbox && exit 0\nexec %s "$@"\n' "$real_id" >"$scratch/shim/id"
 cat >"$scratch/shim/dd" <<'EOF'
@@ -167,11 +189,15 @@ begin() {
     name=$1
     shift
     problems=
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" "$probe" >"$t/probe"
+    prepare_probe || {
+        failures=$((failures + 1))
+        echo "FAIL setup $name: the sandbox path fixture was not safely substituted"
+        return
+    }
     if [ -f "$t/seams.sed" ]; then
         sed -f "$t/seams.sed" "$t/probe" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe"
     fi
-    bounded 20 env -i PATH="$scratch/shim:$PATH" TMPDIR="$t/tmp" "$@"
+    bounded 20 env -i PATH="$t/bin:$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$@"
     rc=$?
     cp "$scratch/bounded.out" "$t/out"
     cp "$scratch/bounded.err" "$t/err"
@@ -320,7 +346,7 @@ environ 100 'OPENAI_API_KEY=sk-FAKE-REAL-SECRET-0123456789abcdef'
 environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record "$R_OTHER_MAIN"
 cat_fail_for_proc "$t/proc/100/environ" 12
-begin main_environ_partial_read_falls_back_to_the_other_start_record env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin main_environ_partial_read_falls_back_to_the_other_start_record env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'P73_FAKE_API_KEY'
@@ -337,7 +363,7 @@ environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 101 'GITHUB_TOKEN=sk-FAKE-CODEX-SECRET-0123456789abcdef'
 record "$R_OTHER_CODEX"
 cat_fail_for_proc "$t/proc/101/environ" 0
-begin codex_environ_failed_read_falls_back_to_the_other_start_record env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_environ_failed_read_falls_back_to_the_other_start_record env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'STRIPE_SECRET'
@@ -354,7 +380,7 @@ environ 100 'OPENAI_API_KEY=sk-FAKE-REAL-SECRET-0123456789abcdef'
 environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record "$R_OK1"
 cat_fail_for_proc "$t/proc/100/environ" 12
-begin main_environ_failed_read_uses_a_clean_start_record env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin main_environ_failed_read_uses_a_clean_start_record env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment PASS 'via record'
@@ -367,7 +393,7 @@ state waiting
 proc_main
 environ 100 'OPENAI_API_KEY=sk-FAKE-REAL-SECRET-0123456789abcdef'
 cat_fail_for_proc "$t/proc/100/environ" 0
-begin main_environ_failed_read_without_a_fresh_record_remains_unknown env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin main_environ_failed_read_without_a_fresh_record_remains_unknown env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment SKIP 'never clean'
@@ -1078,7 +1104,7 @@ environ 101 'STRIPE_SECRET=sk-FAKE-FIRST-CHILD-SECRET-0123456789'
 environ 102 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record "$R_OK1"
 cat_fail_for_proc "$t/proc/102/environ" 0
-begin codex_environments_preserve_first_child_evidence_when_second_read_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_environments_preserve_first_child_evidence_when_second_read_fails env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'not a placeholder'
@@ -1101,7 +1127,7 @@ environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 102 'STRIPE_SECRET=sk-FAKE-SECOND-CHILD-SECRET-0123456789'
 record "$R_OK1"
 cat_fail_for_proc "$t/proc/101/environ" 0
-begin codex_environments_preserve_second_child_evidence_when_first_read_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_environments_preserve_second_child_evidence_when_first_read_fails env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'not a placeholder'
@@ -1124,7 +1150,7 @@ environ 101 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 environ 102 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET other\n'
 cat_fail_for_proc "$t/proc/102/environ" 0
-begin codex_same_name_live_placeholder_keeps_fresh_record_other env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_same_name_live_placeholder_keeps_fresh_record_other env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'not a placeholder'
@@ -1147,7 +1173,7 @@ environ 101 'STRIPE_SECRET=sk-FAKE-SAME-NAME-OTHER-0123456789'
 environ 102 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET placeholder\n'
 cat_fail_for_proc "$t/proc/102/environ" 0
-begin codex_same_name_live_other_keeps_fresh_record_placeholder env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_same_name_live_other_keeps_fresh_record_placeholder env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'not a placeholder'
@@ -1171,7 +1197,7 @@ environ 101 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 environ 102 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET placeholder\n'
 cat_fail_for_proc "$t/proc/102/environ" 0
-begin codex_same_name_placeholder_observations_keep_child_multiplicity env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_same_name_placeholder_observations_keep_child_multiplicity env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL '2 Codex processes'
@@ -1204,7 +1230,7 @@ environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 101 'STRIPE_SECRET=sk-FAKE-FILTER-SECRET-0123456789'
 record "$R_OK1"
 jq_fail_for_codex_filter
-begin codex_filter_failure_uses_fresh_clean_record_without_claiming_live_read env SENTINEL_REAL_JQ="$real_jq" PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_filter_failure_uses_fresh_clean_record_without_claiming_live_read env SENTINEL_REAL_JQ="$real_jq" PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment PASS 'via record'
@@ -1220,7 +1246,7 @@ environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 101 'STRIPE_SECRET=sk-FAKE-FILTER-OTHER-SECRET-0123456789'
 record "$R_OTHER_CODEX"
 jq_fail_for_codex_filter
-begin codex_filter_failure_keeps_fresh_other_record_evidence env SENTINEL_REAL_JQ="$real_jq" PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin codex_filter_failure_keeps_fresh_other_record_evidence env SENTINEL_REAL_JQ="$real_jq" PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'STRIPE_SECRET'
@@ -1237,7 +1263,7 @@ sudo_shim() {
 
 mk j04_a_passwordless_grant_other_than_true_fails_the_sudo_check
 sudo_shim 1 0
-begin j04_a_passwordless_grant_other_than_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J04
+begin j04_a_passwordless_grant_other_than_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
 expect_rc 0
 expect_report J04 sandbox
 expect sudo FAIL 'sudo works'
@@ -1246,7 +1272,7 @@ finish_case
 
 mk j04_a_passwordless_true_fails_the_sudo_check
 sudo_shim 0 1
-begin j04_a_passwordless_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J04
+begin j04_a_passwordless_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
 expect_rc 0
 expect_report J04 sandbox
 expect sudo FAIL 'sudo works'
@@ -1255,7 +1281,7 @@ finish_case
 
 mk j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check
 sudo_shim 1 1
-begin j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J04
+begin j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
 expect_rc 0
 expect_report J04 sandbox
 expect sudo PASS 'found=true works=false'
@@ -1300,7 +1326,7 @@ if [ "$(id -u)" -ne 0 ]; then
     mk j06_a_hook_tree_without_a_writable_ancestor_is_immutable
     hook_tree
     chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
-    mkdir "$t/bin"
+    mkdir -p "$t/bin"
     real_stat=$(command -v stat)
     cat >"$t/bin/stat" <<EOF
 #!/bin/sh
@@ -1311,7 +1337,7 @@ case \$last in
 esac
 EOF
     chmod +x "$t/bin/stat"
-    begin j06_a_hook_tree_without_a_writable_ancestor_is_immutable env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J06
+    begin j06_a_hook_tree_without_a_writable_ancestor_is_immutable env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J06
     chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
     expect_rc 0
     expect_report J06 sandbox
@@ -1334,7 +1360,7 @@ if [ "$(id -u)" -ne 0 ]; then
     chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
     seam HOOK_DIR "$t/hookroot/lib/hooks"
     seam HOOK_TOP "$t/hookroot"
-    mkdir "$t/bin"
+    mkdir -p "$t/bin"
     real_stat=$(command -v stat)
     cat >"$t/bin/stat" <<EOF
 #!/bin/sh
@@ -1346,7 +1372,7 @@ case \$last in
 esac
 EOF
     chmod +x "$t/bin/stat"
-    begin j06_a_root_owned_hook_symlink_to_a_writable_physical_ancestor_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J06
+    begin j06_a_root_owned_hook_symlink_to_a_writable_physical_ancestor_fails env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J06
     chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
     expect_rc 0
     expect_report J06 sandbox
@@ -1390,6 +1416,8 @@ expect sandbox SKIP 'not running in a sandbox'
 finish_case
 
 mk outside_a_sandbox_the_probe_refuses
+ln -s "$real_uname" "$t/bin/uname" || exit 70
+ln -s "$real_id" "$t/bin/id" || exit 70
 begin outside_a_sandbox_the_probe_refuses env PATH="$PATH" sh "$t/probe" --only J08
 case $(uname -s)-$(id -un) in
     Linux-sandbox) ;;
@@ -1486,10 +1514,10 @@ finish_case
 mk file_scan_skips_when_the_jwt_classifier_fails
 state waiting
 record "$R_W0"
-mkdir "$t/bin"
+mkdir -p "$t/bin"
 exit_shim jq '*base64d*' 5
 printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$JWT_NO_SUB" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
-begin file_scan_skips_when_the_jwt_classifier_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin file_scan_skips_when_the_jwt_classifier_fails env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect file_scan SKIP 'not scanned'
@@ -1565,10 +1593,10 @@ finish_case
 mk file_scan_skips_when_grep_fails
 state waiting
 record "$R_W0"
-mkdir "$t/bin"
+mkdir -p "$t/bin"
 exit_shim grep '*bad.dat' 2
 printf 'plain\n' >"$t/sandbox/bad.dat"
-begin file_scan_skips_when_grep_fails env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin file_scan_skips_when_grep_fails env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect file_scan SKIP 'bad.dat'
@@ -1577,11 +1605,11 @@ finish_case
 mk file_scan_flags_a_token_next_to_a_failed_grep
 state waiting
 record "$R_W0"
-mkdir "$t/bin"
+mkdir -p "$t/bin"
 exit_shim grep '*bad.dat' 2
 printf 'plain\n' >"$t/sandbox/bad.dat"
 printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/secret.txt"
-begin file_scan_flags_a_token_next_to_a_failed_grep env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin file_scan_flags_a_token_next_to_a_failed_grep env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect file_scan FAIL 'secret.txt'
@@ -1590,12 +1618,12 @@ finish_case
 mk file_scan_skip_keeps_its_reason_before_a_long_path
 state waiting
 record "$R_W0"
-mkdir "$t/bin"
+mkdir -p "$t/bin"
 exit_shim grep '*bad.dat' 2
 long=$(printf 'd%.0s' $(seq 1 120))
 mkdir -p "$t/sandbox/$long/$long"
 printf 'plain\n' >"$t/sandbox/$long/$long/bad.dat"
-begin file_scan_skip_keeps_its_reason_before_a_long_path env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin file_scan_skip_keeps_its_reason_before_a_long_path env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect file_scan SKIP '(grep failed)'
@@ -1604,10 +1632,10 @@ finish_case
 mk file_scan_skips_when_grep_times_out
 state waiting
 record "$R_W0"
-mkdir "$t/bin"
+mkdir -p "$t/bin"
 exit_shim timeout '*slow.dat' 124
 printf 'plain\n' >"$t/sandbox/slow.dat"
-begin file_scan_skips_when_grep_times_out env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J08
+begin file_scan_skips_when_grep_times_out env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect file_scan SKIP 'slow.dat (grep timed out)'
@@ -1647,11 +1675,11 @@ git_project() {
 }
 
 git_fixture() {
-    env -i PATH="$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+    env -i PATH="$scratch/tools:$scratch/shim" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
 }
 
 git_global_fixture() {
-    env -i PATH="$PATH" HOME="$t/home" GIT_CONFIG_NOSYSTEM=1 git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
+    env -i PATH="$scratch/tools:$scratch/shim" HOME="$t/home" GIT_CONFIG_NOSYSTEM=1 git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"
 }
 
 git_public_state() {
@@ -2305,7 +2333,7 @@ mk j05_a_file_that_cannot_be_hashed_fails_the_files_check
 if git_project; then
     printf a >"$t/sandbox/project/plain.txt"
     printf u >"$t/sandbox/project/unreadable.txt"
-    mkdir "$t/bin"
+    mkdir -p "$t/bin"
     real_sum=$(command -v sha256sum)
     cat >"$t/bin/sha256sum" <<EOF
 #!/bin/sh
@@ -2327,7 +2355,7 @@ $real_sum "\$@"
 [ \$rc -eq 0 ] || exit 1
 EOF
     chmod +x "$t/bin/sha256sum"
-    begin j05_a_file_that_cannot_be_hashed_fails_the_files_check env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J05
+    begin j05_a_file_that_cannot_be_hashed_fails_the_files_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J05
     expect_rc 0
     expect_report J05 sandbox
     expect files FAIL 'unreadable.txt: Permission denied'
@@ -2337,7 +2365,7 @@ else
 fi
 
 mk j15_runs_the_hello_world_image_by_digest
-mkdir "$t/bin"
+mkdir -p "$t/bin"
 cat >"$t/bin/docker" <<'EOF'
 #!/bin/sh
 case "$*" in
@@ -2346,7 +2374,7 @@ case "$*" in
 esac
 EOF
 chmod +x "$t/bin/docker"
-begin j15_runs_the_hello_world_image_by_digest env PATH="$t/bin:$scratch/shim:$PATH" sh "$t/probe" --only J15 --docker on
+begin j15_runs_the_hello_world_image_by_digest env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J15 --docker on
 expect_rc 0
 expect_report J15 sandbox
 expect hello_world PASS '@sha256:'
@@ -2589,6 +2617,88 @@ ln -s "$t/missing-target" "$t/sandbox/.codex/auth.json"
 report auth_file_fails_when_auth_json_is_a_dangling_symlink
 expect auth_file FAIL 'not a regular file'
 finish_case
+
+shadow_case() {
+    name=$1
+    tool=$2
+    shift 2
+    problems=
+    mk "$name"
+    state 'exited 1 0'
+    record "$R_OK1"
+    printf '#!/bin/sh\necho selected >>"%s"\nexit 91\n' "$t/$tool.selected" >"$t/bad-bin/$tool"
+    chmod +x "$t/bad-bin/$tool"
+    total=$((total + 1))
+    prepare_probe || exit 70
+    bounded 20 env -i PATH="$t/bad-bin:$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$t/probe" "$@"
+    rc=$?
+    cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
+    [ "$rc" -eq 0 ] || problems=" rc=$rc"
+    jq -e '.schema == 2 and .mode == "sandbox" and (.steps | keys) == ["J08"] and ([.steps.J08.checks[] | select(.name == "environment")] | length) == 1 and ([.steps.J08.checks[] | select(.name == "environment")][0].result == "PASS") and .steps.J08.facts.start_record.state == "read"' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-result"
+    [ ! -e "$t/$tool.selected" ] || problems="$problems inherited-$tool-selected"
+    finish_case
+}
+
+shadow_case direct_sh_shadow sh --only J08
+shadow_case sandbox_jq_shadow jq --only J08
+shadow_case sandbox_tr_shadow tr --only J08
+
+mk sandbox_path_positive_control
+name=sandbox_path_positive_control
+state 'exited 1 0'
+record "$R_OK1"
+total=$((total + 1))
+problems=
+prepare_probe || exit 70
+bounded 20 env -i PATH="$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$t/probe" --only J08
+rc=$?
+cp "$scratch/bounded.out" "$t/out"
+cp "$scratch/bounded.err" "$t/err"
+[ "$rc" -eq 0 ] || problems=" rc=$rc"
+jq -e '.schema == 2 and .mode == "sandbox" and (.steps | keys) == ["J08"] and ([.steps.J08.checks[] | select(.name == "environment")] | length) == 1 and ([.steps.J08.checks[] | select(.name == "environment")][0].result == "PASS") and .steps.J08.facts.start_record.state == "read"' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-result"
+finish_case
+
+mk host_tools_outside_sandbox_path
+name=host_tools_outside_sandbox_path
+mkdir -p "$t/host-tools"
+for tool in jq sh tr mktemp rm cat; do
+    ln -s "$scratch/tools/$tool" "$t/host-tools/$tool"
+done
+total=$((total + 1))
+problems=
+prepare_probe "$t/absent-sandbox-tools" || exit 70
+[ ! -e "$t/absent-sandbox-tools" ] || {
+    echo "FAIL setup: absent sandbox PATH fixture exists"
+    exit 70
+}
+bounded 20 env -i PATH="$t/host-tools" TMPDIR="$t/tmp" "$t/probe" --host --only J08
+rc=$?
+cp "$scratch/bounded.out" "$t/out"
+cp "$scratch/bounded.err" "$t/err"
+[ "$rc" -eq 0 ] || problems=" rc=$rc"
+jq -e '.schema == 2 and .mode == "host" and .steps.J08.result == "SKIP" and .steps.J08.facts == null and ([.steps.J08.checks[].result] | all(. == "SKIP"))' "$t/out" >/dev/null 2>&1 || problems="$problems host-skip-null-boundary"
+finish_case
+
+mk sandbox_git_shadow
+name=sandbox_git_shadow
+if git_project; then
+    printf '#!/bin/sh\necho selected >>"%s/git.selected"\nexit 91\n' "$t" >"$t/bad-bin/git"
+    chmod +x "$t/bad-bin/git"
+    total=$((total + 1))
+    problems=
+    prepare_probe || exit 70
+    bounded 20 env -i PATH="$t/bad-bin:$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$t/probe" --only J13
+    rc=$?
+    cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
+    [ "$rc" -eq 0 ] || problems=" rc=$rc"
+    jq -e '.schema == 2 and .mode == "sandbox" and .steps.J13.result == "PASS" and .steps.J13.facts.work_tree == true and .steps.J13.facts.clean == true' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-git-facts"
+    [ ! -e "$t/git.selected" ] || problems="$problems inherited-git-selected"
+    finish_case
+else
+    setup_failed sandbox_git_shadow
+fi
 
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

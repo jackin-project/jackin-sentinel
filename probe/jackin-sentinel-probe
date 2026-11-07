@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+#!/bin/sh
 
 # SPDX-FileCopyrightText: 2026 Alexey Zhokhov
 # SPDX-License-Identifier: Apache-2.0
@@ -7,6 +7,7 @@ set -u
 
 PROBE=jackin-sentinel-probe
 VERSION=1
+SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin
 PROJECT=/sandbox/project
 STATE_DIR=/sandbox/.sentinel
 JACKIN_DIR=/sandbox/.jackin
@@ -1907,6 +1908,10 @@ main() {
         esac
         shift
     done
+    if [ "$mode" = sandbox ]; then
+        PATH=$SANDBOX_PATH
+        export PATH
+    fi
     if [ -n "$only" ]; then
         case $only in
             *[!A-Za-z0-9,]*) usage ;;
