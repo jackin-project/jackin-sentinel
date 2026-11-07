@@ -108,25 +108,53 @@ codex_streams() {
 import sys
 
 cases = {
-    "below_cap": (6, 0, b"ReAdY\n"),
-    "exact_cap": (65536, 257, b"ready"),
-    "cap_plus_one_before": (65537, 0, b"ready"),
     "ready_after_cap": (65541, 65536, b"ready"),
     "large": (4194304, 257, b"ready"),
-    "nul_inside": (6, 0, b"r\0eady"),
-    "nul_around": (7, 0, b"\0ready\0"),
-    "nonzero": (5, 0, b"ready"),
+}
+payloads = {
+    "below_cap": b"ready\n",
+    "exact_cap": b"",
+    "cap_plus_one_before": b"",
+    "exact": b"ready",
+    "space": b" ready ",
+    "tab": b"\tready\t",
+    "lf": b"\nready\n",
+    "cr": b"\rready\r",
+    "vt": b"\vready\v",
+    "ff": b"\fready\f",
+    "prompt_echo": b"Reply with the word ready",
+    "already": b"already",
+    "status": b"status: ready",
+    "second_before": b"ready now",
+    "second_after": b"now ready",
+    "uppercase": b"READY",
+    "mixed_case": b"ReAdY",
+    "empty": b"",
+    "whitespace_only": b" \t\n\r\v\f",
+    "nul_before": b"\0ready",
+    "nul_inside": b"r\0eady",
+    "nul_after": b"ready\0",
+    "nul_around": b"\0ready\0",
+    "non_ascii": b"ready\xc3\xa9",
+    "nonzero": b"ready",
 }
 kind = sys.argv[1]
-length, position, marker = cases[kind]
-assert 0 <= position <= length - len(marker)
-chunk_size = 4096
-pattern = b"OUT-RAW-SECRET-MARKER-"
-written = 0
-if kind in ("nul_inside", "nul_around"):
-    sys.stdout.buffer.write(marker)
-    written = len(marker)
+if kind in payloads:
+    payload = payloads[kind]
+    if kind == "exact_cap":
+        payload = b" " * 32765 + b"ready" + b" " * 32766
+        assert len(payload) == 65536 and payload[32765:32770] == b"ready"
+    elif kind == "cap_plus_one_before":
+        payload = b" " * 32766 + b"ready" + b" " * 32766
+        assert len(payload) == 65537 and payload[32766:32771] == b"ready"
+    sys.stdout.buffer.write(payload)
+    written = len(payload)
 else:
+    length, position, marker = cases[kind]
+    assert 0 <= position <= length - len(marker)
+    chunk_size = 4096
+    pattern = b"OUT-RAW-SECRET-MARKER-"
+    written = 0
     while written < length:
         size = min(chunk_size, length - written)
         chunk = (pattern * ((size + len(pattern) - 1) // len(pattern)))[:size]
@@ -142,23 +170,11 @@ else:
             chunk = chunk[:left] + marker[marker_left:marker_right] + chunk[right:]
         sys.stdout.buffer.write(chunk)
         written += size
-assert written == length
-if kind == "below_cap":
-    assert length == 6 and position == 0
-elif kind == "exact_cap":
-    assert length == 65536 and position == 257
-elif kind == "cap_plus_one_before":
-    assert length == 65537 and position == 0
-elif kind == "ready_after_cap":
-    assert length == 65541 and position == 65536
-elif kind == "large":
-    assert length == 4194304 and position == 257
-elif kind == "nul_inside":
-    assert length == 6
-elif kind == "nul_around":
-    assert length == 7
-elif kind == "nonzero":
-    assert length == 5 and position == 0
+    assert written == length
+    if kind == "ready_after_cap":
+        assert length == 65541 and position == 65536
+    elif kind == "large":
+        assert length == 4194304 and position == 257
 raise SystemExit(int(sys.argv[2]))
 PY
     python_arg=$(shell_quote "$python_bin")
@@ -589,6 +605,35 @@ finish_case
 for selected_step in J07 J09; do
     setup_codex_stream_case "$selected_step" below_cap
     codex_stream_case "$selected_step" below_cap PASS 0 6
+    setup_codex_stream_case "$selected_step" exact
+    codex_stream_case "$selected_step" exact PASS 0 5
+    for fixture_kind in space tab lf cr vt ff; do
+        setup_codex_stream_case "$selected_step" "$fixture_kind"
+        codex_stream_case "$selected_step" "$fixture_kind" PASS 0 7
+    done
+    for fixture_kind in prompt_echo already status second_before second_after uppercase mixed_case; do
+        case "$fixture_kind" in
+            prompt_echo) expected_bytes=25 ;;
+            already) expected_bytes=7 ;;
+            status) expected_bytes=13 ;;
+            second_before | second_after) expected_bytes=9 ;;
+            uppercase | mixed_case) expected_bytes=5 ;;
+        esac
+        setup_codex_stream_case "$selected_step" "$fixture_kind"
+        codex_stream_case "$selected_step" "$fixture_kind" FAIL 0 "$expected_bytes"
+    done
+    setup_codex_stream_case "$selected_step" empty
+    codex_stream_case "$selected_step" empty FAIL 0 0
+    setup_codex_stream_case "$selected_step" whitespace_only
+    codex_stream_case "$selected_step" whitespace_only FAIL 0 6
+    for fixture_kind in nul_before nul_inside nul_after; do
+        setup_codex_stream_case "$selected_step" "$fixture_kind"
+        codex_stream_case "$selected_step" "$fixture_kind" FAIL 0 6
+    done
+    setup_codex_stream_case "$selected_step" nul_around
+    codex_stream_case "$selected_step" nul_around FAIL 0 7
+    setup_codex_stream_case "$selected_step" non_ascii
+    codex_stream_case "$selected_step" non_ascii FAIL 0 7
     setup_codex_stream_case "$selected_step" exact_cap
     codex_stream_case "$selected_step" exact_cap PASS 0 65536
     setup_codex_stream_case "$selected_step" cap_plus_one_before
@@ -597,10 +642,6 @@ for selected_step in J07 J09; do
     codex_stream_case "$selected_step" ready_after_cap FAIL 0 65537
     setup_codex_stream_case "$selected_step" large
     codex_stream_case "$selected_step" large FAIL 0 65537
-    setup_codex_stream_case "$selected_step" nul_inside
-    codex_stream_case "$selected_step" nul_inside FAIL 0 6
-    setup_codex_stream_case "$selected_step" nul_around
-    codex_stream_case "$selected_step" nul_around PASS 0 7
     setup_codex_stream_case "$selected_step" nonzero 23
     codex_stream_case "$selected_step" nonzero FAIL 23 5
 done

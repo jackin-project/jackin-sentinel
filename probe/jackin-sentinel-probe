@@ -608,16 +608,28 @@ EOF
                 if (!valid_status(value)) return ""
                 return value
             }
-            function ready_letter(value) {
-                value = tolower(value)
-                if (value == "72" || value == "52") return "r"
-                if (value == "65" || value == "45") return "e"
-                if (value == "61" || value == "41") return "a"
-                if (value == "64" || value == "44") return "d"
-                if (value == "79" || value == "59") return "y"
-                return "?"
+            function response_space(value) {
+                return value == "20" || value == "09" || value == "0a" || value == "0d" || value == "0b" || value == "0c"
             }
-            function parse_hex_line(line, trimmed, token_count, tokens, i, letter) {
+            function response_byte(value) {
+                if (response_bad) return
+                if (response_state == 0) {
+                    if (response_space(value)) return
+                    if (value == "72") response_state = 1
+                    else response_bad = 1
+                    return
+                }
+                if (response_state == 1 && value == "65") response_state = 2
+                else if (response_state == 2 && value == "61") response_state = 3
+                else if (response_state == 3 && value == "64") response_state = 4
+                else if (response_state == 4 && value == "79") {
+                    response_state = 5
+                    ready_found = 1
+                } else if (response_state == 5 && response_space(value)) response_state = 6
+                else if (response_state == 6 && response_space(value)) return
+                else response_bad = 1
+            }
+            function parse_hex_line(line, trimmed, token_count, tokens, i) {
                 trimmed = line
                 sub(/^[[:space:]]+/, "", trimmed)
                 sub(/[[:space:]]+$/, "", trimmed)
@@ -630,9 +642,7 @@ EOF
                     }
                     byte_count++
                     if (byte_count > 65537) grammar_bad = 1
-                    letter = ready_letter(tokens[i])
-                    history = substr(history, length(history) > 4 ? length(history) - 3 : 1) letter
-                    if (history == "ready") ready_found = 1
+                    response_byte(tolower(tokens[i]))
                 }
                 return 1
             }
@@ -709,7 +719,7 @@ EOF
                 } else {
                     for (i = 1; i <= NR; i++) parse_success_record(records[i])
                     if (state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1) output_bytes = byte_count
-                    if (capture_status == 0 && state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1 && producer_code == 0 && od_status == 0 && drain_status == 0 && byte_count <= 65536 && ready_found) answer = 1
+                    if (capture_status == 0 && state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1 && producer_code == 0 && od_status == 0 && drain_status == 0 && byte_count <= 65536 && ready_found && !response_bad && (response_state == 5 || response_state == 6)) answer = 1
                 }
                 printf "%s %d %d\n", producer_code, output_bytes, answer
             }
