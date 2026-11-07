@@ -160,7 +160,7 @@ begin() {
     problems=
     if ! execute "$@"; then
         problems=" the probe did not finish in time or failed"
-    elif ! jq -e --arg step "${1#step_}" '.schema == 1 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
+    elif ! jq -e --arg step "${1#step_}" '.schema == 2 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
         problems=" report-shape"
     fi
 }

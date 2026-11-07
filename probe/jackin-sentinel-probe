@@ -275,11 +275,10 @@ $stat_line
 EOF
     comm=$(proc_comm "$pid") || return 1
     tty=$(tty_name "$ttynr") || tty=
-    args=$(proc_args "$pid") || args=
     jq -cn \
         --argjson pid "$pid" --argjson ppid "$ppid" --argjson sid "$sid" --argjson ticks "$ticks" \
-        --arg comm "$comm" --arg args "$args" --arg tty "$tty" \
-        "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, comm: $comm, args: $args, start_ticks: $ticks, tty: ($tty | n)}'
+        --arg comm "$comm" --arg tty "$tty" \
+        "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, comm: $comm, start_ticks: $ticks, tty: ($tty | n)}'
 }
 
 read_run_state() {
@@ -1627,7 +1626,7 @@ main() {
         finish "$id"
     done
     cat "$work"/step.J* | jq -cMs --arg mode "$mode" --arg docker "$docker" \
-        '{schema: 1, probe: "jackin-sentinel-probe", mode: $mode, docker: $docker, steps: add}'
+        '{schema: 2, probe: "jackin-sentinel-probe", mode: $mode, docker: $docker, steps: add}'
 }
 
 main "$@"

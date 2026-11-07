@@ -183,7 +183,7 @@ expect_rc() {
 
 expect_report() {
     jq -e --arg step "$1" --arg mode "$2" \
-        '.schema == 1 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
+        '.schema == 2 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
         problems="$problems report-shape"
 }
 
@@ -220,6 +220,14 @@ detail_contains() {
 not_disclosed() {
     if grep -Fq "$1" "$t/out" || grep -Fq "$1" "$t/err"; then
         problems="$problems credential-disclosed"
+    fi
+}
+
+public_not_disclosed() {
+    label=$1
+    marker=$2
+    if grep -Fq "$marker" "$t/out"; then
+        problems="$problems ${label}_marker_in_public_report"
     fi
 }
 
@@ -981,6 +989,58 @@ begin j12_no_codex_children_remain_unknown sh "$t/run-probe.sh" "$t/proc" "$t/pr
 expect_rc 0
 expect_report J12 sandbox
 expect distinct_tty SKIP 'unknown'
+finish_case
+
+mk j12_process_arguments_are_not_disclosed
+state 'running 1'
+main_marker=jackin-sentinel-main-argv0-synthetic-41f2c86a
+child_marker=jackin-sentinel-codex-option-synthetic-b709d3e1
+self_marker=jackin-sentinel-probe-positional-synthetic-63ac951d
+mkdir -p "$t/proc/100" "$t/proc/101"
+printf '%s\0%s\0' "/usr/local/bin/jackin-start-$main_marker" '--role=jackin' >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 768 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+printf 'codex\0--model\0%s\0' "$child_marker" >"$t/proc/101/cmdline"
+printf '101 (codex) S 100 100 100 512 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0 0\n' >"$t/proc/101/stat"
+cat >"$t/run-probe.sh" <<'EOF'
+#!/bin/sh
+pid=$$
+mkdir -p "$1/$pid"
+printf 'sh\0%s\0' "$3" >"$1/$pid/cmdline"
+printf '%s (sh) S 1 %s %s 256 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$pid" "$pid" "$pid" "$pid" >"$1/$pid/stat"
+exec sh "$2" --only J12
+EOF
+begin j12_process_arguments_are_not_disclosed sh "$t/run-probe.sh" "$t/proc" "$t/probe" "$self_marker"
+expected_self_pid=$pid
+expect_rc 0
+expect_report J12 sandbox
+expect not_descendant PASS 'not a descendant'
+expect distinct_tty PASS 'every Codex child'
+fact '.processes.run_state' 'running 1'
+fact '.processes.main.pid' 100
+fact '.processes.main.ppid' 1
+fact '.processes.main.start_ticks' 100
+fact '.processes.main.tty' 'tty:3:0'
+fact '.processes.codex | length' 1
+fact '.processes.codex[0].pid' 101
+fact '.processes.codex[0].ppid' 100
+fact '.processes.codex[0].start_ticks' 101
+fact '.processes.codex[0].tty' 'tty:2:0'
+fact '.processes.self.pid' "$expected_self_pid"
+fact '.processes.self.ppid' 1
+fact '.processes.self.start_ticks' "$expected_self_pid"
+fact '.processes.self.tty' 'tty:1:0'
+fact '.processes.main | has("args")' false
+fact '.processes.codex[0] | has("args")' false
+fact '.processes.self | has("args")' false
+public_not_disclosed main "$main_marker"
+public_not_disclosed codex "$child_marker"
+public_not_disclosed self "$self_marker"
+if jq -e --arg marker "$main_marker" \
+    '.steps[].facts.processes.main | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems main_marker_in_main_process"; fi
+if jq -e --arg marker "$child_marker" \
+    '.steps[].facts.processes.codex[0] | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems codex_marker_in_codex_process"; fi
+if jq -e --arg marker "$self_marker" \
+    '.steps[].facts.processes.self | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems self_marker_in_self_process"; fi
 finish_case
 
 mk j08_a_second_codex_child_with_a_real_credential_is_not_a_pass
