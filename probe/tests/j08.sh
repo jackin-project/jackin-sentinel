@@ -1486,7 +1486,17 @@ jwt_flagged() {
     finish_case
 }
 
-jwt_flagged file_scan_flags_a_subless_jwt_of_another_issuer "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"iss":"other-service"}')"
+mk file_scan_flags_a_subless_jwt_of_another_issuer
+state waiting
+record "$R_W0"
+cookie_schema_issuer_jwt=$JWT_HEADER.$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":1,"iss":"other-service"}').$JWT_SIGNATURE
+printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_issuer_jwt" >"$t/sandbox/logs.sqlite"
+report file_scan_flags_a_subless_jwt_of_another_issuer
+expect file_scan FAIL 'logs.sqlite'
+fact '.leaks | length' 1
+fact '.leaks[0] | endswith("/logs.sqlite")' true
+not_disclosed "$cookie_schema_issuer_jwt"
+finish_case
 jwt_flagged file_scan_flags_a_subless_jwt_of_another_audience "$JWT_HEADER" "$(b64url '{"aud":["api.example.com"],"exp":1,"iss":"edge-gateway"}')"
 jwt_flagged file_scan_flags_a_subless_jwt_without_an_audience "$JWT_HEADER" "$(b64url '{"exp":1,"iss":"edge-gateway"}')"
 jwt_flagged file_scan_flags_a_cookie_with_an_extra_secret_claim "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":1,"iss":"edge-gateway","x":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD"}')"
@@ -1514,6 +1524,73 @@ report file_scan_flags_a_jwt_shaped_string_that_does_not_decode
 expect file_scan FAIL 'logs.sqlite'
 fact '.leaks | length' 1
 finish_case
+
+cookie_schema_flagged() {
+    mk "$1"
+    state waiting
+    record "$R_W0"
+    cookie_schema_jwt=$2.$3.$JWT_SIGNATURE
+    printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_jwt" >"$t/sandbox/logs.sqlite"
+    report "$1"
+    expect file_scan FAIL 'logs.sqlite'
+    fact '.leaks | length' 1
+    fact '.leaks[0] | endswith("/logs.sqlite")' true
+    not_disclosed "$cookie_schema_jwt"
+    if [ -n "${4-}" ]; then
+        not_disclosed "$4"
+    fi
+    finish_case
+}
+
+cookie_schema_flagged file_scan_flags_a_cookie_with_an_extra_header_secret "$(b64url '{"alg":"ES256","kid":"oailb-v1","typ":"JWT","x":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD"}')" "$JWT_NO_SUB" 'sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD'
+cookie_schema_flagged file_scan_flags_a_cookie_with_another_algorithm "$(b64url '{"alg":"HS256","kid":"oailb-v1","typ":"JWT"}')" "$JWT_NO_SUB"
+cookie_schema_flagged file_scan_flags_a_cookie_with_a_nonstring_host "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":false,"iat":1,"iss":"edge-gateway"}')"
+cookie_schema_flagged file_scan_flags_a_cookie_with_a_nonnumeric_iat "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":"1","iss":"edge-gateway"}')"
+cookie_schema_flagged file_scan_flags_a_cookie_with_a_nonnumeric_exp "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":"1","host":"x","iat":1,"iss":"edge-gateway"}')"
+
+mk file_scan_passes_a_cookie_without_typ
+state waiting
+record "$R_W0"
+cookie_schema_without_typ_jwt=$(b64url '{"alg":"ES256","kid":"oailb-v1"}').$JWT_NO_SUB.$JWT_SIGNATURE
+printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_without_typ_jwt" >"$t/sandbox/logs.sqlite"
+report file_scan_passes_a_cookie_without_typ
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
+not_disclosed "$cookie_schema_without_typ_jwt"
+finish_case
+
+cookie_schema_flagged file_scan_flags_a_cookie_with_invalid_typ "$(b64url '{"alg":"ES256","kid":"oailb-v1","typ":"not-JWT"}')" "$JWT_NO_SUB"
+cookie_schema_flagged file_scan_flags_a_cookie_with_duplicate_header_alg "$(b64url '{"alg":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD","alg":"ES256","kid":"oailb-v1","typ":"JWT"}')" "$JWT_NO_SUB" 'sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD'
+cookie_schema_flagged file_scan_flags_a_cookie_with_duplicate_payload_host "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD","host":"x","iat":1,"iss":"edge-gateway"}')" 'sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD'
+
+mk file_scan_passes_a_cookie_with_json_whitespace
+state waiting
+record "$R_W0"
+cookie_schema_whitespace_jwt=$(b64url '{"alg": "ES256", "kid": "oailb-v1", "typ": "JWT"}').$(b64url '{"aud": ["chatgpt.com"], "exp": 1, "host": "x", "iat": 1, "iss": "edge-gateway"}').$JWT_SIGNATURE
+printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_whitespace_jwt" >"$t/sandbox/logs.sqlite"
+report file_scan_passes_a_cookie_with_json_whitespace
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
+not_disclosed "$cookie_schema_whitespace_jwt"
+finish_case
+
+cookie_schema_flagged file_scan_flags_a_cookie_with_escaped_duplicate_header_alg "$(b64url '{"alg":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD","a\u006cg":"ES256","kid":"oailb-v1","typ":"JWT"}')" "$JWT_NO_SUB" 'sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD'
+cookie_schema_flagged file_scan_flags_a_cookie_with_escaped_duplicate_payload_host "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD","h\u006fst":"x","iat":1,"iss":"edge-gateway"}')" 'sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD'
+
+mk file_scan_passes_a_cookie_with_punctuation_in_host
+state waiting
+record "$R_W0"
+cookie_schema_punctuation_host='a{,}"\b'
+cookie_schema_punctuation_jwt=$JWT_HEADER.$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"a{,}\"\\b","iat":1,"iss":"edge-gateway"}').$JWT_SIGNATURE
+printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_punctuation_jwt" >"$t/sandbox/logs.sqlite"
+report file_scan_passes_a_cookie_with_punctuation_in_host
+expect file_scan PASS 'no token-shaped string'
+fact '.leaks | length' 0
+not_disclosed "$cookie_schema_punctuation_jwt"
+not_disclosed "$cookie_schema_punctuation_host"
+finish_case
+
+cookie_schema_flagged file_scan_flags_a_cookie_with_a_secret_in_host "$JWT_HEADER" "$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD","iat":1,"iss":"edge-gateway"}')" 'sk-FAKEFAKEFAKEFAKEFAKE0123456789ABCD'
 
 mk file_scan_skips_when_the_jwt_classifier_fails
 state waiting

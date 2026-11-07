@@ -882,18 +882,40 @@ listed() {
 }
 jwt_listed() {
     { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
-        jq -nrR --arg safe "$2" '
+        jq -nrR --arg safe "$2" --arg leak_sk "$LEAK_SK" '
             def b64: gsub("-"; "+") | gsub("_"; "/")
                 | (length % 4) as $m
                 | if $m == 2 then . + "==" elif $m == 3 then . + "=" elif $m == 1 then error("length") else . end
                 | @base64d;
-            def part($i): split(".")[$i] | b64 | fromjson;
+            def unique_top_keys($parsed):
+                reduce scan("\"(?:[^\"\\\\]|\\\\.)*\"|\\{|\\}|\\[|\\]|,") as $token
+                    ({depth: 0, want_key: false, names: []};
+                     if $token == "{" or $token == "[" then
+                         .depth += 1 | if .depth == 1 then .want_key = true else . end
+                     elif $token == "}" or $token == "]" then
+                         .depth -= 1
+                     elif $token == "," then
+                         if .depth == 1 then .want_key = true else . end
+                     elif .depth == 1 and .want_key and ($token | startswith("\"")) then
+                         .names += [($token | fromjson)] | .want_key = false
+                     else . end)
+                | .names as $names
+                | (($names | length) == ($names | unique | length))
+                  and (($names | sort) == ($parsed | keys | sort));
+            def object_part($i):
+                split(".")[$i] | b64 | . as $raw
+                | ($raw | fromjson) as $parsed
+                | if ($parsed | type) == "object" and ($raw | unique_top_keys($parsed))
+                  then $parsed else error("unrecognized cookie object") end;
             def audience: if type == "string" then . == "chatgpt.com" elif type == "array" then . == ["chatgpt.com"] else false end;
             def known_cookie:
                 (split(".")[2] | startswith("eyJ") | not)
-                and (part(0) | type == "object" and .kid == "oailb-v1")
-                and (part(1) | type == "object" and (keys | sort) == ["aud", "exp", "host", "iat", "iss"]
-                     and .iss == "edge-gateway" and (.aud | audience));
+                and (object_part(0) | type == "object" and .alg == "ES256" and .kid == "oailb-v1"
+                     and ((keys | sort) == ["alg", "kid"]
+                          or ((keys | sort) == ["alg", "kid", "typ"] and .typ == "JWT")))
+                and (object_part(1) | type == "object" and (keys | sort) == ["aud", "exp", "host", "iat", "iss"]
+                     and .iss == "edge-gateway" and (.aud | audience)
+                     and (.host | type == "string") and (.host | test($leak_sk) | not) and (.iat | type == "number") and (.exp | type == "number"));
             def verdict:
                 if . == "SCAN_ERROR" then "error"
                 elif test($safe) then "none"
