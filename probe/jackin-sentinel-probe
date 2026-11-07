@@ -504,19 +504,253 @@ EOF
         launch_kind=api_key
     fi
     printf '%s' "$why" >"$work/codex_exec.why"
+    unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
+    unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
+    unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
+    unset _jks_stdout_parsed_answer _jks_stdout_extra
+    _jks_stdout_capture=
     attempted=false
     exit_code=
     answered=false
     bytes=0
     if [ "$launch_kind" != none ]; then
         attempted=true
-        out=$(cd "$SCAN_ROOT" && timeout 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 2>/dev/null </dev/null)
-        exit_code=$?
-        bytes=$(printf '%s' "$out" | wc -c | tr -d ' ')
-        if [ "$exit_code" -eq 0 ] && printf '%s' "$out" | grep -qi 'ready'; then
-            answered=true
+        if _jks_stdout_capture=$(
+            exec 3>&1 || exit 1
+            (
+                _jks_stdout_producer_status=0
+                if (cd "$SCAN_ROOT" && timeout --kill-after=5 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 3>&- 2>/dev/null </dev/null); then
+                    :
+                else
+                    _jks_stdout_producer_status=$?
+                fi
+                printf '!P\t%s\n' "$_jks_stdout_producer_status" >&3 || exit 1
+            ) | {
+                _jks_stdout_od_status=0
+                _jks_stdout_encoded=
+                if _jks_stdout_encoded=$(LC_ALL=C timeout --kill-after=5 240 od -An -N65537 -v -tx1 3>&- 2>/dev/null); then
+                    :
+                else
+                    _jks_stdout_od_status=$?
+                fi
+                _jks_stdout_drain_status=0
+                timeout --kill-after=5 30 cat >/dev/null 3>&- 2>/dev/null || _jks_stdout_drain_status=$?
+                if [ "$_jks_stdout_od_status" -ne 0 ] || [ "$_jks_stdout_drain_status" -ne 0 ]; then
+                    _jks_stdout_count_status=0
+                    _jks_stdout_encoded_bytes=
+                    if _jks_stdout_encoded_bytes=$(printf '%s' "$_jks_stdout_encoded" | LC_ALL=C awk '
+                        function valid_hex(value) {
+                            return length(value) == 2 && value ~ /^[[:xdigit:]][[:xdigit:]]$/
+                        }
+                        {
+                            line = $0
+                            sub(/^[[:space:]]+/, "", line)
+                            sub(/[[:space:]]+$/, "", line)
+                            if (line == "") next
+                            token_count = split(line, tokens, /[[:space:]]+/)
+                            for (i = 1; i <= token_count; i++) {
+                                if (valid_hex(tokens[i])) bytes++
+                                else invalid = 1
+                            }
+                        }
+                        END {
+                            if (invalid || bytes > 65537) exit 1
+                            printf "%d\n", bytes
+                        }
+                    ' 3>&- 2>/dev/null); then
+                        :
+                    else
+                        _jks_stdout_count_status=$?
+                    fi
+                    if [ "$_jks_stdout_count_status" -ne 0 ]; then
+                        unset _jks_stdout_encoded _jks_stdout_encoded_bytes _jks_stdout_count_status
+                        unset _jks_stdout_od_status _jks_stdout_drain_status
+                        exit 1
+                    fi
+                    unset _jks_stdout_encoded
+                    if ! printf '!E\t%s\t%s\t%s\n' "$_jks_stdout_od_status" "$_jks_stdout_drain_status" "$_jks_stdout_encoded_bytes" >&3; then
+                        unset _jks_stdout_encoded_bytes _jks_stdout_count_status
+                        unset _jks_stdout_od_status _jks_stdout_drain_status
+                        exit 1
+                    fi
+                    unset _jks_stdout_encoded_bytes _jks_stdout_count_status
+                    unset _jks_stdout_od_status _jks_stdout_drain_status
+                    exit 1
+                fi
+                if ! printf '!H\n%s\n!O\t%s\n!D\t%s\n' "$_jks_stdout_encoded" "$_jks_stdout_od_status" "$_jks_stdout_drain_status" >&3; then
+                    unset _jks_stdout_encoded _jks_stdout_od_status _jks_stdout_drain_status
+                    exit 1
+                fi
+                unset _jks_stdout_encoded _jks_stdout_od_status _jks_stdout_drain_status
+            }
+        ); then
+            _jks_stdout_capture_status=0
+        else
+            _jks_stdout_capture_status=$?
+        fi
+        _jks_stdout_parse_status=0
+        _jks_stdout_parsed=
+        if _jks_stdout_parsed=$(printf '%s' "$_jks_stdout_capture" | LC_ALL=C awk -v capture_status="$_jks_stdout_capture_status" '
+            function valid_status(value) {
+                if (value !~ /^[0-9]+$/ || length(value) > 3) return 0
+                if (length(value) > 1 && substr(value, 1, 1) == "0") return 0
+                return value + 0 <= 255
+            }
+            function valid_count(value) {
+                if (value !~ /^[0-9]+$/ || length(value) > 5) return 0
+                if (length(value) > 1 && substr(value, 1, 1) == "0") return 0
+                return value + 0 <= 65537
+            }
+            function status_value(line, tag, value) {
+                if (index(line, tag "\t") != 1) return ""
+                value = substr(line, length(tag) + 2)
+                if (!valid_status(value)) return ""
+                return value
+            }
+            function ready_letter(value) {
+                value = tolower(value)
+                if (value == "72" || value == "52") return "r"
+                if (value == "65" || value == "45") return "e"
+                if (value == "61" || value == "41") return "a"
+                if (value == "64" || value == "44") return "d"
+                if (value == "79" || value == "59") return "y"
+                return "?"
+            }
+            function parse_hex_line(line, trimmed, token_count, tokens, i, letter) {
+                trimmed = line
+                sub(/^[[:space:]]+/, "", trimmed)
+                sub(/[[:space:]]+$/, "", trimmed)
+                if (trimmed == "") return 1
+                token_count = split(trimmed, tokens, /[[:space:]]+/)
+                for (i = 1; i <= token_count; i++) {
+                    if (length(tokens[i]) != 2 || tokens[i] !~ /^[[:xdigit:]][[:xdigit:]]$/) {
+                        grammar_bad = 1
+                        return 0
+                    }
+                    byte_count++
+                    if (byte_count > 65537) grammar_bad = 1
+                    letter = ready_letter(tokens[i])
+                    history = substr(history, length(history) > 4 ? length(history) - 3 : 1) letter
+                    if (history == "ready") ready_found = 1
+                }
+                return 1
+            }
+            function parse_success_record(line, producer_value, od_value, drain_value) {
+                if (state == 0) {
+                    producer_value = status_value(line, "!P")
+                    if (producer_value == "") grammar_bad = 1
+                    state = 1
+                    return
+                }
+                if (state == 1) {
+                    if (line != "!H") grammar_bad = 1
+                    state = 2
+                    return
+                }
+                if (state == 2) {
+                    od_value = status_value(line, "!O")
+                    if (od_value != "") {
+                        od_status = od_value
+                        state = 3
+                    } else {
+                        parse_hex_line(line)
+                    }
+                    return
+                }
+                if (state == 3) {
+                    drain_value = status_value(line, "!D")
+                    if (drain_value == "") grammar_bad = 1
+                    else {
+                        drain_status = drain_value
+                        state = 4
+                    }
+                    return
+                }
+                grammar_bad = 1
+            }
+            {
+                line = $0
+                records[NR] = line
+                if (line == "!P" || index(line, "!P\t") == 1) {
+                    record_kind[NR] = "P"
+                    producer_records++
+                    producer_value = status_value(line, "!P")
+                    if (producer_value != "") {
+                        producer_valid_seen++
+                        producer_valid_status = producer_value
+                    }
+                } else if (line == "!E" || index(line, "!E\t") == 1) {
+                    record_kind[NR] = "E"
+                    error_records++
+                    error_fields = split(line, error_parts, "\t")
+                    if (error_fields != 4 || line != "!E\t" error_parts[2] "\t" error_parts[3] "\t" error_parts[4] ||
+                        !valid_status(error_parts[2]) || !valid_status(error_parts[3]) || !valid_count(error_parts[4]) ||
+                        (error_parts[2] + 0 == 0 && error_parts[3] + 0 == 0)) {
+                        error_bad = 1
+                    } else {
+                        error_bytes = error_parts[4] + 0
+                    }
+                } else {
+                    record_kind[NR] = "unknown"
+                }
+            }
+            END {
+                producer_code = "null"
+                output_bytes = 0
+                answer = 0
+                if (producer_records == 1 && producer_valid_seen == 1) producer_code = producer_valid_status
+                if (error_records > 0) {
+                    error_frame_bad = error_bad || capture_status == 0 || error_records != 1 || producer_records > 1
+                    for (i = 1; i <= NR; i++) {
+                        if (record_kind[i] != "P" && record_kind[i] != "E") error_frame_bad = 1
+                    }
+                    if (!error_frame_bad) output_bytes = error_bytes
+                } else {
+                    for (i = 1; i <= NR; i++) parse_success_record(records[i])
+                    if (state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1) output_bytes = byte_count
+                    if (capture_status == 0 && state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1 && producer_code == 0 && od_status == 0 && drain_status == 0 && byte_count <= 65536 && ready_found) answer = 1
+                }
+                printf "%s %d %d\n", producer_code, output_bytes, answer
+            }
+        ' 3>&- 2>/dev/null); then
+            _jks_stdout_parse_status=0
+        else
+            _jks_stdout_parse_status=$?
+        fi
+        unset _jks_stdout_capture _jks_stdout_capture_status
+        if [ "$_jks_stdout_parse_status" -eq 0 ]; then
+            _jks_stdout_extra=
+            if IFS=' ' read -r _jks_stdout_parsed_exit _jks_stdout_parsed_bytes _jks_stdout_parsed_answer _jks_stdout_extra <<EOF
+$_jks_stdout_parsed
+EOF
+            then
+                case "$_jks_stdout_parsed_exit" in
+                    null) exit_code= ;;
+                    '' | *[!0-9]*) exit_code= ;;
+                    *)
+                        if [ "$_jks_stdout_parsed_exit" -le 255 ]; then
+                            exit_code=$_jks_stdout_parsed_exit
+                        fi
+                        ;;
+                esac
+                case "$_jks_stdout_parsed_bytes" in
+                    '' | *[!0-9]*) bytes=0 ;;
+                    *)
+                        if [ "$_jks_stdout_parsed_bytes" -le 65537 ]; then
+                            bytes=$_jks_stdout_parsed_bytes
+                        fi
+                        ;;
+                esac
+                if [ "$_jks_stdout_parsed_answer" = 1 ] && [ -z "$_jks_stdout_extra" ]; then
+                    answered=true
+                fi
+            fi
         fi
     fi
+    unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
+    unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
+    unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
+    unset _jks_stdout_parsed_answer _jks_stdout_extra
     jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),

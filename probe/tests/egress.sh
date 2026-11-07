@@ -6,11 +6,12 @@ set -u
 here=$(cd "$(dirname "$0")" && pwd)
 probe=$here/../jackin-sentinel-probe
 scratch=$(mktemp -d) || exit 70
+scratch=$(cd "$scratch" && pwd -P) || exit 70
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh jq sed tr cat env awk grep mktemp rm wc head; do
+for tool in sh jq sed tr cat env awk grep mktemp rm wc head od; do
     found=$(command -v "$tool") || {
         echo "FAIL setup: $tool is not installed"
         exit 70
@@ -24,7 +25,7 @@ real_id=$(command -v id) || exit 70
 real_env=$(command -v env) || exit 70
 printf '#!/bin/sh\necho Linux\n' >"$scratch/tools/uname"
 printf '#!/bin/sh\n[ "$*" = -un ] && echo sandbox && exit 0\nexec %s "$@"\n' "$real_id" >"$scratch/tools/id"
-printf '#!/bin/sh\nshift\nexec "$@"\n' >"$scratch/tools/timeout"
+printf '#!/bin/sh\ncase %s in --kill-after=*) shift ;; esac\nshift\nexec "%s"\n' "\${1-}" "\$@" >"$scratch/tools/timeout"
 chmod +x "$scratch/tools/uname" "$scratch/tools/id" "$scratch/tools/timeout"
 if PATH="$scratch/tools" command -v curl >/dev/null 2>&1; then
     echo "FAIL setup: the tool directory reaches a real curl"
@@ -80,6 +81,122 @@ mk() {
 codex_says() {
     printf '#!/bin/sh\necho ran >>"%s"\necho "%s"\nexit %s\n' "$t/codex.ran" "$1" "$2" >"$t/bin/codex"
     chmod +x "$t/bin/codex"
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+codex_streams() {
+    fixture_kind=$1
+    fixture_exit=$2
+    cat >"$scratch/codex-output.py" <<'PY'
+import sys
+
+cases = {
+    "below_cap": (6, 0, b"ReAdY\n"),
+    "exact_cap": (65536, 257, b"ready"),
+    "cap_plus_one_before": (65537, 0, b"ready"),
+    "ready_after_cap": (65541, 65536, b"ready"),
+    "large": (4194304, 257, b"ready"),
+    "nul_inside": (6, 0, b"r\0eady"),
+    "nul_around": (7, 0, b"\0ready\0"),
+    "nonzero": (5, 0, b"ready"),
+}
+kind = sys.argv[1]
+length, position, marker = cases[kind]
+assert 0 <= position <= length - len(marker)
+chunk_size = 4096
+pattern = b"OUT-RAW-SECRET-MARKER-"
+written = 0
+if kind in ("nul_inside", "nul_around"):
+    sys.stdout.buffer.write(marker)
+    written = len(marker)
+else:
+    while written < length:
+        size = min(chunk_size, length - written)
+        chunk = (pattern * ((size + len(pattern) - 1) // len(pattern)))[:size]
+        start = written
+        end = start + size
+        marker_start = max(start, position)
+        marker_end = min(end, position + len(marker))
+        if marker_start < marker_end:
+            left = marker_start - start
+            right = marker_end - start
+            marker_left = marker_start - position
+            marker_right = marker_end - position
+            chunk = chunk[:left] + marker[marker_left:marker_right] + chunk[right:]
+        sys.stdout.buffer.write(chunk)
+        written += size
+assert written == length
+if kind == "below_cap":
+    assert length == 6 and position == 0
+elif kind == "exact_cap":
+    assert length == 65536 and position == 257
+elif kind == "cap_plus_one_before":
+    assert length == 65537 and position == 0
+elif kind == "ready_after_cap":
+    assert length == 65541 and position == 65536
+elif kind == "large":
+    assert length == 4194304 and position == 257
+elif kind == "nul_inside":
+    assert length == 6
+elif kind == "nul_around":
+    assert length == 7
+elif kind == "nonzero":
+    assert length == 5 and position == 0
+raise SystemExit(int(sys.argv[2]))
+PY
+    python_arg=$(shell_quote "$python_bin")
+    generator_arg=$(shell_quote "$scratch/codex-output.py")
+    kind_arg=$(shell_quote "$fixture_kind")
+    exit_arg=$(shell_quote "$fixture_exit")
+    ran_arg=$(shell_quote "$t/codex.ran")
+    printf '#!/bin/sh\necho ran >>%s\nexec %s %s %s %s\n' \
+        "$ran_arg" "$python_arg" "$generator_arg" "$kind_arg" "$exit_arg" >"$t/bin/codex"
+    chmod +x "$t/bin/codex"
+}
+
+codex_stream_case() {
+    selected_step=$1
+    fixture_kind=$2
+    expected_result=$3
+    expected_exit=$4
+    expected_bytes=$5
+    if [ "$selected_step" = J07 ]; then
+        step_name=j07
+        check_name=codex_exec
+    else
+        step_name=j09
+        check_name=codex_reaches_api
+        with_curl
+        answer "$OUTSIDE" 7 000
+        answer "$METADATA" 7 000
+        answer "$PROVIDER" 7 000
+    fi
+    case_name="${step_name}_codex_stdout_${fixture_kind}"
+    begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER"
+    expect "$check_name" "$expected_result" "$(if [ "$expected_result" = PASS ]; then printf 'codex exec answered'; else printf 'gave no answer'; fi)"
+    if [ -n "$expected_exit" ]; then
+        fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered) \(.output_bytes)"' "true api_key $expected_exit $([ "$expected_result" = PASS ] && printf true || printf false) $expected_bytes"
+    else
+        fact '.codex_exec | "\(.attempted) \(.credential) \(.answered) \(.output_bytes)"' "true api_key false $expected_bytes"
+    fi
+    expect_absent_from_report OUT-RAW-SECRET-MARKER
+    finish_case
+}
+
+setup_codex_stream_case() {
+    selected_step=$1
+    fixture_kind=$2
+    fixture_exit=${3-0}
+    if [ "$selected_step" = J07 ]; then
+        step_name=j07
+    else
+        step_name=j09
+    fi
+    mk "${step_name}_codex_stdout_${fixture_kind}"
+    codex_streams "$fixture_kind" "$fixture_exit"
 }
 
 auth_json() {
@@ -217,6 +334,17 @@ PLACEHOLDER=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN
 PLACEHOLDER_SHOWN='openshel*********************************OKEN'
 API_PLACEHOLDER=openshell:resolve:env:OPENAI_API_KEY
 API_PLACEHOLDER_SHOWN='openshel************************_KEY'
+python_bin=$(command -v python3) || exit 70
+case "$python_bin" in
+    /*) ;;
+    *)
+        python_dir=${python_bin%/*}
+        python_name=${python_bin##*/}
+        [ "$python_dir" != "$python_bin" ] || python_dir=.
+        python_dir=$(cd "$python_dir" && pwd -P) || exit 70
+        python_bin=$python_dir/$python_name
+        ;;
+esac
 INJECTED="$PLACEHOLDER
 X-Exfil: FAKE-REAL-SECRET-0123456789"
 INJECTED_JSON='openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN\nX-Exfil: FAKE-REAL-SECRET-0123456789'
@@ -435,6 +563,25 @@ begin j09_codex_timeout_after_partial_output_is_not_an_answer step_J09 '' OPENAI
 expect codex_reaches_api FAIL 'exit 124 gave no answer'
 fact '.codex_exec | "\(.attempted) \(.exit_code) \(.answered)"' 'true 124 false'
 finish_case
+
+for selected_step in J07 J09; do
+    setup_codex_stream_case "$selected_step" below_cap
+    codex_stream_case "$selected_step" below_cap PASS 0 6
+    setup_codex_stream_case "$selected_step" exact_cap
+    codex_stream_case "$selected_step" exact_cap PASS 0 65536
+    setup_codex_stream_case "$selected_step" cap_plus_one_before
+    codex_stream_case "$selected_step" cap_plus_one_before FAIL 0 65537
+    setup_codex_stream_case "$selected_step" ready_after_cap
+    codex_stream_case "$selected_step" ready_after_cap FAIL 0 65537
+    setup_codex_stream_case "$selected_step" large
+    codex_stream_case "$selected_step" large FAIL 0 65537
+    setup_codex_stream_case "$selected_step" nul_inside
+    codex_stream_case "$selected_step" nul_inside FAIL 0 6
+    setup_codex_stream_case "$selected_step" nul_around
+    codex_stream_case "$selected_step" nul_around PASS 0 7
+    setup_codex_stream_case "$selected_step" nonzero 23
+    codex_stream_case "$selected_step" nonzero FAIL 23 5
+done
 
 mk j09_codex_uses_the_api_key_of_auth_json
 with_curl
