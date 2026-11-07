@@ -1,0 +1,1960 @@
+#!/bin/sh
+
+# SPDX-FileCopyrightText: 2026 Alexey Zhokhov
+# SPDX-License-Identifier: Apache-2.0
+
+set -u
+
+PROBE=jackin-sentinel-probe
+VERSION=1
+SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin
+PROJECT=/sandbox/project
+STATE_DIR=/sandbox/.sentinel
+JACKIN_DIR=/sandbox/.jackin
+CODEX_HOME_DIR=/sandbox/.codex
+CODEX_BIN=/usr/local/bin/codex
+CODEX_COMM=codex
+START_BIN=/usr/local/bin/jackin-start
+HELLO_IMAGE='hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef'
+HOOK_DIR=/usr/local/lib/jackin/hooks
+HOOK_TOP=/
+RECORD_FILE=$JACKIN_DIR/run/env-kinds
+RUN_STATE_FILE=$JACKIN_DIR/run/state
+RECORD_MAX=65536
+SCAN_ROOT=/sandbox
+SCAN_MAX_KIB=262144
+SCAN_GREP_SECONDS=20
+LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
+LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
+ID_TOKEN_HEADER=$(printf '%s' 'eyJhbGci' 'OiJub25l' 'IiwidHlw' 'IjoiSldU' 'In0')
+ID_TOKEN_PAYLOAD=$(printf '%s' 'eyJpc3Mi' 'OiJodHRw' 'czovL2F1' 'dGgub3Bl' 'bmFpLmNv' 'bSIsImF1' 'ZCI6ImNv' 'ZGV4Iiwi' 'c3ViIjoi' 'b3BlbnNo' 'ZWxsLWFw' 'cC1zZXJ2' 'ZXIifQ')
+LEAK_JWT_SAFE="^${ID_TOKEN_HEADER}\\.${ID_TOKEN_PAYLOAD}\\.placeholder$"
+LEAK_RT='"refresh_token"[[:space:]]*:[[:space:]]*"[^"]+"'
+LEAK_RT_SAFE=':\s*"openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*"$'
+PLACEHOLDER_RE='^openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*'
+PLACEHOLDER_ID_TOKEN="${ID_TOKEN_HEADER}.${ID_TOKEN_PAYLOAD}.placeholder"
+J10_ALLOWED="$STATE_DIR /tmp"
+J10_DENIED="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
+PROMPT='Reply with the word ready'
+ALL_STEPS='J00 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 J14 J15 J16'
+JQN='def n: if . == "" then null else . end;'
+
+usage() {
+    echo "usage: $PROBE [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]" >&2
+    echo "       $PROBE --version" >&2
+    exit 64
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+check() {
+    detail=$3
+    if [ "$2" != PASS ] && [ -z "$detail" ]; then
+        detail="no detail"
+    fi
+    jq -cn --arg name "$1" --arg result "$2" --arg detail "$detail" \
+        '{name: $name, result: $result, detail: ($detail | .[0:300])}' >>"$work/checks"
+}
+
+pass() {
+    check "$1" PASS "${2-}"
+}
+
+fail() {
+    check "$1" FAIL "$2"
+}
+
+skip() {
+    check "$1" SKIP "$2"
+}
+
+finish() {
+    jq -cn --arg id "$1" --slurpfile checks "$work/checks" --slurpfile facts "$work/facts" '
+        ($checks
+            + (if ($checks | length) == 0
+               then [{name: "checks", result: "FAIL", detail: "the step recorded no check"}]
+               else [] end)
+            + (if $facts[0] == null and all($checks[]; .result != "SKIP")
+               then [{name: "facts", result: "FAIL", detail: "the step collected no facts"}]
+               else [] end)) as $c
+        | (if any($c[]; .result == "FAIL") then "FAIL"
+           elif any($c[]; .result == "SKIP") then "SKIP"
+           else "PASS" end) as $r
+        | {($id): {
+            result: $r,
+            reason: (if $r == "PASS" then ""
+                     else ([$c[] | select(.result == $r) | "\(.name): \(.detail)"] | join("; ") | .[0:600])
+                     end),
+            checks: $c,
+            facts: ($facts[0] // null)}}' >"$work/step.$1"
+}
+
+selected() {
+    [ -z "$only" ] && return 0
+    case ",$only," in
+        *",$1,"*) return 0 ;;
+    esac
+    return 1
+}
+
+require_sandbox() {
+    if [ "$(uname -s)" = Linux ] && [ "$(id -un)" = sandbox ] && [ -d /sandbox ]; then
+        return 0
+    fi
+    echo "$PROBE: refusing to run outside a sandbox; use --host for a dry run" >&2
+    exit 66
+}
+
+count_lines() {
+    if [ -f "$1" ]; then
+        wc -l <"$1" | tr -d ' '
+    else
+        echo 0
+    fi
+}
+
+count_matches() {
+    n=0
+    if [ -f "$2" ]; then
+        n=$(grep -c "$1" "$2" 2>/dev/null)
+    fi
+    echo "${n:-0}"
+}
+
+file_meta() {
+    stat -L -c '%u %a' "$1" 2>/dev/null
+}
+
+git_in() {
+    # shellcheck disable=SC2016
+    /usr/bin/env -i /bin/sh -c '
+        case $1 in x*) PATH=${1#x}; export PATH ;; *) unset PATH ;; esac
+        case $2 in x*) HOME=${2#x}; export HOME ;; *) unset HOME ;; esac
+        case $3 in x*) XDG_CONFIG_HOME=${3#x}; export XDG_CONFIG_HOME ;; *) unset XDG_CONFIG_HOME ;; esac
+        case $4 in x*) TMPDIR=${4#x}; export TMPDIR ;; *) unset TMPDIR ;; esac
+        case $5 in x*) LANG=${5#x}; export LANG ;; *) unset LANG ;; esac
+        case $6 in x*) LANGUAGE=${6#x}; export LANGUAGE ;; *) unset LANGUAGE ;; esac
+        case $7 in x*) LC_ALL=${7#x}; export LC_ALL ;; *) unset LC_ALL ;; esac
+        case $8 in x*) LC_COLLATE=${8#x}; export LC_COLLATE ;; *) unset LC_COLLATE ;; esac
+        case $9 in x*) LC_CTYPE=${9#x}; export LC_CTYPE ;; *) unset LC_CTYPE ;; esac
+        case ${10} in x*) LC_MESSAGES=${10#x}; export LC_MESSAGES ;; *) unset LC_MESSAGES ;; esac
+        case ${11} in x*) LC_MONETARY=${11#x}; export LC_MONETARY ;; *) unset LC_MONETARY ;; esac
+        case ${12} in x*) LC_NUMERIC=${12#x}; export LC_NUMERIC ;; *) unset LC_NUMERIC ;; esac
+        case ${13} in x*) LC_TIME=${13#x}; export LC_TIME ;; *) unset LC_TIME ;; esac
+        shift 13
+        project=$1
+        shift
+        exec git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$project" "$@"
+    ' git_in \
+        "${PATH+x}${PATH-}" "${HOME+x}${HOME-}" "${XDG_CONFIG_HOME+x}${XDG_CONFIG_HOME-}" "${TMPDIR+x}${TMPDIR-}" \
+        "${LANG+x}${LANG-}" "${LANGUAGE+x}${LANGUAGE-}" "${LC_ALL+x}${LC_ALL-}" "${LC_COLLATE+x}${LC_COLLATE-}" \
+        "${LC_CTYPE+x}${LC_CTYPE-}" "${LC_MESSAGES+x}${LC_MESSAGES-}" "${LC_MONETARY+x}${LC_MONETARY-}" \
+        "${LC_NUMERIC+x}${LC_NUMERIC-}" "${LC_TIME+x}${LC_TIME-}" "$PROJECT" "$@"
+}
+
+in_work_tree() {
+    inside=$(git_in rev-parse --is-inside-work-tree 2>/dev/null) || return 1
+    [ "$inside" = true ] || return 1
+    prefix=$(git_in rev-parse --show-prefix 2>/dev/null) || return 1
+    [ -z "$prefix" ]
+}
+
+git_index_flags_state() {
+    index_file=$1
+    index_hex=$2
+    od -A n -v -t x1 "$index_file" >"$index_hex" 2>/dev/null || return 2
+    # shellcheck disable=SC2016
+    awk '
+        BEGIN { record_length=0; dirty=0; invalid=0 }
+        {
+            for (i=1; i<=NF; i++) {
+                byte=$i
+                if (byte == "00") {
+                    if (record_length < 3 || separator != "20" || tag !~ /^(4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a])$/) {
+                        invalid=1
+                    } else if (tag != "48") {
+                        dirty=1
+                    }
+                    record_length=0
+                    tag=""
+                    separator=""
+                } else {
+                    if (record_length == 0) tag=byte
+                    else if (record_length == 1) separator=byte
+                    record_length++
+                }
+            }
+        }
+        END {
+            if (invalid || record_length != 0) exit 2
+            if (dirty) exit 1
+            exit 0
+        }
+    ' "$index_hex"
+}
+
+path_or_ancestor_writable() {
+    candidate=$1
+    top=${2:-$HOOK_TOP}
+    while :; do
+        [ -w "$candidate" ] && return 0
+        [ "$candidate" = "$top" ] && return 1
+        parent=${candidate%/*}
+        [ -n "$parent" ] || parent=/
+        [ "$parent" != "$candidate" ] || return 1
+        candidate=$parent
+    done
+}
+
+physical_path() {
+    candidate=$1
+    hops=0
+    while [ -L "$candidate" ]; do
+        hops=$((hops + 1))
+        [ "$hops" -le 40 ] || return 1
+        target=$(readlink "$candidate") || return 1
+        case $target in
+            /*) candidate=$target ;;
+            *) candidate=$(dirname "$candidate")/$target ;;
+        esac
+    done
+    parent=$(
+        unset CDPATH
+        cd -P "$(dirname "$candidate")" 2>/dev/null && pwd -P
+    ) || return 1
+    printf '%s/%s\n' "${parent%/}" "${candidate##*/}"
+}
+
+proc_args() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    { tr '\0' ' ' <"/proc/$1/cmdline"; } 2>/dev/null | sed 's/ *$//' | cut -c1-200
+}
+
+proc_comm() {
+    comm=$(sed -n 's/^[0-9]* (\(.*\)) [^)]*$/\1/p' "/proc/$1/stat" 2>/dev/null)
+    [ -n "$comm" ] || return 1
+    echo "$comm"
+}
+
+proc_stat() {
+    [ -r "/proc/$1/stat" ] || return 1
+    stat_line=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $2, $4, $20, $5}')
+    [ -n "$stat_line" ] || return 1
+    echo "$stat_line"
+}
+
+proc_environ() {
+    { cat "/proc/$1/environ"; } 2>/dev/null
+}
+
+environ_state() {
+    if { true <"/proc/$1/environ"; } 2>/dev/null; then
+        echo read
+    else
+        echo denied
+    fi
+}
+
+tty_name() {
+    [ "$1" -ne 0 ] || return 1
+    major=$((($1 >> 8) & 4095))
+    minor=$((($1 & 255) | (($1 >> 12) & 1048320)))
+    case $major in
+        13[6-9] | 14[0-3]) echo "/dev/pts/$((minor + (major - 136) * 256))" ;;
+        229) echo "/dev/hvc$minor" ;;
+        *) echo "tty:$major:$minor" ;;
+    esac
+}
+
+proc_json() {
+    pid=$1
+    stat_line=$(proc_stat "$pid") || return 1
+    read -r ppid sid ticks ttynr <<EOF
+$stat_line
+EOF
+    comm=$(proc_comm "$pid") || return 1
+    tty=$(tty_name "$ttynr") || tty=
+    jq -cn \
+        --argjson pid "$pid" --argjson ppid "$ppid" --argjson sid "$sid" --argjson ticks "$ticks" \
+        --arg comm "$comm" --arg tty "$tty" \
+        "$JQN"'{pid: $pid, ppid: $ppid, sid: $sid, comm: $comm, start_ticks: $ticks, tty: ($tty | n)}'
+}
+
+read_run_state() {
+    run_state=
+    [ -f "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] || return 0
+    if ! timeout 2 dd if="$RUN_STATE_FILE" of="$work/run-state.raw" bs=65 count=1 iflag=nonblock,nofollow 2>/dev/null; then
+        return 0
+    fi
+    [ -f "$RUN_STATE_FILE" ] && [ ! -L "$RUN_STATE_FILE" ] || return 0
+    state_size=$(wc -c <"$work/run-state.raw" 2>/dev/null) || return 0
+    state_size=$(printf '%s' "$state_size" | tr -d '[:space:]')
+    case $state_size in
+        '' | *[!0-9]*) return 0 ;;
+    esac
+    state_prefix=$(head -c 7 "$work/run-state.raw" 2>/dev/null) || state_prefix=
+    state_nuls=$(LC_ALL=C tr -cd '\000' <"$work/run-state.raw" | wc -c | tr -d ' ')
+    if [ "$state_size" -gt 64 ] || [ "$state_nuls" -ne 0 ]; then
+        case $state_prefix in
+            running*) run_state='running invalid' ;;
+            exited*) run_state='exited invalid' ;;
+            waiting*) run_state='waiting invalid' ;;
+        esac
+        return 0
+    fi
+    run_state=$(LC_ALL=C awk '
+        function valid(s, attempt, fields, count) {
+            if (s == "waiting") return 1
+            if (s ~ /^running [1-9][0-9]*$/) {
+                attempt = substr(s, 9)
+                return length(attempt) <= 18
+            }
+            if (s ~ /^exited [1-9][0-9]* (0|[1-9][0-9]*)$/) {
+                count = split(s, fields, " ")
+                return count == 3 && length(fields[2]) <= 18 && length(fields[3]) <= 3 && fields[3] + 0 <= 255
+            }
+            return 0
+        }
+        NR == 1 { first = $0; next }
+        { extra = 1 }
+        END {
+            if (NR == 1 && !extra && valid(first)) print first
+            else if (first ~ /^running/) print "running invalid"
+            else if (first ~ /^exited/) print "exited invalid"
+            else if (first == "waiting") print "waiting invalid"
+        }' "$work/run-state.raw" 2>/dev/null) || run_state=
+}
+
+collect_processes() {
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
+    read_run_state
+    main_pid=
+    for dir in /proc/[0-9]*; do
+        pid=${dir#/proc/}
+        args=$(proc_args "$pid") || continue
+        case $args in
+            *"$START_BIN"*) ;;
+            *) continue ;;
+        esac
+        stat_line=$(proc_stat "$pid") || continue
+        read -r ppid _ _ <<EOF
+$stat_line
+EOF
+        if parent=$(proc_args "$ppid"); then
+            case $parent in
+                *"$START_BIN"*) continue ;;
+            esac
+        fi
+        main_pid=$pid
+        break
+    done
+    self_pid=$$
+    : >"$work/main.json"
+    : >"$work/codex.ndjson"
+    if [ -n "$main_pid" ]; then
+        proc_json "$main_pid" >"$work/main.json"
+        for dir in /proc/[0-9]*; do
+            pid=${dir#/proc/}
+            stat_line=$(proc_stat "$pid") || continue
+            read -r ppid _ <<EOF
+$stat_line
+EOF
+            [ "$ppid" = "$main_pid" ] || continue
+            [ "$(proc_comm "$pid")" = "$CODEX_COMM" ] || continue
+            proc_json "$pid" >>"$work/codex.ndjson"
+        done
+    fi
+    proc_json "$self_pid" >"$work/self.json"
+    descends=false
+    cur=$self_pid
+    while [ "$cur" -gt 1 ]; do
+        stat_line=$(proc_stat "$cur") || break
+        read -r cur _ <<EOF
+$stat_line
+EOF
+        if [ -n "$main_pid" ] && [ "$cur" = "$main_pid" ]; then
+            descends=true
+            break
+        fi
+    done
+    jq -n --arg boot_id "$boot_id" --arg run_state "$run_state" --argjson descends "$descends" \
+        --slurpfile main "$work/main.json" --slurpfile codex "$work/codex.ndjson" --slurpfile self "$work/self.json" \
+        "$JQN"'{boot_id: $boot_id, run_state: ($run_state | n), main: ($main[0] // null), codex: $codex,
+          self: $self[0], self_descends_from_main: $descends}' >"$work/processes.json"
+}
+
+process_checks() {
+    main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
+    state=$(jq -r '.run_state // ""' "$work/processes.json")
+    codex_count=$(jq -r '.codex | length' "$work/processes.json")
+    if [ -n "$main_pid" ]; then
+        pass main_process "pid $main_pid"
+    else
+        fail main_process "no process runs $START_BIN"
+    fi
+    run_state=$state
+    case $state in
+        running*)
+            if ! run_state_attempt >/dev/null; then
+                fail codex_child "the lifecycle state '$state' is not a valid running state: expected 'running <attempt>'"
+            elif [ "$codex_count" -eq 1 ]; then
+                pass codex_child "1 Codex process as a child of the main process"
+            elif [ "$codex_count" -gt 1 ]; then
+                fail codex_child "$codex_count Codex processes are children of the main process, expected one"
+            else
+                fail codex_child "state is $state but the main process has no Codex child"
+            fi
+            ;;
+        *) skip codex_child "jackin-start state is '${state:-unknown}', not running" ;;
+    esac
+}
+
+ensure_codex_exec() {
+    [ -f "$work/codex_exec.json" ] && return 0
+    launch_kind=none
+    why="the sandbox holds no credential"
+    cred_path="$CODEX_HOME_DIR/auth.json"
+    unsafe=
+    if [ -e "$cred_path" ] || [ -L "$cred_path" ]; then
+        kinds=$(token_kinds "$cred_path") || kinds="other other other"
+        case $kinds in
+            *other*) unsafe=1 ;;
+        esac
+    fi
+    login_ready=0
+    api_ready=0
+    has_other=0
+    inspection_unavailable=
+    env_inventory=$(
+        exec 3>&1
+        {
+            producer_status=0
+            env -0 3>&- 2>/dev/null || producer_status=$?
+            printf '!P\t%s\n' "$producer_status" >&3
+        } | {
+            classifier_status=0
+            classified=$(credential_variables codex_exec 3>&- 2>/dev/null) || classifier_status=$?
+            if [ -n "$classified" ]; then
+                printf '%s\n' "$classified" >&3
+            fi
+            printf '!C\t%s\n' "$classifier_status" >&3
+        }
+    )
+    inventory_summary=$(printf '%s\n' "$env_inventory" | LC_ALL=C awk -F '\t' '
+        $1 == "!P" {
+            if (NF != 2 || $2 !~ /^[0-9]+$/ || producer_seen++) invalid = 1
+            else producer_status = $2
+            next
+        }
+        $1 == "!C" {
+            if (NF != 2 || $2 !~ /^[0-9]+$/ || classifier_seen++) invalid = 1
+            else classifier_status = $2
+            next
+        }
+        NF != 3 || $1 !~ /^[A-Za-z_][A-Za-z0-9_]*$/ ||
+            ($2 != "empty" && $2 != "placeholder" && $2 != "other") || $3 != "codex_exec" {
+            invalid = 1
+            next
+        }
+        $2 == "other" { other = 1 }
+        $1 == "CODEX_AUTH_ACCESS_TOKEN" && $2 == "placeholder" { login = 1 }
+        $1 == "OPENAI_API_KEY" && $2 == "placeholder" { api = 1 }
+        END {
+            if (invalid || producer_seen != 1 || classifier_seen != 1) exit 2
+            printf "%d %d %d %s %s\n", login, api, other, producer_status, classifier_status
+        }
+    ' 2>/dev/null) || inspection_unavailable=1
+    if [ -z "$inspection_unavailable" ] && [ -n "$inventory_summary" ]; then
+        extra=
+        if read -r inventory_login_ready inventory_api_ready inventory_has_other producer_status classifier_status extra <<EOF
+$inventory_summary
+EOF
+        then
+            case "$inventory_login_ready:$inventory_api_ready:$inventory_has_other:${extra-}" in
+                [01]:[01]:[01]:)
+                    if [ "$producer_status" = 0 ] && [ "$classifier_status" = 0 ]; then
+                        login_ready=$inventory_login_ready
+                        api_ready=$inventory_api_ready
+                        has_other=$inventory_has_other
+                    else
+                        inspection_unavailable=1
+                    fi
+                    ;;
+                *) inspection_unavailable=1 ;;
+            esac
+        else
+            inspection_unavailable=1
+        fi
+    else
+        inspection_unavailable=1
+    fi
+    [ "$has_other" = 0 ] || unsafe=1
+    if [ -n "$unsafe" ]; then
+        why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
+    elif [ -n "$inspection_unavailable" ]; then
+        why="codex exec was not run: could not inspect inherited credentials"
+    elif [ "$login_ready" = 1 ]; then
+        launch_kind=chatgpt_login
+    elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
+        launch_kind=chatgpt_login
+    elif [ "$api_ready" = 1 ]; then
+        launch_kind=api_key
+    elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
+        launch_kind=api_key
+    fi
+    printf '%s' "$why" >"$work/codex_exec.why"
+    unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
+    unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
+    unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
+    unset _jks_stdout_parsed_answer _jks_stdout_extra
+    _jks_stdout_capture=
+    attempted=false
+    exit_code=
+    answered=false
+    bytes=0
+    if [ "$launch_kind" != none ]; then
+        attempted=true
+        if _jks_stdout_capture=$(
+            exec 3>&1 || exit 1
+            (
+                _jks_stdout_producer_status=0
+                if (cd "$SCAN_ROOT" && timeout --kill-after=5 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 3>&- 2>/dev/null </dev/null); then
+                    :
+                else
+                    _jks_stdout_producer_status=$?
+                fi
+                printf '!P\t%s\n' "$_jks_stdout_producer_status" >&3 || exit 1
+            ) | {
+                _jks_stdout_od_status=0
+                _jks_stdout_encoded=
+                if _jks_stdout_encoded=$(LC_ALL=C timeout --kill-after=5 240 od -An -N65537 -v -tx1 3>&- 2>/dev/null); then
+                    :
+                else
+                    _jks_stdout_od_status=$?
+                fi
+                _jks_stdout_drain_status=0
+                timeout --kill-after=5 30 cat >/dev/null 3>&- 2>/dev/null || _jks_stdout_drain_status=$?
+                if [ "$_jks_stdout_od_status" -ne 0 ] || [ "$_jks_stdout_drain_status" -ne 0 ]; then
+                    _jks_stdout_count_status=0
+                    _jks_stdout_encoded_bytes=
+                    if _jks_stdout_encoded_bytes=$(printf '%s' "$_jks_stdout_encoded" | LC_ALL=C awk '
+                        function valid_hex(value) {
+                            return length(value) == 2 && value ~ /^[[:xdigit:]][[:xdigit:]]$/
+                        }
+                        {
+                            line = $0
+                            sub(/^[[:space:]]+/, "", line)
+                            sub(/[[:space:]]+$/, "", line)
+                            if (line == "") next
+                            token_count = split(line, tokens, /[[:space:]]+/)
+                            for (i = 1; i <= token_count; i++) {
+                                if (valid_hex(tokens[i])) bytes++
+                                else invalid = 1
+                            }
+                        }
+                        END {
+                            if (invalid || bytes > 65537) exit 1
+                            printf "%d\n", bytes
+                        }
+                    ' 3>&- 2>/dev/null); then
+                        :
+                    else
+                        _jks_stdout_count_status=$?
+                    fi
+                    if [ "$_jks_stdout_count_status" -ne 0 ]; then
+                        unset _jks_stdout_encoded _jks_stdout_encoded_bytes _jks_stdout_count_status
+                        unset _jks_stdout_od_status _jks_stdout_drain_status
+                        exit 1
+                    fi
+                    unset _jks_stdout_encoded
+                    if ! printf '!E\t%s\t%s\t%s\n' "$_jks_stdout_od_status" "$_jks_stdout_drain_status" "$_jks_stdout_encoded_bytes" >&3; then
+                        unset _jks_stdout_encoded_bytes _jks_stdout_count_status
+                        unset _jks_stdout_od_status _jks_stdout_drain_status
+                        exit 1
+                    fi
+                    unset _jks_stdout_encoded_bytes _jks_stdout_count_status
+                    unset _jks_stdout_od_status _jks_stdout_drain_status
+                    exit 1
+                fi
+                if ! printf '!H\n%s\n!O\t%s\n!D\t%s\n' "$_jks_stdout_encoded" "$_jks_stdout_od_status" "$_jks_stdout_drain_status" >&3; then
+                    unset _jks_stdout_encoded _jks_stdout_od_status _jks_stdout_drain_status
+                    exit 1
+                fi
+                unset _jks_stdout_encoded _jks_stdout_od_status _jks_stdout_drain_status
+            }
+        ); then
+            _jks_stdout_capture_status=0
+        else
+            _jks_stdout_capture_status=$?
+        fi
+        _jks_stdout_parse_status=0
+        _jks_stdout_parsed=
+        if _jks_stdout_parsed=$(printf '%s' "$_jks_stdout_capture" | LC_ALL=C awk -v capture_status="$_jks_stdout_capture_status" '
+            function valid_status(value) {
+                if (value !~ /^[0-9]+$/ || length(value) > 3) return 0
+                if (length(value) > 1 && substr(value, 1, 1) == "0") return 0
+                return value + 0 <= 255
+            }
+            function valid_count(value) {
+                if (value !~ /^[0-9]+$/ || length(value) > 5) return 0
+                if (length(value) > 1 && substr(value, 1, 1) == "0") return 0
+                return value + 0 <= 65537
+            }
+            function status_value(line, tag, value) {
+                if (index(line, tag "\t") != 1) return ""
+                value = substr(line, length(tag) + 2)
+                if (!valid_status(value)) return ""
+                return value
+            }
+            function response_space(value) {
+                return value == "20" || value == "09" || value == "0a" || value == "0d" || value == "0b" || value == "0c"
+            }
+            function response_byte(value) {
+                if (response_bad) return
+                if (response_state == 0) {
+                    if (response_space(value)) return
+                    if (value == "72") response_state = 1
+                    else response_bad = 1
+                    return
+                }
+                if (response_state == 1 && value == "65") response_state = 2
+                else if (response_state == 2 && value == "61") response_state = 3
+                else if (response_state == 3 && value == "64") response_state = 4
+                else if (response_state == 4 && value == "79") {
+                    response_state = 5
+                    ready_found = 1
+                } else if (response_state == 5 && response_space(value)) response_state = 6
+                else if (response_state == 6 && response_space(value)) return
+                else response_bad = 1
+            }
+            function parse_hex_line(line, trimmed, token_count, tokens, i) {
+                trimmed = line
+                sub(/^[[:space:]]+/, "", trimmed)
+                sub(/[[:space:]]+$/, "", trimmed)
+                if (trimmed == "") return 1
+                token_count = split(trimmed, tokens, /[[:space:]]+/)
+                for (i = 1; i <= token_count; i++) {
+                    if (length(tokens[i]) != 2 || tokens[i] !~ /^[[:xdigit:]][[:xdigit:]]$/) {
+                        grammar_bad = 1
+                        return 0
+                    }
+                    byte_count++
+                    if (byte_count > 65537) grammar_bad = 1
+                    response_byte(tolower(tokens[i]))
+                }
+                return 1
+            }
+            function parse_success_record(line, producer_value, od_value, drain_value) {
+                if (state == 0) {
+                    producer_value = status_value(line, "!P")
+                    if (producer_value == "") grammar_bad = 1
+                    state = 1
+                    return
+                }
+                if (state == 1) {
+                    if (line != "!H") grammar_bad = 1
+                    state = 2
+                    return
+                }
+                if (state == 2) {
+                    od_value = status_value(line, "!O")
+                    if (od_value != "") {
+                        od_status = od_value
+                        state = 3
+                    } else {
+                        parse_hex_line(line)
+                    }
+                    return
+                }
+                if (state == 3) {
+                    drain_value = status_value(line, "!D")
+                    if (drain_value == "") grammar_bad = 1
+                    else {
+                        drain_status = drain_value
+                        state = 4
+                    }
+                    return
+                }
+                grammar_bad = 1
+            }
+            {
+                line = $0
+                records[NR] = line
+                if (line == "!P" || index(line, "!P\t") == 1) {
+                    record_kind[NR] = "P"
+                    producer_records++
+                    producer_value = status_value(line, "!P")
+                    if (producer_value != "") {
+                        producer_valid_seen++
+                        producer_valid_status = producer_value
+                    }
+                } else if (line == "!E" || index(line, "!E\t") == 1) {
+                    record_kind[NR] = "E"
+                    error_records++
+                    error_fields = split(line, error_parts, "\t")
+                    if (error_fields != 4 || line != "!E\t" error_parts[2] "\t" error_parts[3] "\t" error_parts[4] ||
+                        !valid_status(error_parts[2]) || !valid_status(error_parts[3]) || !valid_count(error_parts[4]) ||
+                        (error_parts[2] + 0 == 0 && error_parts[3] + 0 == 0)) {
+                        error_bad = 1
+                    } else {
+                        error_bytes = error_parts[4] + 0
+                    }
+                } else {
+                    record_kind[NR] = "unknown"
+                }
+            }
+            END {
+                producer_code = "null"
+                output_bytes = 0
+                answer = 0
+                if (producer_records == 1 && producer_valid_seen == 1) producer_code = producer_valid_status
+                if (error_records > 0) {
+                    error_frame_bad = error_bad || capture_status == 0 || error_records != 1 || producer_records > 1
+                    for (i = 1; i <= NR; i++) {
+                        if (record_kind[i] != "P" && record_kind[i] != "E") error_frame_bad = 1
+                    }
+                    if (!error_frame_bad) output_bytes = error_bytes
+                } else {
+                    for (i = 1; i <= NR; i++) parse_success_record(records[i])
+                    if (state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1) output_bytes = byte_count
+                    if (capture_status == 0 && state == 4 && !grammar_bad && producer_records == 1 && producer_valid_seen == 1 && producer_code == 0 && od_status == 0 && drain_status == 0 && byte_count <= 65536 && ready_found && !response_bad && (response_state == 5 || response_state == 6)) answer = 1
+                }
+                printf "%s %d %d\n", producer_code, output_bytes, answer
+            }
+        ' 3>&- 2>/dev/null); then
+            _jks_stdout_parse_status=0
+        else
+            _jks_stdout_parse_status=$?
+        fi
+        unset _jks_stdout_capture _jks_stdout_capture_status
+        if [ "$_jks_stdout_parse_status" -eq 0 ]; then
+            _jks_stdout_extra=
+            if IFS=' ' read -r _jks_stdout_parsed_exit _jks_stdout_parsed_bytes _jks_stdout_parsed_answer _jks_stdout_extra <<EOF
+$_jks_stdout_parsed
+EOF
+            then
+                case "$_jks_stdout_parsed_exit" in
+                    null) exit_code= ;;
+                    '' | *[!0-9]*) exit_code= ;;
+                    *)
+                        if [ "$_jks_stdout_parsed_exit" -le 255 ]; then
+                            exit_code=$_jks_stdout_parsed_exit
+                        fi
+                        ;;
+                esac
+                case "$_jks_stdout_parsed_bytes" in
+                    '' | *[!0-9]*) bytes=0 ;;
+                    *)
+                        if [ "$_jks_stdout_parsed_bytes" -le 65537 ]; then
+                            bytes=$_jks_stdout_parsed_bytes
+                        fi
+                        ;;
+                esac
+                if [ "$_jks_stdout_parsed_answer" = 1 ] && [ -z "$_jks_stdout_extra" ]; then
+                    answered=true
+                fi
+            fi
+        fi
+    fi
+    unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
+    unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
+    unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
+    unset _jks_stdout_parsed_answer _jks_stdout_extra
+    jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
+        --argjson answered "$answered" --argjson bytes "$bytes" \
+        "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
+          answered: $answered, output_bytes: $bytes}' >"$work/codex_exec.json"
+}
+
+egress() {
+    url=$1
+    bearer=${2-}
+    body=${3-/dev/null}
+    if ! have curl; then
+        jq -cn --arg url "$url" '{url: $url, curl_found: false, curl_exit: null, http_code: 0}'
+        return 0
+    fi
+    if [ -n "$bearer" ]; then
+        printf 'Authorization: Bearer %s\n' "$bearer" >"$work/header"
+        code=$(curl -q -sS --noproxy '*' -o "$body" --max-filesize 65536 -w '%{http_code}' --connect-timeout 5 --max-time 15 -H "@$work/header" "$url" 2>/dev/null </dev/null)
+        rc=$?
+    else
+        code=$(curl -q -sS --noproxy '*' -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 15 "$url" 2>/dev/null </dev/null)
+        rc=$?
+    fi
+    jq -cn --arg url "$url" --argjson rc "$rc" --arg code "${code:-000}" \
+        '{url: $url, curl_found: true, curl_exit: $rc, http_code: ($code | tonumber)}'
+}
+
+egress_outcome() {
+    printf '%s' "$1" | jq -r '
+        if .curl_found != true then "curl_missing"
+        elif .http_code != 0 then "answered"
+        elif .curl_exit == 7 then "refused"
+        elif .curl_exit == 6 then "unresolved"
+        else "failed" end'
+}
+
+egress_fault() {
+    case $(egress_outcome "$2") in
+        curl_missing) echo "curl is not installed, so the probe cannot test $1" ;;
+        answered) echo "$1 answered HTTP $(printf '%s' "$2" | jq -r '.http_code')" ;;
+        unresolved) echo "$1 did not resolve (curl exit 6): a resolver fault is not a policy denial" ;;
+        *) echo "$1 gave curl exit $(printf '%s' "$2" | jq -r '.curl_exit') and no HTTP response: not a policy denial" ;;
+    esac
+}
+
+provider_saw_only() {
+    head -c 65536 "$2" 2>/dev/null | jq -e --arg p "$1" '
+        def shown: if ($p | length) > 12 then $p[0:8] + ([range(($p | length) - 12)] | map("*") | join("")) + $p[-4:] else $p end;
+        .error.code == "invalid_api_key"
+        and (.error.message | type == "string")
+        and (.error.message as $m | [shown, $p] | any(. as $s | $m | startswith("Incorrect API key provided: " + $s + ". ")))' >/dev/null 2>&1
+}
+
+denial_check() {
+    if [ "$(egress_outcome "$3")" = refused ]; then
+        pass "$1" "$2 refused the connection (curl exit 7, no HTTP response)"
+    else
+        fail "$1" "$(egress_fault "$2" "$3")"
+    fi
+}
+
+proxy_variables() {
+    env | awk -F= '$1 ~ /^[A-Za-z_][A-Za-z0-9_]*_(PROXY|proxy)$/ { print $1 }'
+}
+
+token_kinds() {
+    jq -r --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+        def kind($v; $jwt):
+            if $v == null then "absent"
+            elif $v == "" then "empty"
+            elif $jwt then (if $v == $id_token then "placeholder" else "other" end)
+            elif ($v | type == "string" and test($re + "\\z")) then "placeholder"
+            else "other" end;
+        def worst:
+            if any(. == "other") then "other"
+            elif any(. == "placeholder") then "placeholder"
+            elif any(. == "empty") then "empty"
+            else "absent" end;
+        [([kind(.tokens.access_token; false), kind(.OPENAI_API_KEY; false)] | worst),
+         kind(.tokens.refresh_token; false),
+         kind(.tokens.id_token; true)] | @tsv' "$1"
+}
+
+credential_variables() {
+    jq -Rrs --arg source "$1" --arg re "$PLACEHOLDER_RE" '
+        def kind($value):
+            if $value == "" then "empty"
+            elif ($value | test($re + "\\z")) then "placeholder"
+            else "other" end;
+        split("\u0000")[]
+        | select(length > 0)
+        | (index("=")) as $separator
+        | select($separator != null)
+        | .[0:$separator] as $name
+        | .[($separator + 1):] as $value
+        | select($name | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+        | ($name | ascii_upcase) as $upper
+        | select($upper != "SSH_AUTH_SOCK" and ($upper | test("(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)")))
+        | [$name, kind($value), $source] | @tsv'
+}
+
+is_placeholder() {
+    jq -Rrse --arg re "$PLACEHOLDER_RE" 'test($re + "\\z")' >/dev/null 2>&1
+}
+
+scan_leaks() {
+    cat >"$work/scan-file.sh" <<'EOF'
+emit() {
+    jq -cn --arg kind "$1" --arg path "$2" --arg why "$3" '{kind: $kind, path: $path, why: $why}' ||
+        echo "the scan could not record a $1" >&2
+}
+listed() {
+    { timeout "$SCAN_GREP_SECONDS" grep -azoE -e "$1" "$3" || [ $? -eq 1 ] || printf 'SCAN_ERROR\0'; } |
+        jq -Rrs --arg safe "$2" '
+            split("\u0000") | map(select(. != ""))
+            | if any(.[]; . == "SCAN_ERROR") then "error"
+              elif any(.[]; (test($safe) | not)) then "hit"
+              else "none" end' 2>/dev/null || printf error
+}
+jwt_listed() {
+    { timeout "$SCAN_GREP_SECONDS" grep -aoE -e "$1" "$3" || [ $? -eq 1 ] || echo SCAN_ERROR; } |
+        jq -nrR --arg safe "$2" '
+            def b64: gsub("-"; "+") | gsub("_"; "/")
+                | (length % 4) as $m
+                | if $m == 2 then . + "==" elif $m == 3 then . + "=" elif $m == 1 then error("length") else . end
+                | @base64d;
+            def part($i): split(".")[$i] | b64 | fromjson;
+            def audience: if type == "string" then . == "chatgpt.com" elif type == "array" then . == ["chatgpt.com"] else false end;
+            def known_cookie:
+                (split(".")[2] | startswith("eyJ") | not)
+                and (part(0) | type == "object" and .kid == "oailb-v1")
+                and (part(1) | type == "object" and (keys | sort) == ["aud", "exp", "host", "iat", "iss"]
+                     and .iss == "edge-gateway" and (.aud | audience));
+            def verdict:
+                if . == "SCAN_ERROR" then "error"
+                elif test($safe) then "none"
+                else (try (if known_cookie then "none" else "hit" end) catch "hit")
+                end;
+            reduce (inputs | verdict) as $v ("none";
+                if . == "error" or $v == "error" then "error" elif . == "hit" or $v == "hit" then "hit" else "none" end)'
+}
+mode=$1
+shift
+for file; do
+    if [ "$mode" = oversize ]; then
+        emit unscanned "$file" "over the size cap"
+        continue
+    fi
+    if [ ! -r "$file" ]; then
+        emit unscanned "$file" unreadable
+        continue
+    fi
+    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" -e "$LEAK_JWT" -e "$LEAK_RT" "$file"
+    candidate=$?
+    if [ "$candidate" -eq 1 ]; then
+        timeout "$SCAN_GREP_SECONDS" grep -azqE -e "$LEAK_RT" "$file"
+        candidate=$?
+        if [ "$candidate" -eq 1 ]; then
+            continue
+        fi
+    fi
+    case $candidate in
+        0) ;;
+        124)
+            emit unscanned "$file" "grep timed out"
+            continue
+            ;;
+        *)
+            emit unscanned "$file" "grep failed"
+            continue
+            ;;
+    esac
+    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" "$file"
+    sk=$?
+    jwt=$(jwt_listed "$LEAK_JWT" "$LEAK_JWT_SAFE" "$file")
+    case $jwt in
+        none | hit) ;;
+        *) jwt=error ;;
+    esac
+    rt=$(listed "$LEAK_RT" "$LEAK_RT_SAFE" "$file")
+    if [ "$sk" -eq 0 ] || [ "$jwt" = hit ] || [ "$rt" = hit ]; then
+        emit leak "$file" "token-shaped string"
+    elif [ "$sk" -ge 2 ] || [ "$jwt" = error ] || [ "$rt" = error ]; then
+        emit unscanned "$file" "grep failed or timed out"
+    fi
+done
+exit 0
+EOF
+    env "SCAN_GREP_SECONDS=$SCAN_GREP_SECONDS" "LEAK_SK=$LEAK_SK" "LEAK_JWT=$LEAK_JWT" "LEAK_JWT_SAFE=$LEAK_JWT_SAFE" \
+        "LEAK_RT=$LEAK_RT" "LEAK_RT_SAFE=$LEAK_RT_SAFE" \
+        find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f \
+        \( -size +"${SCAN_MAX_KIB}k" -exec sh "$work/scan-file.sh" oversize {} + \
+        -o -exec sh "$work/scan-file.sh" scan {} + \) >"$work/scan.ndjson" 2>"$work/scan.err"
+    find_rc=$?
+    scan_result=$(jq -n --slurpfile found "$work/scan.ndjson" --rawfile err "$work/scan.err" --argjson rc "$find_rc" '
+        ($err | split("\n") | map(select(. != "") | sub("^find: "; ""))) as $e
+        | {leaks: ([$found[] | select(.kind == "leak") | .path] | .[0:50]),
+           unscanned: ([$found[] | select(.kind == "unscanned") | "\(.path) (\(.why))"]
+                       + $e
+                       + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end)),
+           reasons: (([$found[] | select(.kind == "unscanned") | .why]
+                      + (if ($e | length) > 0 then ["find error"] else [] end)
+                      + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end)) | unique | join(", "))}') ||
+        scan_result='{"leaks": [], "unscanned": ["the scan output could not be read"], "reasons": "the scan output could not be read"}'
+}
+
+try_create() {
+    if LC_ALL=C sh -c 'set -C; : >"$1"' sh "$1" 2>"$work/create.err"; then
+        return 0
+    fi
+    if grep -Fq 'Permission denied' "$work/create.err"; then
+        return 1
+    fi
+    return 2
+}
+
+step_J00() (
+    present=false
+    executable=false
+    version=
+    [ -e "$CODEX_BIN" ] && present=true
+    if [ -f "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]; then
+        executable=true
+    fi
+    if [ "$executable" = true ]; then
+        home=$(mktemp -d "$work/codexhome.XXXXXX")
+        if ! version=$(CODEX_HOME=$home timeout 30 "$CODEX_BIN" --version 2>/dev/null </dev/null); then
+            version=
+            fail codex_version "codex --version failed"
+        elif [ -z "$version" ]; then
+            fail codex_version "codex --version printed nothing"
+        else
+            pass codex_version "$version"
+        fi
+    else
+        fail codex_binary "$CODEX_BIN is not an executable file"
+    fi
+    jq -n --arg path "$CODEX_BIN" --argjson present "$present" --argjson executable "$executable" --arg version "$version" \
+        "$JQN"'{codex: {path: $path, present: $present, executable: $executable, version: ($version | n)}}' >"$work/facts"
+)
+
+step_J04() (
+    user=$(id -un)
+    uid=$(id -u)
+    gid=$(id -g)
+    home=${HOME-}
+    sudo_found=false
+    sudo_works=false
+    docker_binary=false
+    if have sudo; then
+        sudo_found=true
+        if timeout 5 sudo -n true >/dev/null 2>&1 </dev/null || timeout 5 sudo -n -l >/dev/null 2>&1 </dev/null; then
+            sudo_works=true
+        fi
+    fi
+    if have docker; then
+        docker_binary=true
+    fi
+    if [ "$user" = sandbox ] && [ "$uid" = 1000 ] && [ "$gid" = 1000 ]; then
+        pass identity "$user uid=$uid gid=$gid"
+    else
+        fail identity "expected sandbox uid=1000 gid=1000, found $user uid=$uid gid=$gid"
+    fi
+    if [ "$sudo_works" = false ]; then
+        pass sudo "sudo found=$sudo_found works=false"
+    else
+        fail sudo "sudo works"
+    fi
+    if [ "$docker_binary" = true ] && [ "$docker" = off ]; then
+        fail docker_binary "a docker binary exists but the Docker capability is off"
+    elif [ "$docker_binary" = false ] && [ "$docker" = on ]; then
+        fail docker_binary "no docker binary but the Docker capability is on"
+    else
+        pass docker_binary "found=$docker_binary with the capability $docker"
+    fi
+    jq -n --arg user "$user" --argjson uid "$uid" --argjson gid "$gid" --arg home "$home" \
+        --argjson sudo_found "$sudo_found" --argjson sudo_works "$sudo_works" --argjson docker_binary "$docker_binary" \
+        '{user: $user, uid: $uid, gid: $gid, home: $home, sudo: {found: $sudo_found, works: $sudo_works}, docker_binary: $docker_binary}' >"$work/facts"
+)
+
+step_J05() (
+    git_work_tree=false
+    files='[]'
+    sums_rc=0
+    if [ -d "$PROJECT" ]; then
+        pass project_dir "$PROJECT"
+        if in_work_tree; then
+            git_work_tree=true
+        fi
+        (cd "$PROJECT" && find . -path ./.git -prune -o -type f -exec sha256sum --zero {} +) >"$work/sums" 2>"$work/sums.err"
+        sums_rc=$?
+        files=$(jq -Rs '[split("\u0000")[] | select(. != "") | {sha256: .[0:64], path: (.[66:] | ltrimstr("./"))}] | sort_by(.path)' "$work/sums") || files='[]'
+    else
+        fail project_dir "$PROJECT is missing"
+    fi
+    if [ "$git_work_tree" = true ]; then
+        pass git_work_tree "$PROJECT"
+    else
+        fail git_work_tree "$PROJECT is not a git work tree"
+    fi
+    total=$(printf '%s' "$files" | jq 'length')
+    if [ "$sums_rc" -ne 0 ]; then
+        fail files "$total files hashed, but some could not be read: $(head -n 3 "$work/sums.err" | tr '\n' ';')"
+    elif [ "$total" -gt 0 ]; then
+        pass files "$total files"
+    else
+        fail files "the project holds no file"
+    fi
+    jq -n --arg project "$PROJECT" --argjson tree "$git_work_tree" --argjson files "$files" \
+        '{project: $project, git_work_tree: $tree, files: $files}' >"$work/facts"
+)
+
+step_J06() (
+    setup_runs=$(count_lines "$STATE_DIR/setup.log")
+    preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
+    preflight_failures=$(count_matches '^preflight fail' "$STATE_DIR/preflight.log")
+    : >"$work/hooks.ndjson"
+    exposed=
+    for name in setup preflight; do
+        path=$HOOK_DIR/$name
+        symlinked=false
+        [ -L "$path" ] && symlinked=true
+        physical=$(physical_path "$path") || physical=
+        meta_path=${physical:-$path}
+        meta=$(file_meta "$meta_path") || meta="65534 000"
+        read -r uid mode <<EOF
+$meta
+EOF
+        writable=false
+        physical_top=$(
+            unset CDPATH
+            cd -P "$HOOK_TOP" 2>/dev/null && pwd -P
+        ) || physical_top=$HOOK_TOP
+        if { [ -n "$physical" ] && path_or_ancestor_writable "$physical" "$physical_top"; } || path_or_ancestor_writable "$path" "$HOOK_TOP"; then
+            writable=true
+        fi
+        if [ ! -e "$path" ] || [ "$symlinked" = true ] || [ "$writable" = true ] || [ "$uid" != 0 ]; then
+            exposed="$exposed $name"
+        fi
+        jq -cn --arg name "$name" --arg path "$path" --argjson uid "$uid" --arg mode "$mode" --argjson writable "$writable" \
+            '{name: $name, path: $path, uid: $uid, mode: $mode, writable: $writable}' >>"$work/hooks.ndjson"
+    done
+    if [ "$setup_runs" = 1 ]; then
+        pass setup_runs "setup ran once"
+    else
+        fail setup_runs "setup ran $setup_runs times, expected once"
+    fi
+    if [ "$preflight_runs" -ge 1 ]; then
+        pass preflight_runs "preflight ran $preflight_runs times, $preflight_failures failed"
+    else
+        fail preflight_runs "preflight never ran"
+    fi
+    if [ -z "$exposed" ]; then
+        pass hooks_immutable "both hooks are root-owned, not symlinked, and not writable"
+    else
+        fail hooks_immutable "missing, symlinked, not root-owned or writable:$exposed"
+    fi
+    jq -n --arg state_dir "$STATE_DIR" --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
+        --argjson failures "$preflight_failures" --slurpfile hooks "$work/hooks.ndjson" \
+        '{state_dir: $state_dir, setup_runs: $setup, preflight_runs: $preflight, preflight_failures: $failures, hooks: $hooks}' >"$work/facts"
+)
+
+step_J07() (
+    collect_processes
+    ensure_codex_exec
+    process_checks
+    attempted=$(jq -r '.attempted' "$work/codex_exec.json")
+    if [ "$attempted" = true ]; then
+        if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
+            pass codex_exec "codex exec answered the fixed prompt"
+        else
+            fail codex_exec "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
+        fi
+    else
+        skip codex_exec "$(cat "$work/codex_exec.why")"
+    fi
+    jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/codex_exec.json" \
+        '{processes: $p[0], codex_exec: $x[0]}' >"$work/facts"
+)
+
+agent_env() {
+    [ -n "$3" ] || {
+        : >"$2"
+        echo absent
+        return 0
+    }
+    state=$(environ_state "$3")
+    if [ "$state" = read ]; then
+        fifo="$work/proc-env.$1.$3"
+        parsed="$work/proc-env.$1.$3.tsv"
+        rm -f "$fifo" "$parsed"
+        if ! mkfifo "$fifo" 2>/dev/null; then
+            : >"$2"
+            echo denied
+            return 0
+        fi
+        proc_environ "$3" >"$fifo" 2>/dev/null &
+        producer=$!
+        filter_status=0
+        if ! credential_variables "$1" <"$fifo" >"$parsed" 2>/dev/null; then
+            filter_status=1
+        fi
+        producer_status=0
+        wait "$producer" || producer_status=1
+        rm -f "$fifo"
+        if [ "$filter_status" -eq 0 ] && [ "$producer_status" -eq 0 ] && mv "$parsed" "$2" 2>/dev/null; then
+            echo read
+            return 0
+        fi
+        rm -f "$parsed"
+        : >"$2"
+        echo denied
+        return 0
+    fi
+    : >"$2"
+    echo "$state"
+}
+
+record_parse() {
+    LC_ALL=C awk '
+        function bad() { failed = 1; exit 1 }
+        NR == 1 { if ($0 != "jackin-env-kinds 1") bad(); next }
+        NR == 2 {
+            if ($0 !~ /^attempt (0|[1-9][0-9]*)$/) bad()
+            split($0, parts, " ")
+            if (length(parts[2]) > 18) bad()
+            print "attempt\t" parts[2]
+            next
+        }
+        {
+            if ($0 !~ /^(main|codex) [A-Za-z_][A-Za-z0-9_]* (placeholder|empty|other)$/) bad()
+            split($0, parts, " ")
+            if (parts[1] == "main" && seen_codex) bad()
+            if (parts[1] == "codex") seen_codex = 1
+            key = parts[1] " " parts[2]
+            if (key in used) bad()
+            used[key] = 1
+            print parts[1] "\t" parts[2] "\t" parts[3]
+        }
+        END { if (!failed && NR < 2) exit 1 }'
+}
+
+record_load() {
+    : >"$work/record.tsv"
+    record_state=absent
+    record_attempt=
+    if [ -L "$RECORD_FILE" ]; then
+        record_state=malformed
+        return 0
+    fi
+    [ -e "$RECORD_FILE" ] || return 0
+    if [ ! -f "$RECORD_FILE" ]; then
+        record_state=malformed
+        return 0
+    fi
+    if ! head -c $((RECORD_MAX + 1)) "$RECORD_FILE" >"$work/record.raw" 2>/dev/null; then
+        record_state=unreadable
+        return 0
+    fi
+    size=$(wc -c <"$work/record.raw" | tr -d ' ')
+    nuls=$(tr -cd '\000' <"$work/record.raw" | wc -c | tr -d ' ')
+    if [ "$size" -gt "$RECORD_MAX" ] || [ "$nuls" -ne 0 ]; then
+        record_state=malformed
+        return 0
+    fi
+    if record_parse <"$work/record.raw" >"$work/record.tsv"; then
+        record_state="read"
+        record_attempt=$(awk -F'\t' '$1 == "attempt" { print $2 }' "$work/record.tsv")
+    else
+        : >"$work/record.tsv"
+        record_state=malformed
+    fi
+}
+
+run_state_attempt() {
+    case $run_state in
+        waiting) echo 0 ;;
+        'running '*)
+            n=${run_state#running }
+            case $n in
+                '' | 0* | *[!0-9]*) return 1 ;;
+            esac
+            [ "${#n}" -le 18 ] || return 1
+            echo "$n"
+            ;;
+        'exited '*)
+            rest=${run_state#exited }
+            case $rest in
+                *' '*)
+                    n=${rest%% *}
+                    status=${rest#* }
+                    ;;
+                *) return 1 ;;
+            esac
+            case $n in
+                '' | 0* | *[!0-9]*) return 1 ;;
+            esac
+            case $status in
+                0) ;;
+                '' | 0* | *[!0-9]*) return 1 ;;
+            esac
+            [ "${#n}" -le 18 ] && [ "${#status}" -le 3 ] && [ "$status" -le 255 ] || return 1
+            echo "$n"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+record_rows() {
+    awk -F'\t' -v env="$1" '$1 == env { print $2 "\t" $3 "\t" env }' "$work/record.tsv"
+}
+
+settle() {
+    record_rows "$1" | sort -u >"$work/rec.$1.tsv"
+    settled=$2
+    if [ "$2" = read ]; then
+        sort -u "$work/live.$1.tsv" >"$work/eff.$1.tsv"
+        read_from="$read_from, the $1 environment (/proc)"
+        if [ "$3" -eq 1 ] && ! cmp -s "$work/eff.$1.tsv" "$work/rec.$1.tsv"; then
+            disagree="${disagree:+$disagree, }$1"
+        fi
+    elif [ "$3" -eq 1 ]; then
+        cp "$work/rec.$1.tsv" "$work/eff.$1.tsv"
+        read_from="$read_from, the $1 environment (record)"
+        settled=record
+    else
+        : >"$work/eff.$1.tsv"
+        unread_from="${unread_from:+$unread_from; }the $1 environment ($2, no fresh record)"
+    fi
+    cat "$work/eff.$1.tsv" >>"$work/variables.tsv"
+}
+
+step_J08() (
+    : >"$work/variables.tsv"
+    main_pid=
+    codex_pids=
+    codex_children=0
+    if collect_processes 2>/dev/null; then
+        main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
+        codex_pids=$(jq -r '.codex[].pid' "$work/processes.json")
+        codex_children=$(jq -r '.codex | length' "$work/processes.json")
+    fi
+    env -0 | credential_variables probe >>"$work/variables.tsv"
+    launch_files=0
+    for file in "$JACKIN_DIR"/env-*; do
+        [ -f "$file" ] || continue
+        launch_files=$((launch_files + 1))
+        sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$file" 2>/dev/null |
+            awk '{ printf "%s%c", $0, 0 }' | credential_variables launch_env >>"$work/variables.tsv"
+    done
+    read_from="the probe environment, $launch_files launch env file(s)"
+    unread_from=
+    scan_leaks
+    leaks=$(printf '%s' "$scan_result" | jq -c '.leaks')
+    unscanned=$(printf '%s' "$scan_result" | jq -r '.unscanned | length')
+    if [ "$unscanned" -gt 0 ]; then
+        unscanned_text="$unscanned paths under $SCAN_ROOT not scanned ($(printf '%s' "$scan_result" | jq -r '.reasons')): $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
+        unread_from="${unread_from:+$unread_from; }$unscanned_text"
+    fi
+    record_load
+    state_attempt=$(run_state_attempt) || state_attempt=
+    if [ "$record_state" = read ] && [ "$record_attempt" != "$state_attempt" ]; then
+        record_state=stale
+    fi
+    main_known=0
+    codex_known=0
+    if [ "$record_state" = read ]; then
+        main_known=1
+        codex_lines=$(awk -F'\t' '$1 == "codex"' "$work/record.tsv" | wc -l | tr -d ' ')
+        if [ "$record_attempt" -ge 1 ]; then
+            case $run_state in
+                'exited '*' 65') [ "$codex_lines" -eq 0 ] || codex_known=1 ;;
+                *) codex_known=1 ;;
+            esac
+        fi
+    fi
+    main_env=$(agent_env main "$work/live.main.tsv" "$main_pid")
+    codex_env=absent
+    codex_read_failed=0
+    codex_read_count=0
+    codex_fail_count=0
+    : >"$work/live.codex.tsv"
+    for pid in $codex_pids; do
+        child_env=$(agent_env codex "$work/live.codex.$pid.tsv" "$pid")
+        if [ "$child_env" = read ]; then
+            codex_read_count=$((codex_read_count + 1))
+            cat "$work/live.codex.$pid.tsv" >>"$work/live.codex.tsv"
+        else
+            codex_read_failed=1
+            codex_fail_count=$((codex_fail_count + 1))
+        fi
+    done
+    if [ "$codex_read_count" -gt 0 ]; then
+        codex_env='read'
+    elif [ "$codex_read_failed" -eq 1 ]; then
+        codex_env=denied
+    fi
+    codex_read_label="$codex_read_count child environments"
+    codex_fail_label="$codex_fail_count child environments"
+    [ "$codex_read_count" -eq 1 ] && codex_read_label='1 child environment'
+    [ "$codex_fail_count" -eq 1 ] && codex_fail_label='1 child environment'
+    if [ "$codex_fail_count" -gt 0 ] && [ "$codex_known" -ne 1 ]; then
+        unread_from="${unread_from:+$unread_from; }$codex_fail_count Codex child environment(s) could not be read"
+    fi
+    disagree=
+    settle main "$main_env" "$main_known"
+    main_env=$settled
+    settle codex "$codex_env" "$codex_known"
+    codex_env=$settled
+    if [ "$codex_read_count" -gt 0 ] && [ "$codex_fail_count" -gt 0 ] && [ "$codex_known" -eq 1 ]; then
+        cat "$work/rec.codex.tsv" >>"$work/variables.tsv"
+        read_from="$read_from, the fresh aggregate Codex record"
+    fi
+    sort -u -o "$work/variables.tsv" "$work/variables.tsv"
+    environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
+    others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | unique | join(" ")')
+    placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder")] | length')
+    scope="checked: $read_from, $CODEX_HOME_DIR/auth.json, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
+    auth_file=null
+    auth_problem=
+    auth_placeholders=0
+    auth="$CODEX_HOME_DIR/auth.json"
+    if [ -f "$auth" ]; then
+        kinds=$(token_kinds "$auth") || kinds=
+        read -r access refresh idt <<EOF
+$kinds
+EOF
+        meta=$(file_meta "$auth") || meta="65534 000"
+        read -r _ mode <<EOF
+$meta
+EOF
+        auth_file=$(jq -n --arg path "$auth" --arg mode "$mode" --arg a "${access:-other}" --arg r "${refresh:-other}" --arg i "${idt:-other}" \
+            '{path: $path, mode: $mode, access_token: $a, refresh_token: $r, id_token: $i}')
+        for kind in "${access:-other}" "${refresh:-other}" "${idt:-other}"; do
+            [ "$kind" = other ] && auth_problem=1
+            [ "$kind" = placeholder ] && auth_placeholders=$((auth_placeholders + 1))
+        done
+    fi
+    if [ "$placeholders" -eq 0 ] && [ "$auth_placeholders" -eq 0 ]; then
+        skip credential "the sandbox holds no credential placeholder ($scope)"
+    else
+        pass credential "$placeholders placeholder variables, $auth_placeholders placeholder tokens in auth.json ($scope)"
+    fi
+    if [ "$record_state" = malformed ]; then
+        fail environment "malformed start record"
+    elif [ -n "$others" ]; then
+        detail="not a placeholder: $others"
+        if [ "$codex_children" -gt 1 ]; then
+            detail="$detail; $codex_children Codex processes, read $codex_read_label"
+            if [ "$codex_fail_count" -gt 0 ]; then
+                if [ "$codex_known" -eq 1 ]; then
+                    detail="$detail; $codex_fail_label unread; the fresh aggregate Codex record is retained"
+                else
+                    detail="$detail; $codex_fail_label unread"
+                fi
+            fi
+        fi
+        fail environment "$detail${disagree:+ (/proc and the start record disagree for: $disagree)}"
+    elif [ "$codex_children" -gt 1 ]; then
+        detail="$codex_children Codex processes are children of the main process; read $codex_read_label"
+        if [ "$codex_fail_count" -gt 0 ]; then
+            detail="$detail; $codex_fail_label could not be read"
+            if [ "$codex_known" -eq 1 ]; then
+                detail="$detail; the fresh aggregate Codex record is retained"
+            fi
+        fi
+        fail environment "$detail"
+    elif [ "$record_state" != read ]; then
+        case $record_state in
+            absent) skip environment "no start record at $RECORD_FILE; the environments are unknown, never clean" ;;
+            unreadable) skip environment "the start record at $RECORD_FILE cannot be read" ;;
+            *) skip environment "the start record is stale (record attempt $record_attempt, run state '${run_state:-absent}')" ;;
+        esac
+    elif [ "$codex_known" -ne 1 ]; then
+        skip environment "the Codex environment is not known: the record at attempt $record_attempt holds no Codex environment"
+    else
+        pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
+    fi
+    if [ -f "$auth" ]; then
+        if [ -z "$auth_problem" ]; then
+            pass auth_file "auth.json holds only placeholders and empty values"
+        else
+            fail auth_file "auth.json holds a token that is not a placeholder"
+        fi
+    elif [ -e "$auth" ] || [ -L "$auth" ]; then
+        fail auth_file "$auth exists but is not a regular file, so the probe did not examine its tokens"
+    else
+        skip auth_file "no auth.json at $auth, so there is no file to examine"
+    fi
+    if [ "$leaks" != '[]' ]; then
+        fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
+    elif [ "$unscanned" -gt 0 ]; then
+        skip file_scan "$unscanned_text"
+    else
+        pass file_scan "no token-shaped string outside the project"
+    fi
+    case $record_state in
+        read | stale) attempt_fact=$record_attempt ;;
+        *) attempt_fact=null ;;
+    esac
+    jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
+        --arg main_env "$main_env" --arg codex_env "$codex_env" \
+        --arg record_state "$record_state" --argjson record_attempt "$attempt_fact" \
+        '{environment: $environment, agent_environment: {main: $main_env, codex: $codex_env},
+          start_record: {state: $record_state, attempt: $record_attempt},
+          auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
+)
+
+step_J09() (
+    ensure_codex_exec
+    outside=$(egress https://example.com)
+    metadata=$(egress http://169.254.169.254/latest/meta-data/)
+    proxies=$(proxy_variables | tr '\n' ' ' | sed 's/ $//')
+    bearer=
+    if [ "${CODEX_AUTH_ACCESS_TOKEN-}" != "" ]; then
+        bearer=$CODEX_AUTH_ACCESS_TOKEN
+    elif [ "${OPENAI_API_KEY-}" != "" ]; then
+        bearer=$OPENAI_API_KEY
+    fi
+    if [ -z "$bearer" ] && [ -f "$CODEX_HOME_DIR/auth.json" ]; then
+        bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
+    fi
+    provider=null
+    if [ -n "$bearer" ] && printf '%s' "$bearer" | is_placeholder; then
+        : >"$work/provider.body"
+        provider=$(egress https://api.openai.com/v1/models "$bearer" "$work/provider.body")
+    fi
+    if [ "$(jq -r '.attempted' "$work/codex_exec.json")" = true ]; then
+        if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
+            pass codex_reaches_api "codex exec answered"
+        else
+            fail codex_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
+        fi
+    else
+        skip codex_reaches_api "$(cat "$work/codex_exec.why")"
+    fi
+    if [ -n "$proxies" ]; then
+        fail outside_host_denied "proxy variables are set: $proxies"
+        fail metadata_denied "proxy variables are set: $proxies"
+    else
+        denial_check outside_host_denied example.com "$outside"
+        denial_check metadata_denied 169.254.169.254 "$metadata"
+    fi
+    if [ "$provider" = null ]; then
+        skip provider_no_credential "no placeholder to send"
+    elif [ "$(egress_outcome "$provider")" = curl_missing ]; then
+        fail provider_no_credential "$(egress_fault api.openai.com "$provider")"
+    elif [ "$(egress_outcome "$provider")" = refused ]; then
+        pass provider_no_credential "api.openai.com refused the connection, so no credential was applied"
+    elif [ "$(egress_outcome "$provider")" != answered ]; then
+        fail provider_no_credential "api.openai.com gave no HTTP response, so the probe cannot show that no credential was applied"
+    else
+        code=$(printf '%s' "$provider" | jq -r '.http_code')
+        case $code in
+            2??) fail provider_no_credential "curl got HTTP $code from the provider host" ;;
+            401)
+                if provider_saw_only "$bearer" "$work/provider.body"; then
+                    pass provider_no_credential "HTTP 401: the provider named only the placeholder, so no credential was applied"
+                else
+                    fail provider_no_credential "HTTP 401 without the invalid-key answer for the placeholder: the provider may have seen another credential"
+                fi
+                ;;
+            *) fail provider_no_credential "curl got HTTP $code, not the 401 that shows the provider saw only the placeholder" ;;
+        esac
+    fi
+    rm -f "$work/provider.body"
+    jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/codex_exec.json" \
+        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, codex_exec: $x[0]}' >"$work/facts"
+)
+
+step_J10() (
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    : >"$work/writes.ndjson"
+    allowed_failed=
+    denied_created=
+    attributed=
+    for expected in allowed denied; do
+        if [ "$expected" = allowed ]; then
+            dirs=$J10_ALLOWED
+        else
+            dirs=$J10_DENIED
+        fi
+        for dir in $dirs; do
+            [ -d "$dir" ] || [ "$expected" = allowed ] || continue
+            path="$dir/jackin-sentinel-j10-$$"
+            dac=false
+            [ -w "$dir" ] && [ -x "$dir" ] && dac=true
+            created=false
+            if try_create "$path"; then
+                created=true
+                create_result=0
+            else
+                create_result=$?
+            fi
+            if [ "$created" = true ]; then
+                rm -f "$path"
+            fi
+            if [ "$expected" = allowed ] && [ "$created" = false ]; then
+                allowed_failed="$allowed_failed $dir"
+            fi
+            if [ "$expected" = denied ] && [ "$created" = true ]; then
+                denied_created="$denied_created $dir"
+            fi
+            if [ "$expected" = denied ] && [ "$created" = false ] && [ "$dac" = true ] && [ "$create_result" -eq 1 ]; then
+                attributed="$attributed $dir"
+            fi
+            jq -cn --arg path "$path" --arg expected "$expected" --argjson dac "$dac" --argjson created "$created" \
+                '{path: $path, expected: $expected, dac_writable: $dac, created: $created}' >>"$work/writes.ndjson"
+        done
+    done
+    if [ -z "$allowed_failed" ]; then
+        pass allowed_writes "files can be created under $J10_ALLOWED"
+    else
+        fail allowed_writes "cannot create a file in:$allowed_failed"
+    fi
+    if [ -z "$denied_created" ]; then
+        pass denied_writes "no file could be created at a denied path"
+    else
+        fail denied_writes "a file was created in:$denied_created"
+    fi
+    if [ -n "$attributed" ]; then
+        pass denial_by_policy "denied although the mode allows the write:$attributed"
+    else
+        fail denial_by_policy "no denied path was writable by mode, so the policy is not proven"
+    fi
+    jq -n --slurpfile writes "$work/writes.ndjson" '{writes: $writes}' >"$work/facts"
+)
+
+step_J11() (
+    collect_processes
+    process_checks
+    jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
+)
+
+step_J12() (
+    collect_processes
+    if [ "$(jq -r '.self_descends_from_main' "$work/processes.json")" = false ]; then
+        pass not_descendant "the probe is not a descendant of the main process"
+    else
+        fail not_descendant "the probe runs below the main process"
+    fi
+    self_tty=$(jq -r '.self.tty // ""' "$work/processes.json")
+    codex_children=$(jq -r '.codex | length' "$work/processes.json")
+    codex_ttys_known=$(jq -r 'all(.codex[]; .tty != null and .tty != "")' "$work/processes.json")
+    shared_ttys=$(jq -r --arg tty "$self_tty" '[.codex[] | select(.tty == $tty)] | length' "$work/processes.json")
+    if [ -z "$self_tty" ] || [ "$codex_children" -eq 0 ]; then
+        skip distinct_tty "the tty of the probe or of Codex is unknown"
+    elif [ "$shared_ttys" -gt 0 ]; then
+        fail distinct_tty "$shared_ttys Codex child process(es) share the probe tty $self_tty"
+    elif [ "$codex_ttys_known" != true ]; then
+        skip distinct_tty "the tty of the probe or of Codex is unknown"
+    else
+        pass distinct_tty "probe $self_tty, every Codex child has a distinct tty"
+    fi
+    jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
+)
+
+step_J13() (
+    work_tree=false
+    branch=
+    head=
+    clean=false
+    status_known=false
+    refs_known=false
+    stash=0
+    branches='[]'
+    if in_work_tree; then
+        work_tree=true
+        branch=$(git_in symbolic-ref --short -q HEAD 2>/dev/null)
+        head=$(git_in rev-parse -q --verify HEAD 2>/dev/null)
+        if porcelain=$(git_in -c core.fileMode=true -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null) &&
+            git_in ls-files -v -z >"$work/root-index-flags" 2>/dev/null &&
+            git_in ls-files -v -z --recurse-submodules >"$work/recursive-index-flags" 2>/dev/null; then
+            status_known=true
+            clean=true
+            [ -z "$porcelain" ] || clean=false
+            if git_index_flags_state "$work/root-index-flags" "$work/root-index-flags.hex"; then
+                :
+            else
+                flags_rc=$?
+                if [ "$flags_rc" -eq 1 ]; then
+                    clean=false
+                else
+                    status_known=false
+                    clean=false
+                fi
+            fi
+            if git_index_flags_state "$work/recursive-index-flags" "$work/recursive-index-flags.hex"; then
+                :
+            else
+                flags_rc=$?
+                if [ "$flags_rc" -eq 1 ]; then
+                    clean=false
+                else
+                    status_known=false
+                    clean=false
+                fi
+            fi
+        else
+            clean=false
+        fi
+        : >"$work/refs.err"
+        if refs=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>>"$work/refs.err") &&
+            git_in for-each-ref refs/stash >/dev/null 2>>"$work/refs.err" &&
+            stashes=$(git_in stash list 2>>"$work/refs.err") && [ ! -s "$work/refs.err" ]; then
+            refs_known=true
+            [ -z "$stashes" ] || stash=$(printf '%s\n' "$stashes" | wc -l | tr -d ' ')
+            if [ -n "$refs" ]; then
+                branches=$(printf '%s\n' "$refs" | jq -Rn '[inputs | split(" ") | {name: .[0], tip: .[1]}]') || refs_known=false
+            fi
+        fi
+    fi
+    if [ "$work_tree" = true ]; then
+        pass work_tree "$PROJECT"
+    else
+        fail work_tree "$PROJECT is not a git work tree"
+    fi
+    if [ -n "$head" ]; then
+        pass head "$head"
+    else
+        fail head "HEAD is unborn or unreadable"
+    fi
+    if [ "$work_tree" = false ]; then
+        skip work_tree_status "git status not run: $PROJECT is not a git work tree"
+    elif [ "$status_known" = true ]; then
+        pass work_tree_status "git status ran"
+    else
+        fail work_tree_status "Git work-tree inspection failed, so the cleanliness of the work tree is unknown"
+    fi
+    if [ "$work_tree" = false ]; then
+        skip refs "git for-each-ref not run: $PROJECT is not a git work tree"
+    elif [ "$refs_known" = true ]; then
+        pass refs "$(printf '%s' "$branches" | jq 'length') local branches"
+    else
+        fail refs "git for-each-ref failed or reported a broken ref: $(head -n 3 "$work/refs.err" 2>/dev/null | tr '\n' ';')"
+    fi
+    jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
+        --argjson branches "$branches" --argjson clean "$clean" --argjson stash "$stash" \
+        "$JQN"'{project: $project, work_tree: $work_tree, branch: ($branch | n), head: ($head | n), branches: $branches, clean: $clean, stash: $stash}' >"$work/facts"
+)
+
+step_J14() (
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
+    marker=$STATE_DIR/marker
+    mkdir -p "$STATE_DIR" 2>/dev/null
+    raw_id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    id=
+    created=false
+    if (
+        set -C
+        printf '%s\n' "$raw_id" >"$marker"
+    ) 2>/dev/null; then
+        created=true
+    else
+        raw_id=
+        marker_bytes=$(od -An -N34 -v -tx1 "$marker" 2>/dev/null) || marker_bytes=
+        marker_bytes=$(printf '%s' "$marker_bytes" | tr -d '[:space:]')
+        if printf '%s' "$marker_bytes" | grep -qE '^((3[0-9]|6[1-6]){32})(0a)?$'; then
+            raw_id=$(printf '%s' "$marker_bytes" | awk '
+                BEGIN {
+                    for (i = 0; i < 10; i++) chars[sprintf("3%d", i)] = i
+                    for (i = 1; i <= 6; i++) chars[sprintf("6%d", i)] = substr("abcdef", i, 1)
+                }
+                { for (i = 1; i <= 64; i += 2) printf "%s", chars[substr($0, i, 2)] }
+            ')
+        fi
+    fi
+    setup_runs=$(count_lines "$STATE_DIR/setup.log")
+    preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
+    if printf '%s' "$raw_id" | grep -qE '^[0-9a-f]{32}$'; then
+        id=$raw_id
+        pass marker "created=$created id=$id"
+    else
+        fail marker "the marker file $marker holds no valid id"
+    fi
+    if [ -n "$boot_id" ]; then
+        pass boot_id "$boot_id"
+    else
+        fail boot_id "/proc/sys/kernel/random/boot_id is unreadable"
+    fi
+    jq -n --arg boot_id "$boot_id" --arg path "$marker" --arg id "$id" --argjson created "$created" \
+        --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
+        '{boot_id: $boot_id, marker: {path: $path, id: $id, created: $created}, setup_runs: $setup, preflight_runs: $preflight}' >"$work/facts"
+)
+
+step_J15() (
+    if [ "$docker" != on ]; then
+        skip docker_capability "the Docker capability is off (--docker on selects this step)"
+        return 0
+    fi
+    docker_path=$(command -v docker 2>/dev/null) || docker_path=
+    found=false
+    [ -n "$docker_path" ] && found=true
+    cert_dir=$JACKIN_DIR/docker
+    : >"$work/certs.ndjson"
+    cert_problem=
+    for name in ca.pem cert.pem key.pem; do
+        meta=$(file_meta "$cert_dir/$name") || meta="65534 000"
+        read -r _ mode <<EOF
+$meta
+EOF
+        [ -f "$cert_dir/$name" ] || cert_problem="$cert_problem $name"
+        if [ "$name" = key.pem ] && [ "$mode" != 600 ]; then
+            cert_problem="$cert_problem key.pem-mode-$mode"
+        fi
+        jq -cn --arg name "$name" --arg mode "$mode" '{name: $name, mode: $mode}' >>"$work/certs.ndjson"
+    done
+    host=${DOCKER_HOST-}
+    tls=${DOCKER_TLS_VERIFY-}
+    cert_path=${DOCKER_CERT_PATH-}
+    run_exit=
+    hello=false
+    engine_id=
+    engine_version=
+    if [ "$found" = true ]; then
+        out=$(timeout 300 docker run --rm "$HELLO_IMAGE" 2>&1 </dev/null)
+        run_exit=$?
+        if printf '%s' "$out" | grep -q 'Hello from Docker!'; then
+            hello=true
+        fi
+        if info=$(timeout 60 docker info --format '{{.ID}} {{.ServerVersion}}' 2>/dev/null </dev/null); then
+            read -r engine_id engine_version <<EOF
+$info
+EOF
+        fi
+    fi
+    if [ "$found" = true ]; then
+        pass docker_binary "$docker_path"
+    else
+        fail docker_binary "no docker binary on PATH"
+    fi
+    case $host in
+        tcp://host.openshell.internal:*)
+            if [ "$tls" = 1 ] && [ "$cert_path" = "$cert_dir" ]; then
+                pass environment "DOCKER_HOST=$host"
+            else
+                fail environment "DOCKER_TLS_VERIFY or DOCKER_CERT_PATH is wrong"
+            fi
+            ;;
+        *) fail environment "DOCKER_HOST is '${host:-unset}', expected tcp://host.openshell.internal:<port>" ;;
+    esac
+    if [ -z "$cert_problem" ]; then
+        pass certificates "ca.pem, cert.pem and key.pem (mode 600) exist in $cert_dir"
+    else
+        fail certificates "problem:$cert_problem"
+    fi
+    if [ "$hello" = true ] && [ "$run_exit" = 0 ]; then
+        pass hello_world "docker run --rm $HELLO_IMAGE printed the hello text"
+    else
+        fail hello_world "docker run --rm $HELLO_IMAGE exit ${run_exit:-none}"
+    fi
+    if [ -n "$engine_id" ]; then
+        pass engine "$engine_id"
+    else
+        fail engine "docker info gave no engine id"
+    fi
+    jq -n --argjson found "$found" --arg path "$docker_path" --arg host "$host" --arg tls "$tls" --arg cert_path "$cert_path" \
+        --slurpfile certs "$work/certs.ndjson" --arg run_exit "$run_exit" --argjson hello "$hello" \
+        --arg engine_id "$engine_id" --arg engine_version "$engine_version" \
+        "$JQN"'{docker_binary: {found: $found, path: ($path | n)},
+          environment: {docker_host: ($host | n), tls_verify: ($tls | n), cert_path: ($cert_path | n)},
+          certificates: $certs,
+          run: {exit_code: ($run_exit | n | if . == null then null else tonumber end), hello: $hello},
+          engine: {id: ($engine_id | n), server_version: ($engine_version | n)}}' >"$work/facts"
+)
+
+step_J16() (
+    if [ "$docker" != off ]; then
+        skip docker_capability "the Docker capability is on (--docker off selects this step)"
+        return 0
+    fi
+    binary=false
+    have docker && binary=true
+    variables=$(env | sed -n 's/^\(DOCKER_[A-Za-z0-9_]*\)=.*/\1/p' | jq -Rn '[inputs]')
+    proxies=$(proxy_variables | tr '\n' ' ' | sed 's/ $//')
+    attempted=false
+    curl_found=false
+    have curl && curl_found=true
+    reply=null
+    control=null
+    if [ -n "$engine" ]; then
+        attempted=true
+        reply=$(egress "https://$engine/_ping")
+        control=$(egress https://example.com)
+    fi
+    if [ "$binary" = false ]; then
+        pass docker_binary "no docker binary"
+    else
+        fail docker_binary "a docker binary exists"
+    fi
+    if [ "$variables" = '[]' ]; then
+        pass docker_variables "no DOCKER_ variable"
+    else
+        fail docker_variables "set: $(printf '%s' "$variables" | jq -r 'join(" ")')"
+    fi
+    if [ -n "$proxies" ]; then
+        fail engine_denied "proxy variables are set: $proxies"
+    elif [ "$attempted" = false ]; then
+        skip engine_denied "no --engine endpoint was given"
+    else
+        case $(egress_outcome "$reply") in
+            unresolved)
+                if [ "$(egress_outcome "$control")" = refused ]; then
+                    pass engine_denied "$engine does not resolve (curl exit 6) while example.com resolves and is refused: the policy refuses the name"
+                else
+                    fail engine_denied "$engine did not resolve (curl exit 6) and the control name example.com gave $(egress_outcome "$control"): a resolver fault cannot be told from a policy denial"
+                fi
+                ;;
+            *) denial_check engine_denied "$engine" "$reply" ;;
+        esac
+    fi
+    jq -n --argjson binary "$binary" --argjson variables "$variables" --arg engine "$engine" \
+        --argjson attempted "$attempted" --argjson curl_found "$curl_found" --argjson reply "$reply" --argjson control "$control" \
+        "$JQN"'{docker_binary: $binary, docker_variables: $variables, endpoint: ($engine | n),
+          connection: {attempted: $attempted, curl_found: $curl_found, curl_exit: ($reply.curl_exit // null), http_code: ($reply.http_code // 0)},
+          resolver_control: $control}' >"$work/facts"
+)
+
+main() {
+    mode=sandbox
+    docker=off
+    engine=
+    only=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --version)
+                echo "$PROBE $VERSION"
+                exit 0
+                ;;
+            --host) mode=host ;;
+            --docker)
+                [ $# -ge 2 ] || usage
+                case $2 in
+                    on | off) docker=$2 ;;
+                    *) usage ;;
+                esac
+                shift
+                ;;
+            --engine)
+                [ $# -ge 2 ] || usage
+                case $2 in
+                    '' | *[!A-Za-z0-9.:-]* | *:*:* | :* | *:) usage ;;
+                    *:*[!0-9]*) usage ;;
+                    *:*) engine=$2 ;;
+                    *) usage ;;
+                esac
+                shift
+                ;;
+            --only)
+                [ $# -ge 2 ] || usage
+                only=$2
+                shift
+                ;;
+            *) usage ;;
+        esac
+        shift
+    done
+    if [ "$mode" = sandbox ]; then
+        PATH=$SANDBOX_PATH
+        export PATH
+    fi
+    if [ -n "$only" ]; then
+        case $only in
+            *[!A-Za-z0-9,]*) usage ;;
+        esac
+        [ -n "$(printf '%s' "$only" | tr -d ',')" ] || usage
+        for id in $(printf '%s' "$only" | tr ',' ' '); do
+            case " $ALL_STEPS " in
+                *" $id "*) ;;
+                *) usage ;;
+            esac
+        done
+    fi
+    have jq || {
+        echo "$PROBE: jq is required" >&2
+        exit 69
+    }
+    [ "$mode" = host ] || require_sandbox
+    work=$(mktemp -d) || exit 70
+    trap 'rm -rf "$work"' EXIT
+    trap 'exit 70' INT TERM HUP
+    for id in $ALL_STEPS; do
+        selected "$id" || continue
+        : >"$work/checks"
+        : >"$work/facts"
+        if [ "$mode" = host ]; then
+            skip sandbox "not running in a sandbox (--host)"
+        else
+            "step_$id" || true
+        fi
+        finish "$id"
+    done
+    cat "$work"/step.J* | jq -cMs --arg mode "$mode" --arg docker "$docker" \
+        '{schema: 2, probe: "jackin-sentinel-probe", mode: $mode, docker: $docker, steps: add}'
+}
+
+main "$@"

@@ -1,55 +1,135 @@
 # jackin-sentinel
 
-Internal jackin' role for manual smoke checks and future PTY, functional, and
-Docker E2E coverage.
+jackin-sentinel is the verification role of jackin. It proves that jackin works from the host to the Codex process in the sandbox. Codex is the only agent.
 
-The canonical manual-test repository is:
+`xtask e2e` in the jackin repository runs the sentinel journey (J00 to J17). The steps are in the Sentinel journey table of `rewrite/PLAN.md` in jackin. The journey compares what the host sees with what the probe in the sandbox reports.
+
+Jackin builds the image and creates the sandbox. This repository does not publish an image. The role holds no secret.
+
+## What the image contains
+
+The `Dockerfile` ends in a stage that starts `FROM construct`. One `RUN` layer installs `jackin-sentinel-probe` at `/usr/local/bin/jackin-sentinel-probe`, owned by root. The layer prints its own lines, so the build output shows the sentinel layer.
+
+Jackin adds Codex, `jackin-start`, and the two hooks when it derives the final image (decisions D05 and D11).
+
+The probe is a POSIX `sh` script that needs `jq`. The construct image has `jq`.
+
+## Egress policy
+
+`policy.yaml` is a native OpenShell policy that jackin sends without change.
+
+- The role has no network rule. The sandbox cannot reach any host that the role names, because the role names none.
+- The only egress is the rule that OpenShell adds for the Codex provider hosts.
+- `/bin`, `/sbin`, `/usr`, `/lib`, `/etc`, `/proc`, `/dev/urandom`, and `/var/log` are read-only. `/sandbox`, `/tmp`, and `/dev/null` are writable.
+- `landlock.compatibility` is `hard_requirement`, so the sandbox fails to start where Landlock is unavailable.
+
+The Docker capability is off (`[docker] enabled = false`).
+
+## Environment and hooks
+
+The manifest has one `[env]` entry:
+
+| Name | Default | Prompt |
+|---|---|---|
+| `SENTINEL_FAIL_PREFLIGHT` | `0` | Fail the preflight hook (1) or pass it (0): |
+
+Jackin runs each hook through exec as the user `sandbox`, in `/sandbox/project`, with the `[env]` values. Each hook appends one line to a log in `/sandbox/.sentinel`:
+
+| Hook | Runs | Log line |
+|---|---|---|
+| `hooks/setup.sh` | Once for each launch | `setup launch=<launch-id> flag=<value>` in `setup.log` |
+| `hooks/preflight.sh` | Before each Codex start | `preflight ok flag=<value>` in `preflight.log` |
+| `hooks/preflight.sh` | Before each Codex start, when `SENTINEL_FAIL_PREFLIGHT` is `1` | `preflight fail flag=1` in `preflight.log`, then exit code 17 |
+
+A non-zero exit stops the launch. The sandbox stays `Ready`. Each log line is one execution. `setup` adds no second line when a crash before the done marker runs it again for the same launch, but it adds one when the done marker of the launch already exists. The probe counts the lines, so a hook that jackin runs twice after success is a visible failure. The hook files in the image are owned by root. The agent cannot change them.
+
+## Use the role
+
+Build jackin in the jackin repository. Check the role from this directory with that binary:
 
 ```sh
-https://github.com/jackin-project/jackin-sentinel
+jackin role check .
 ```
 
-Load it from any workspace with:
+Register the role, then load it with a project directory:
 
 ```sh
-jackin load jackin-project/sentinel . --rebuild --debug
+jackin role add sentinel .
+jackin load sentinel <project>
 ```
 
-The role intentionally concentrates the valid role-manifest surface area in one
-place:
+To make the preflight hook fail, pass the variable:
 
-- every supported agent table
-- runtime hooks: `setup_once`, `source`, and `preflight`
-- static env defaults
-- rich text prompts
-- rich select prompts
-- skippable prompts and skip cascading
-- dependency ordering and `${env.*}` interpolation
-- Docker build output from a real `RUN` layer
+```sh
+jackin load sentinel <project> --env SENTINEL_FAIL_PREFLIGHT=1
+```
 
-At runtime the hooks install `jackin-sentinel-report` into the agent user's
-`PATH`. Run it from the container to print a deterministic report bounded by
-`JACKIN_SENTINEL_REPORT_BEGIN` and `JACKIN_SENTINEL_REPORT_END`. Future E2E
-tests should parse that report rather than depending on agent-specific UI text.
+The launch stops with the hook error. Load again with the same launch ID and without the variable to start Codex (journey step J06).
 
-Manual verification checklist:
+## The probe
 
-1. Confirm the launch cockpit owns the full screen and no raw Docker output is
-   printed over it.
-2. Complete every manifest env dialog: required text, defaulted text, select,
-   defaulted select, skippable optional value, and dependency-derived values.
-3. Open the Docker build log from the cockpit and confirm the
-   `jackin-sentinel build layer` line appears there, not on the main screen.
-4. Launch at least one agent and run `jackin-sentinel-report`.
-5. Confirm the report shows resolved env values, hook markers, runtime
-   variables, and Docker CLI availability.
-6. Exit the container with a dirty isolated worktree and confirm cleanup is a
-   rich dialog, not a plain numbered CLI prompt.
+`jackin-sentinel-probe` prints one JSON object on stdout. `rewrite/probe-schema.json` in jackin defines it. `xtask e2e` reads it, so change the probe, the schema, and `crates/xtask/src/e2e/` in one task.
 
-Recommended test tiers:
+```text
+jackin-sentinel-probe [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]
+jackin-sentinel-probe --version
+```
 
-1. PTY tests drive the rich launch dialogs and assert the visible screen.
-2. Functional tests run jackin' commands against this role with fake or stubbed
-   external dependencies.
-3. Docker E2E tests launch the role with a real Docker daemon and assert the
-   sentinel report, hook markers, env resolution, and diagnostics/build output.
+| Flag | Meaning |
+|---|---|
+| `--host` | Dry run. Every selected step is `SKIP` with `facts: null`. Use it to check the output shape outside a sandbox. |
+| `--docker on\|off` | The Docker capability that the caller expects. The default is `off`. `on` runs J15 and skips J16. `off` skips J15 and runs J16. |
+| `--engine HOST:PORT` | The engine endpoint that J16 tries to reach. Without it, the connection check of J16 is `SKIP`. |
+| `--only` | A comma-separated list of steps. An unselected step is absent from the report. |
+
+Without `--host`, the probe runs only on Linux as the user `sandbox` with `/sandbox` present. Otherwise it exits 66. The probe exits 0 whenever it printed a report, even when a step is `FAIL`. It exits 64 for a usage error and 69 when `jq` is missing.
+
+Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, and typed `facts`. A step that needs a credential or a capability that the sandbox lacks is `SKIP`. It is never `PASS`.
+
+| Step | What the probe reports |
+|---|---|
+| J00 | The Codex binary and the output of `codex --version`. |
+| J04 | The user, uid, gid, whether `sudo` works, and whether a `docker` binary exists. |
+| J05 | The sha256 digest of every regular file below `/sandbox/project`, outside `.git`. |
+| J06 | The execution counts of the hooks, and the owner and mode of the installed hook files. |
+| J07 | The main process, its Codex child, and the answer of a `codex exec` call. |
+| J08 | Whether every credential variable (any letter case) and every token in `auth.json` is a full placeholder (`openshell:resolve:env:NAME` and nothing else), and which files hold a token-shaped string. The probe never prints a value. |
+| J09 | The `curl` exit code and HTTP code for a host outside the policy, the metadata address, and a Codex provider host. A denial is curl exit 7 with no HTTP response. Exit 6 (the name did not resolve), a missing `curl`, and any other exit are not a denial. The provider check sends only a full placeholder and passes only on the provider's HTTP 401 invalid-key answer that names that placeholder (the provider masks the middle of the key); the probe compares that body and never prints it. `codex exec` runs only when every credential in the sandbox is a full placeholder. |
+| J10 | Which file creations succeed under `/sandbox` and `/tmp` and which fail elsewhere. |
+| J11 | The Codex process with its pid and start time, for a comparison before and after a detach. |
+| J12 | The probe process, its controlling terminal, and whether it descends from the main process. |
+| J13 | The git state of `/sandbox/project`: branches, tips, HEAD, cleanliness, and stash count. |
+| J14 | A marker file, the boot id, and the hook counts, for a comparison after stop and start. |
+| J15 | With `--docker on`: the Docker variables, the client certificates, the output of a `hello-world` container that the agent starts through the engine, and the engine id. |
+| J16 | With `--docker off`: no `docker` binary, no `DOCKER_` variable, and no connection to the engine endpoint. Curl exit 7 is a denial. Exit 6 counts only when a control name (`example.com`) resolves and is refused in the same run, so a resolver fault does not pass. |
+
+J01, J02, J03, and J17 have no in-sandbox part. `xtask e2e` runs them on the host.
+
+Run a dry run on any host that has `jq`:
+
+```sh
+probe/jackin-sentinel-probe --host | jq .
+```
+
+In a sandbox of this role, run `jackin shell <sandbox>` and then:
+
+```sh
+jackin-sentinel-probe | jq .
+jackin-sentinel-probe --docker on --only J15 | jq .
+```
+
+J07 and J09 run `codex exec` only when the sandbox has a configured OpenShell placeholder credential. The bounded stdout capture can wait up to 280 seconds, separate from the deadlines for other journey checks. The `output_bytes` fact counts the observed stdout prefix, up to 65,537 bytes. Byte 65,537 marks overflow, so output longer than 65,536 bytes fails even when `ready` appears in the prefix. J15 pulls `hello-world` through the engine and takes up to five minutes.
+
+## Docker capability
+
+The capability is off in the manifest. Enable it for a launch with `docker = true` on the workspace (journey step J15). The engine is a dedicated external engine that the operator runs (decision D24). The agent can read the engine client key, and containers bypass the sandbox network policy.
+
+## Repository checks
+
+`mise run test` runs `prek run --all-files`: gitleaks, shellcheck, shfmt, hadolint, the J08 cases of `probe/tests/j08.sh`, and the J09 and J16 egress cases of `probe/tests/egress.sh`.
+
+`velnor` generates the CI workflows from `.velnor/config.toml`. Do not edit them by hand.
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
