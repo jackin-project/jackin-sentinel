@@ -223,6 +223,12 @@ not_disclosed() {
     fi
 }
 
+no_raw_nul() {
+    if od -An -v -tu1 "$t/out" "$t/err" | awk '{ for (i = 1; i <= NF; i++) if ($i == 0) found = 1 } END { exit !found }'; then
+        problems="$problems raw-nul-in-output"
+    fi
+}
+
 public_not_disclosed() {
     label=$1
     marker=$2
@@ -1805,6 +1811,7 @@ if git_in_project init -q --bare; then
     expect work_tree FAIL 'not a git work tree'
     expect work_tree_status SKIP 'git status not run'
     fact '.work_tree' false
+    fact '.clean' false
     finish_case
 else
     setup_failed j13_a_bare_repository_is_not_a_work_tree
@@ -1828,6 +1835,85 @@ expect_rc 0
 expect_report J13 sandbox
 expect work_tree FAIL 'not a git work tree'
 expect work_tree_status SKIP 'git status not run'
+fact '.clean' false
+finish_case
+
+mk j13_missing_project_does_not_claim_cleanliness
+rmdir "$t/sandbox/project"
+begin j13_missing_project_does_not_claim_cleanliness sh "$t/probe" --only J13
+expect_rc 0
+expect_report J13 sandbox
+expect work_tree FAIL 'not a git work tree'
+expect work_tree_status SKIP 'git status not run'
+fact '.clean' false
+finish_case
+
+mk j14_existing_valid_marker_preserves_its_id
+mkdir -p "$t/sandbox/.sentinel"
+known_id=0123456789abcdef0123456789abcdef
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+printf '%s\n' "$known_id" >"$t/sandbox/.sentinel/marker"
+begin j14_existing_valid_marker_preserves_its_id sh "$t/probe" --only J14
+expect_rc 0
+expect_report J14 sandbox
+expect marker PASS "created=false id=$known_id"
+fact '.marker.id' "$known_id"
+fact '.marker.created' false
+finish_case
+
+mk j14_existing_invalid_marker_does_not_disclose_its_id
+mkdir -p "$t/sandbox/.sentinel"
+synthetic_marker_id=jackin-sentinel-sensitive-marker-synthetic-9d5210a4
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+printf '%s\n' "$synthetic_marker_id" >"$t/sandbox/.sentinel/marker"
+begin j14_existing_invalid_marker_does_not_disclose_its_id sh "$t/probe" --only J14
+expect_rc 0
+expect_report J14 sandbox
+expect marker FAIL 'holds no valid id'
+fact '.marker.id' ''
+not_disclosed "$synthetic_marker_id"
+finish_case
+
+mk j14_existing_marker_with_leading_nul_does_not_disclose_its_id
+mkdir -p "$t/sandbox/.sentinel"
+known_id=11223344556677889900aabbccddeeff
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+printf '\000%s\n' "$known_id" >"$t/sandbox/.sentinel/marker"
+begin j14_existing_marker_with_leading_nul_does_not_disclose_its_id sh "$t/probe" --only J14
+expect_rc 0
+expect_report J14 sandbox
+expect marker FAIL 'holds no valid id'
+fact '.marker.id' ''
+not_disclosed "$known_id"
+no_raw_nul
+finish_case
+
+mk j14_existing_marker_with_internal_nul_does_not_disclose_its_id
+mkdir -p "$t/sandbox/.sentinel"
+known_id=22334455667788990011aabbccddeeff
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+printf '%s\000%s\n' "${known_id%????????????????}" "${known_id#????????????????}" >"$t/sandbox/.sentinel/marker"
+begin j14_existing_marker_with_internal_nul_does_not_disclose_its_id sh "$t/probe" --only J14
+expect_rc 0
+expect_report J14 sandbox
+expect marker FAIL 'holds no valid id'
+fact '.marker.id' ''
+not_disclosed "$known_id"
+no_raw_nul
+finish_case
+
+mk j14_existing_marker_with_trailing_nul_does_not_disclose_its_id
+mkdir -p "$t/sandbox/.sentinel"
+known_id=33445566778899001122aabbccddeeff
+printf '%s\000\n' "$known_id" >"$t/sandbox/.sentinel/marker"
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+begin j14_existing_marker_with_trailing_nul_does_not_disclose_its_id sh "$t/probe" --only J14
+expect_rc 0
+expect_report J14 sandbox
+expect marker FAIL 'holds no valid id'
+fact '.marker.id' ''
+not_disclosed "$known_id"
+no_raw_nul
 finish_case
 
 mk j05_parent_repository_is_not_the_project_repository

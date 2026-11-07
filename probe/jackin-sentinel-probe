@@ -1377,7 +1377,7 @@ step_J13() (
     work_tree=false
     branch=
     head=
-    clean=true
+    clean=false
     status_known=false
     refs_known=false
     stash=0
@@ -1390,6 +1390,7 @@ step_J13() (
             git_in ls-files -v -z >"$work/root-index-flags" 2>/dev/null &&
             git_in ls-files -v -z --recurse-submodules >"$work/recursive-index-flags" 2>/dev/null; then
             status_known=true
+            clean=true
             [ -z "$porcelain" ] || clean=false
             if git_index_flags_state "$work/root-index-flags" "$work/root-index-flags.hex"; then
                 :
@@ -1460,19 +1461,32 @@ step_J14() (
     boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
     marker=$STATE_DIR/marker
     mkdir -p "$STATE_DIR" 2>/dev/null
-    id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    raw_id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    id=
     created=false
     if (
         set -C
-        printf '%s\n' "$id" >"$marker"
+        printf '%s\n' "$raw_id" >"$marker"
     ) 2>/dev/null; then
         created=true
     else
-        id=$(head -n 1 "$marker" 2>/dev/null) || id=
+        raw_id=
+        marker_bytes=$(od -An -N33 -v -tx1 "$marker" 2>/dev/null) || marker_bytes=
+        marker_bytes=$(printf '%s' "$marker_bytes" | tr -d '[:space:]')
+        if printf '%s' "$marker_bytes" | grep -qE '^((3[0-9]|6[1-6]){32})(0a)?$'; then
+            raw_id=$(printf '%s' "$marker_bytes" | awk '
+                BEGIN {
+                    for (i = 0; i < 10; i++) chars[sprintf("3%d", i)] = i
+                    for (i = 1; i <= 6; i++) chars[sprintf("6%d", i)] = substr("abcdef", i, 1)
+                }
+                { for (i = 1; i <= 64; i += 2) printf "%s", chars[substr($0, i, 2)] }
+            ')
+        fi
     fi
     setup_runs=$(count_lines "$STATE_DIR/setup.log")
     preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
-    if printf '%s' "$id" | grep -qE '^[0-9a-f]{32}$'; then
+    if printf '%s' "$raw_id" | grep -qE '^[0-9a-f]{32}$'; then
+        id=$raw_id
         pass marker "created=$created id=$id"
     else
         fail marker "the marker file $marker holds no valid id"
