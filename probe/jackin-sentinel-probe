@@ -1706,7 +1706,7 @@ step_J14() (
         created=true
     else
         raw_id=
-        marker_bytes=$(od -An -N33 -v -tx1 "$marker" 2>/dev/null) || marker_bytes=
+        marker_bytes=$(od -An -N34 -v -tx1 "$marker" 2>/dev/null) || marker_bytes=
         marker_bytes=$(printf '%s' "$marker_bytes" | tr -d '[:space:]')
         if printf '%s' "$marker_bytes" | grep -qE '^((3[0-9]|6[1-6]){32})(0a)?$'; then
             raw_id=$(printf '%s' "$marker_bytes" | awk '

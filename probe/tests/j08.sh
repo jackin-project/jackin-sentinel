@@ -1944,6 +1944,80 @@ not_disclosed "$known_id"
 no_raw_nul
 finish_case
 
+mk j14_existing_valid_marker_without_lf_preserves_its_id
+known_id=0123456789abcdef0123456789abcdef
+if mkdir -p "$t/sandbox/.sentinel" &&
+    printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id" &&
+    printf '%s' "$known_id" >"$t/sandbox/.sentinel/marker" &&
+    [ -f "$t/sandbox/.sentinel/marker" ]; then
+    begin j14_existing_valid_marker_without_lf_preserves_its_id sh "$t/probe" --only J14
+    expect_rc 0
+    expect_report J14 sandbox
+    expect marker PASS "created=false id=$known_id"
+    fact '.marker.id' "$known_id"
+    fact '.marker.created' false
+    finish_case
+else
+    setup_failed j14_existing_valid_marker_without_lf_preserves_its_id
+fi
+
+mk j14_existing_marker_with_byte_34_ascii_does_not_disclose_its_id
+known_id=11223344556677889900aabbccddeeff
+if mkdir -p "$t/sandbox/.sentinel" &&
+    printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id" &&
+    printf '%s\nX' "$known_id" >"$t/sandbox/.sentinel/marker" &&
+    [ -f "$t/sandbox/.sentinel/marker" ]; then
+    begin j14_existing_marker_with_byte_34_ascii_does_not_disclose_its_id sh "$t/probe" --only J14
+    expect_rc 0
+    expect_report J14 sandbox
+    expect marker FAIL 'holds no valid id'
+    fact '.marker.id' ''
+    fact '.marker.created' false
+    not_disclosed "$known_id"
+    no_raw_nul
+    finish_case
+else
+    setup_failed j14_existing_marker_with_byte_34_ascii_does_not_disclose_its_id
+fi
+
+mk j14_existing_marker_with_byte_34_lf_does_not_disclose_its_id
+known_id=22334455667788990011aabbccddeeff
+if mkdir -p "$t/sandbox/.sentinel" &&
+    printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id" &&
+    printf '%s\n\n' "$known_id" >"$t/sandbox/.sentinel/marker" &&
+    [ -f "$t/sandbox/.sentinel/marker" ]; then
+    begin j14_existing_marker_with_byte_34_lf_does_not_disclose_its_id sh "$t/probe" --only J14
+    expect_rc 0
+    expect_report J14 sandbox
+    expect marker FAIL 'holds no valid id'
+    fact '.marker.id' ''
+    fact '.marker.created' false
+    not_disclosed "$known_id"
+    no_raw_nul
+    finish_case
+else
+    setup_failed j14_existing_marker_with_byte_34_lf_does_not_disclose_its_id
+fi
+
+mk j14_existing_marker_with_byte_34_nul_does_not_disclose_its_id
+known_id=33445566778899001122aabbccddeeff
+if mkdir -p "$t/sandbox/.sentinel" &&
+    printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id" &&
+    printf '%s\n\000' "$known_id" >"$t/sandbox/.sentinel/marker" &&
+    [ -f "$t/sandbox/.sentinel/marker" ]; then
+    begin j14_existing_marker_with_byte_34_nul_does_not_disclose_its_id sh "$t/probe" --only J14
+    expect_rc 0
+    expect_report J14 sandbox
+    expect marker FAIL 'holds no valid id'
+    fact '.marker.id' ''
+    fact '.marker.created' false
+    not_disclosed "$known_id"
+    no_raw_nul
+    finish_case
+else
+    setup_failed j14_existing_marker_with_byte_34_nul_does_not_disclose_its_id
+fi
+
 mk j05_parent_repository_is_not_the_project_repository
 if git_fixture -C "$t/sandbox" init -q && git_fixture -C "$t/sandbox" -c user.name=probe -c user.email=probe@example.invalid commit -q --allow-empty -m parent && git_fixture -C "$t/sandbox" tag parent-tag && printf project >"$t/sandbox/project/file.txt" && parent_state=$(git_public_state "$t/sandbox"); then
     begin j05_parent_repository_is_not_the_project_repository sh "$t/probe" --only J05
