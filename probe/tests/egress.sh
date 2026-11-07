@@ -9,7 +9,6 @@ scratch=$(mktemp -d) || exit 70
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
-
 mkdir "$scratch/tools"
 for tool in sh jq sed tr cat env awk grep mktemp rm wc head; do
     found=$(command -v "$tool") || {
@@ -18,7 +17,11 @@ for tool in sh jq sed tr cat env awk grep mktemp rm wc head; do
     }
     ln -s "$found" "$scratch/tools/$tool"
 done
+jq() {
+    "$scratch/tools/jq" "$@"
+}
 real_id=$(command -v id) || exit 70
+real_env=$(command -v env) || exit 70
 printf '#!/bin/sh\necho Linux\n' >"$scratch/tools/uname"
 printf '#!/bin/sh\n[ "$*" = -un ] && echo sandbox && exit 0\nexec %s "$@"\n' "$real_id" >"$scratch/tools/id"
 printf '#!/bin/sh\nshift\nexec "$@"\n' >"$scratch/tools/timeout"
@@ -68,7 +71,7 @@ chmod +x "$scratch/stub-curl"
 mk() {
     t=$scratch/$1
     rm -rf "$t"
-    mkdir -p "$t/bin" "$t/sandbox" "$t/tmp"
+    mkdir -p "$t/bin" "$t/home" "$t/sandbox" "$t/tmp"
     : >"$t/table"
     : >"$t/curl.log"
     pathvar=$t/bin:$scratch/tools
@@ -146,7 +149,7 @@ execute() {
     sed -e "s#/sandbox#$t/sandbox#g" -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/bin/codex#" "$probe" >"$t/probe"
     set -- "$@" sh "$t/probe" --only "${step#step_}"
     [ -z "$engine" ] || set -- "$@" --engine "$engine"
-    bounded 20 env -i PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
+    bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
     rc=$?
     cp "$scratch/bounded.out" "$t/out"
     cp "$scratch/bounded.err" "$t/err"
@@ -163,6 +166,14 @@ begin() {
     elif ! jq -e --arg step "${1#step_}" '.schema == 2 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
         problems=" report-shape"
     fi
+}
+
+begin_without_probe_env() {
+    rm "$scratch/tools/env"
+    begin "$@"
+    result=$?
+    ln -s "$real_env" "$scratch/tools/env"
+    return "$result"
 }
 
 expect() {
@@ -577,6 +588,63 @@ begin j09_no_credential_skips_codex step_J09 ''
 expect codex_reaches_api SKIP 'no credential'
 fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
 finish_case
+
+INHERITED_CREDENTIAL_VALUE=FAKE-inherited-credential-value-7d95c2
+
+credential_case_setup() {
+    mk "$1"
+    codex_says 'ready' 0
+    if [ "$2" = J09 ]; then
+        with_curl
+        answer "$OUTSIDE" 7 000
+        answer "$METADATA" 7 000
+        answer "$PROVIDER" 7 000
+    fi
+}
+
+for selected_step in J07 J09; do
+    if [ "$selected_step" = J07 ]; then
+        step_name=j07
+        check_name=codex_exec
+    else
+        step_name=j09
+        check_name=codex_reaches_api
+    fi
+    for credential_name in KEY X_TOKEN A_SECRET_B PASSWORD DB_PASSWD CREDENTIAL CREDENTIALS AUTH github_token auth credential; do
+        case_name="${step_name}_inherited_${credential_name}_nonplaceholder_skips_codex"
+        credential_case_setup "$case_name" "$selected_step"
+        begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER" "$credential_name=$INHERITED_CREDENTIAL_VALUE"
+        expect "$check_name" SKIP 'not a full placeholder'
+        fact '.codex_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
+        expect_codex_not_run
+        expect_absent_from_report "$INHERITED_CREDENTIAL_VALUE"
+        finish_case
+    done
+
+    case_name="${step_name}_inherited_placeholders_empty_and_ordinary_values_allow_codex"
+    credential_case_setup "$case_name" "$selected_step"
+    begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER" GITHUB_TOKEN="$PLACEHOLDER" auth="$PLACEHOLDER" credential="$PLACEHOLDER" AWS_SECRET_ACCESS_KEY= KEYBOARD=ordinary-keyboard TOKENIZER=ordinary-tokenizer OAUTH_X=ordinary-oauth SSH_AUTH_SOCK=ordinary-socket
+    expect "$check_name" PASS 'codex exec answered'
+    fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
+    [ -e "$t/codex.ran" ] || problems="$problems codex-not-run"
+    finish_case
+
+    case_name="${step_name}_inherited_env_inspection_available_control"
+    credential_case_setup "$case_name" "$selected_step"
+    begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER"
+    expect "$check_name" PASS 'codex exec answered'
+    fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
+    [ -e "$t/codex.ran" ] || problems="$problems codex-not-run"
+    finish_case
+
+    case_name="${step_name}_inherited_env_inspection_unavailable_skips_codex"
+    credential_case_setup "$case_name" "$selected_step"
+    begin_without_probe_env "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER"
+    expect "$check_name" SKIP 'could not inspect'
+    fact '.codex_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
+    expect_codex_not_run
+    finish_case
+done
 
 mk j16_engine_refused
 with_curl

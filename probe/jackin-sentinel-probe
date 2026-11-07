@@ -412,38 +412,103 @@ process_checks() {
 
 ensure_codex_exec() {
     [ -f "$work/codex_exec.json" ] && return 0
-    credential=none
+    launch_kind=none
     why="the sandbox holds no credential"
-    auth="$CODEX_HOME_DIR/auth.json"
+    cred_path="$CODEX_HOME_DIR/auth.json"
     unsafe=
-    if [ -e "$auth" ] || [ -L "$auth" ]; then
-        kinds=$(token_kinds "$auth") || kinds="other other other"
+    if [ -e "$cred_path" ] || [ -L "$cred_path" ]; then
+        kinds=$(token_kinds "$cred_path") || kinds="other other other"
         case $kinds in
             *other*) unsafe=1 ;;
         esac
     fi
-    for value in "${CODEX_AUTH_ACCESS_TOKEN-}" "${OPENAI_API_KEY-}"; do
-        if [ -n "$value" ] && ! is_placeholder "$value"; then
-            unsafe=1
+    login_ready=0
+    api_ready=0
+    has_other=0
+    inspection_unavailable=
+    env_inventory=$(
+        exec 3>&1
+        {
+            producer_status=0
+            env -0 3>&- 2>/dev/null || producer_status=$?
+            printf '!P\t%s\n' "$producer_status" >&3
+        } | {
+            classifier_status=0
+            classified=$(credential_variables codex_exec 3>&- 2>/dev/null) || classifier_status=$?
+            if [ -n "$classified" ]; then
+                printf '%s\n' "$classified" >&3
+            fi
+            printf '!C\t%s\n' "$classifier_status" >&3
+        }
+    )
+    inventory_summary=$(printf '%s\n' "$env_inventory" | LC_ALL=C awk -F '\t' '
+        $1 == "!P" {
+            if (NF != 2 || $2 !~ /^[0-9]+$/ || producer_seen++) invalid = 1
+            else producer_status = $2
+            next
+        }
+        $1 == "!C" {
+            if (NF != 2 || $2 !~ /^[0-9]+$/ || classifier_seen++) invalid = 1
+            else classifier_status = $2
+            next
+        }
+        NF != 3 || $1 !~ /^[A-Za-z_][A-Za-z0-9_]*$/ ||
+            ($2 != "empty" && $2 != "placeholder" && $2 != "other") || $3 != "codex_exec" {
+            invalid = 1
+            next
+        }
+        $2 == "other" { other = 1 }
+        $1 == "CODEX_AUTH_ACCESS_TOKEN" && $2 == "placeholder" { login = 1 }
+        $1 == "OPENAI_API_KEY" && $2 == "placeholder" { api = 1 }
+        END {
+            if (invalid || producer_seen != 1 || classifier_seen != 1) exit 2
+            printf "%d %d %d %s %s\n", login, api, other, producer_status, classifier_status
+        }
+    ' 2>/dev/null) || inspection_unavailable=1
+    if [ -z "$inspection_unavailable" ] && [ -n "$inventory_summary" ]; then
+        extra=
+        if read -r inventory_login_ready inventory_api_ready inventory_has_other producer_status classifier_status extra <<EOF
+$inventory_summary
+EOF
+        then
+            case "$inventory_login_ready:$inventory_api_ready:$inventory_has_other:${extra-}" in
+                [01]:[01]:[01]:)
+                    if [ "$producer_status" = 0 ] && [ "$classifier_status" = 0 ]; then
+                        login_ready=$inventory_login_ready
+                        api_ready=$inventory_api_ready
+                        has_other=$inventory_has_other
+                    else
+                        inspection_unavailable=1
+                    fi
+                    ;;
+                *) inspection_unavailable=1 ;;
+            esac
+        else
+            inspection_unavailable=1
         fi
-    done
+    else
+        inspection_unavailable=1
+    fi
+    [ "$has_other" = 0 ] || unsafe=1
     if [ -n "$unsafe" ]; then
         why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
-    elif is_placeholder "${CODEX_AUTH_ACCESS_TOKEN-}"; then
-        credential=chatgpt_login
-    elif [ -f "$auth" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$auth" >/dev/null 2>&1; then
-        credential=chatgpt_login
-    elif [ -n "${OPENAI_API_KEY-}" ]; then
-        credential=api_key
-    elif [ -f "$auth" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$auth" >/dev/null 2>&1; then
-        credential=api_key
+    elif [ -n "$inspection_unavailable" ]; then
+        why="codex exec was not run: could not inspect inherited credentials"
+    elif [ "$login_ready" = 1 ]; then
+        launch_kind=chatgpt_login
+    elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
+        launch_kind=chatgpt_login
+    elif [ "$api_ready" = 1 ]; then
+        launch_kind=api_key
+    elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
+        launch_kind=api_key
     fi
     printf '%s' "$why" >"$work/codex_exec.why"
     attempted=false
     exit_code=
     answered=false
     bytes=0
-    if [ "$credential" != none ]; then
+    if [ "$launch_kind" != none ]; then
         attempted=true
         out=$(cd "$SCAN_ROOT" && timeout 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 2>/dev/null </dev/null)
         exit_code=$?
@@ -452,7 +517,7 @@ ensure_codex_exec() {
             answered=true
         fi
     fi
-    jq -n --arg credential "$credential" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
+    jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
           answered: $answered, output_bytes: $bytes}' >"$work/codex_exec.json"
@@ -553,7 +618,7 @@ credential_variables() {
 }
 
 is_placeholder() {
-    jq -en --arg v "$1" --arg re "$PLACEHOLDER_RE" '$v | test($re + "\\z")' >/dev/null 2>&1
+    jq -Rrse --arg re "$PLACEHOLDER_RE" 'test($re + "\\z")' >/dev/null 2>&1
 }
 
 scan_leaks() {
@@ -1174,7 +1239,7 @@ step_J09() (
         bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
     fi
     provider=null
-    if [ -n "$bearer" ] && is_placeholder "$bearer"; then
+    if [ -n "$bearer" ] && printf '%s' "$bearer" | is_placeholder; then
         : >"$work/provider.body"
         provider=$(egress https://api.openai.com/v1/models "$bearer" "$work/provider.body")
     fi
