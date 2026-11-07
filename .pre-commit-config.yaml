@@ -4,13 +4,20 @@ repos:
       - id: gitleaks
         name: gitleaks
         language: system
-        entry: sh -c 'for file; do gitleaks dir --redact --no-banner -- "$file" || exit 1; done' gitleaks
+        entry: sh hooks/gitleaks.sh
+        types: []
+        types_or: [file, symlink]
       - id: gitleaks-cases
         name: staged gitleaks cases
         language: system
         entry: sh tests/gitleaks.sh
-        files: ^(.pre-commit-config.yaml|tests/gitleaks\.sh)$
+        files: ^(.pre-commit-config.yaml|tests/gitleaks\.sh|hooks/gitleaks\.sh|hooks/gitleaks-(trace2|stderr)\.jq)$
         pass_filenames: false
+      - id: gitleaks-filter-syntax
+        name: gitleaks filter syntax
+        language: system
+        entry: sh -c 'for file; do jq -nR --argjson expected "[]" --arg mode git -f "$file" </dev/null >/dev/null || exit 1; done' gitleaks-filter-syntax
+        files: ^hooks/gitleaks-(trace2|stderr)\.jq$
       - id: shellcheck
         name: shellcheck
         language: system
