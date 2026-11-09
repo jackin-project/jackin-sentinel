@@ -23,7 +23,6 @@ prompt = "Fail the preflight hook (1) or pass it (0):"
 instructions = "instructions/codex.md"
 
 [agents.omp]
-model = "glm-5.3"
 instructions = "instructions/omp.md"
 
 [agents.claude]

@@ -1,6 +1,6 @@
 # jackin-sentinel
 
-jackin-sentinel is the verification role of jackin. It proves that jackin works from the host to the Codex process in the sandbox. Codex is the only agent.
+jackin-sentinel is the verification role of jackin. It proves that jackin works from the host to the selected agent process in the sandbox. The manifest maps Codex to `instructions/codex.md`, omp to `instructions/omp.md`, and Claude Code to `instructions/claude.md`. The selected D29 tuple chooses the provider and model.
 
 `xtask e2e` in the jackin repository runs the sentinel journey (J00 to J17). The steps are in the Sentinel journey table of `rewrite/PLAN.md` in jackin. The journey compares what the host sees with what the probe in the sandbox reports.
 
@@ -10,7 +10,7 @@ Jackin builds the image and creates the sandbox. This repository does not publis
 
 The `Dockerfile` ends in a stage that starts `FROM construct`. One `RUN` layer installs `jackin-sentinel-probe` at `/usr/local/bin/jackin-sentinel-probe`, owned by root. The layer prints its own lines, so the build output shows the sentinel layer.
 
-Jackin adds Codex, `jackin-start`, and the two hooks when it derives the final image (decisions D05 and D11).
+Jackin adds the selected agent binaries, `jackin-start`, and the two hooks when it derives the final image (decisions D05 and D11).
 
 The probe is a POSIX `sh` script that needs `jq`. The construct image has `jq`.
 
@@ -19,7 +19,7 @@ The probe is a POSIX `sh` script that needs `jq`. The construct image has `jq`.
 `policy.yaml` is a native OpenShell policy that jackin sends without change.
 
 - The role has no network rule. The sandbox cannot reach any host that the role names, because the role names none.
-- The only egress is the rule that OpenShell adds for the Codex provider hosts.
+- The only provider egress comes from the rules that OpenShell adds for the selected tuples.
 - `/bin`, `/sbin`, `/usr`, `/lib`, `/etc`, `/proc`, `/dev/urandom`, and `/var/log` are read-only. `/sandbox`, `/tmp`, and `/dev/null` are writable.
 - `landlock.compatibility` is `hard_requirement`, so the sandbox fails to start where Landlock is unavailable.
 
@@ -38,8 +38,8 @@ Jackin runs each hook through exec as the user `sandbox`, in `/sandbox/project`,
 | Hook | Runs | Log line |
 |---|---|---|
 | `hooks/setup.sh` | Once for each launch | `setup launch=<launch-id> flag=<value>` in `setup.log` |
-| `hooks/preflight.sh` | Before each Codex start | `preflight ok flag=<value>` in `preflight.log` |
-| `hooks/preflight.sh` | Before each Codex start, when `SENTINEL_FAIL_PREFLIGHT` is `1` | `preflight fail flag=1` in `preflight.log`, then exit code 17 |
+| `hooks/preflight.sh` | Before each agent start | `preflight ok flag=<value>` in `preflight.log` |
+| `hooks/preflight.sh` | Before each agent start, when `SENTINEL_FAIL_PREFLIGHT` is `1` | `preflight fail flag=1` in `preflight.log`, then exit code 17 |
 
 A non-zero exit stops the launch. The sandbox stays `Ready`. Each log line is one execution. `setup` adds no second line when a crash before the done marker runs it again for the same launch, but it adds one when the done marker of the launch already exists. The probe counts the lines, so a hook that jackin runs twice after success is a visible failure. The hook files in the image are owned by root. The agent cannot change them.
 
@@ -64,7 +64,7 @@ To make the preflight hook fail, pass the variable:
 jackin load sentinel <project> --env SENTINEL_FAIL_PREFLIGHT=1
 ```
 
-The launch stops with the hook error. Load again with the same launch ID and without the variable to start Codex (journey step J06).
+The launch stops with the hook error. Load again with the same launch ID and without the variable to start the selected agent (journey step J06).
 
 ## The probe
 
@@ -88,15 +88,15 @@ Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, 
 
 | Step | What the probe reports |
 |---|---|
-| J00 | The Codex binary and the output of `codex --version`. |
+| J00 | The selected agent binary and its version output. |
 | J04 | The user, uid, gid, whether `sudo` works, and whether a `docker` binary exists. |
 | J05 | The sha256 digest of every regular file below `/sandbox/project`, outside `.git`. |
 | J06 | The execution counts of the hooks, and the owner and mode of the installed hook files. |
-| J07 | The main process, its Codex child, and the answer of a `codex exec` call. |
-| J08 | Whether every credential variable (any letter case) and every token in `auth.json` is a full placeholder (`openshell:resolve:env:NAME` and nothing else), and which files hold a token-shaped string. The probe never prints a value. |
-| J09 | The `curl` exit code and HTTP code for a host outside the policy, the metadata address, and a Codex provider host. A denial is curl exit 7 with no HTTP response. Exit 6 (the name did not resolve), a missing `curl`, and any other exit are not a denial. The provider check sends only a full placeholder and passes only on the provider's HTTP 401 invalid-key answer that names that placeholder (the provider masks the middle of the key); the probe compares that body and never prints it. `codex exec` runs only when every credential in the sandbox is a full placeholder. |
+| J07 | The main process, its selected agent child, and the answer of the selected agent's execution command. |
+| J08 | Whether every credential variable (any letter case) and every token in the selected tuple's auth file is a full placeholder (`openshell:resolve:env:NAME` and nothing else), and which files hold a token-shaped string. The probe never prints a value. |
+| J09 | The `curl` exit code and HTTP code for a host outside the policy, the metadata address, and a selected provider host. A denial is curl exit 7 with no HTTP response. Exit 6 (the name did not resolve), a missing `curl`, and any other exit are not a denial. The provider check sends only a full placeholder and applies the selected tuple's response rule. The probe compares that body and never prints it. The selected agent's execution command runs only when every credential in the sandbox is a full placeholder. |
 | J10 | Which file creations succeed under `/sandbox` and `/tmp` and which fail elsewhere. |
-| J11 | The Codex process with its pid and start time, for a comparison before and after a detach. |
+| J11 | The selected agent process with its pid and start time, for a comparison before and after a detach. |
 | J12 | The probe process, its controlling terminal, and whether it descends from the main process. |
 | J13 | The git state of `/sandbox/project`: branches, tips, HEAD, cleanliness, and stash count. |
 | J14 | A marker file, the boot id, and the hook counts, for a comparison after stop and start. |
@@ -118,7 +118,7 @@ jackin-sentinel-probe | jq .
 jackin-sentinel-probe --docker on --only J15 | jq .
 ```
 
-J07 and J09 run `codex exec` only when the sandbox has a configured OpenShell placeholder credential. The bounded stdout capture can wait up to 280 seconds, separate from the deadlines for other journey checks. The `output_bytes` fact counts the observed stdout prefix, up to 65,537 bytes. Byte 65,537 marks overflow, so output longer than 65,536 bytes fails even when `ready` appears in the prefix. J15 pulls `hello-world` through the engine. Its run and info commands accept at most 65,536 output bytes each; overflow or incomplete capture fails the affected check. Run captures merged stdout and stderr; info captures stdout. Producer and capture deadlines are 300 seconds for run and 60 seconds for info, with a further drain deadline of 30 seconds and a five-second kill grace. These bounds do not establish descendant cleanup.
+J07 and J09 run the selected agent's execution command only when the sandbox has a configured OpenShell placeholder credential. The bounded stdout capture can wait up to 280 seconds, separate from the deadlines for other journey checks. The `output_bytes` fact counts the observed stdout prefix, up to 65,537 bytes. Byte 65,537 marks overflow, so output longer than 65,536 bytes fails even when `ready` appears in the prefix. J15 pulls `hello-world` through the engine. Its run and info commands accept at most 65,536 output bytes each; overflow or incomplete capture fails the affected check. Run captures merged stdout and stderr; info captures stdout. Producer and capture deadlines are 300 seconds for run and 60 seconds for info, with a further drain deadline of 30 seconds and a five-second kill grace. These bounds do not establish descendant cleanup.
 
 ## Docker capability
 
