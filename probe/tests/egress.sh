@@ -274,13 +274,14 @@ expect_codex_not_run() {
 bounded() {
     limit=$1
     shift
-    "$@" >"$scratch/bounded.out" 2>"$scratch/bounded.err" &
+    "$python_bin" -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1],sys.argv[1:])' "$@" \
+        >"$scratch/bounded.out" 2>"$scratch/bounded.err" &
     pid=$!
     ticks=0
     while kill -0 "$pid" 2>/dev/null; do
         ticks=$((ticks + 1))
         if [ "$ticks" -gt $((limit * 10)) ]; then
-            kill -KILL "$pid" 2>/dev/null
+            kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
             wait "$pid" 2>/dev/null
             return 124
         fi
@@ -776,6 +777,21 @@ answer "$METADATA" 7 000
 begin j09_a_real_api_key_variable_blocks_codex_exec_next_to_a_placeholder_in_auth_json step_J09 '' OPENAI_API_KEY=FAKE-real-key
 expect codex_reaches_api SKIP 'not a full placeholder'
 expect_codex_not_run
+finish_case
+
+mk j09_auth_fifo_is_not_read_or_sent
+with_curl
+mkdir -p "$t/sandbox/.codex"
+mkfifo "$t/sandbox/.codex/auth.json"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+begin j09_auth_fifo_is_not_read_or_sent step_J09 ''
+expect codex_reaches_api SKIP ''
+expect provider_no_credential SKIP 'no placeholder to send'
+fact '.codex_exec.attempted' false
+fact '.provider_host' null
+[ -p "$t/sandbox/.codex/auth.json" ] || problems="$problems auth-fifo-changed"
+expect_never_sent 'FAKE-real-token'
 finish_case
 
 mk j09_a_real_refresh_token_blocks_codex_exec_next_to_a_placeholder_access_token

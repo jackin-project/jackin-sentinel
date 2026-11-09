@@ -11,7 +11,7 @@ failures=0
 total=0
 
 mkdir -p "$scratch/tools" "$scratch/shim"
-for tool in awk basename cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
+for tool in awk basename cat chmod cmp cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
     found=$(command -v "$tool") || {
         echo "FAIL setup: $tool is not installed"
         exit 70
@@ -20,6 +20,7 @@ for tool in awk basename cat chmod cp cut date dirname env find grep head jq ls 
 done
 real_id=$(command -v id) || exit 70
 real_uname=$(command -v uname) || exit 70
+real_dd_bin=$(command -v dd) || exit 70
 
 R_OK1='jackin-env-kinds 1\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_KEY placeholder\ncodex GITHUB_TOKEN empty\ncodex OPENAI_API_KEY placeholder\n'
 R_W0='jackin-env-kinds 1\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
@@ -36,7 +37,9 @@ mk() {
 
 prepare_probe() {
     fixture_path=${1:-$t/bin:$scratch/shim:$scratch/tools}
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" "$probe" >"$t/probe"
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" \
+        -e "s#^START_BIN=.*#START_BIN=$t/sandbox/usr/local/bin/jackin-start#" \
+        -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/sandbox/usr/local/bin/codex#" "$probe" >"$t/probe"
     if grep -q '^SANDBOX_PATH=' "$t/probe"; then
         sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe" >"$t/probe.next" || return 1
         mv "$t/probe.next" "$t/probe" || return 1
@@ -56,16 +59,44 @@ record() {
     printf '%b' "$1" >"$t/sandbox/.jackin/run/env-kinds"
 }
 
+proc_launcher() {
+    proc_fixture_binaries
+    pid=$1
+    parent=$2
+    ticks=$3
+    mkdir -p "$t/proc/$pid"
+    printf '%s\0%s\0' "$proc_shell_arg" "$proc_start_bin" >"$t/proc/$pid/cmdline"
+    printf '%s (jackin-start) S %s %s %s 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' \
+        "$pid" "$parent" "$pid" "$pid" "$ticks" >"$t/proc/$pid/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/$pid/status"
+    ln -s "$proc_shell_exe" "$t/proc/$pid/exe"
+}
+
 proc_main() {
-    mkdir -p "$t/proc/100"
-    printf '/usr/local/bin/jackin-start\0codex\0' >"$t/proc/100/cmdline"
-    printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+    proc_launcher 100 1 100
 }
 
 proc_codex() {
+    proc_fixture_binaries
     mkdir -p "$t/proc/101"
-    printf 'codex\0--sandbox\0' >"$t/proc/101/cmdline"
+    printf '%s\0--sandbox\0' "$proc_codex_bin" >"$t/proc/101/cmdline"
     printf '101 (codex) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0 0\n' >"$t/proc/101/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/101/status"
+    ln -s "$proc_codex_exe" "$t/proc/101/exe"
+}
+
+proc_fixture_binaries() {
+    proc_start_bin=$t/sandbox/usr/local/bin/jackin-start
+    proc_codex_bin=$t/sandbox/usr/local/bin/codex
+    proc_shell_arg=/bin/sh
+    mkdir -p "$t/sandbox/usr/local/bin"
+    printf '#!/bin/sh\n' >"$proc_start_bin"
+    chmod +x "$proc_start_bin"
+    proc_shell_exe=$(readlink -f /bin/sh)
+    if [ ! -e "$proc_codex_bin" ]; then
+        ln -s "$proc_shell_exe" "$proc_codex_bin"
+    fi
+    proc_codex_exe=$(readlink -f "$proc_codex_bin")
 }
 
 environ() {
@@ -134,13 +165,14 @@ setup_failed() {
 bounded() {
     limit=$1
     shift
-    "$@" >"$scratch/bounded.out" 2>"$scratch/bounded.err" &
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1],sys.argv[1:])' "$@" \
+        >"$scratch/bounded.out" 2>"$scratch/bounded.err" &
     pid=$!
     ticks=0
     while kill -0 "$pid" 2>/dev/null; do
         ticks=$((ticks + 1))
         if [ "$ticks" -gt $((limit * 10)) ]; then
-            kill -KILL "$pid" 2>/dev/null
+            kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
             wait "$pid" 2>/dev/null
             return 124
         fi
@@ -151,7 +183,7 @@ bounded() {
 
 printf '#!/bin/sh\necho Linux\n' >"$scratch/shim/uname"
 printf '#!/bin/sh\n[ "$*" = -un ] && echo sandbox && exit 0\nexec %s "$@"\n' "$real_id" >"$scratch/shim/id"
-cat >"$scratch/shim/dd" <<'EOF'
+    cat >"$scratch/shim/dd" <<EOF
 #!/usr/bin/env python3
 import os
 import sys
@@ -159,7 +191,9 @@ import sys
 arguments = dict(argument.split("=", 1) for argument in sys.argv[1:] if "=" in argument)
 source = arguments.get("if")
 destination = arguments.get("of")
-if arguments.get("bs") != "65" or arguments.get("count") != "1" or arguments.get("iflag") != "nonblock,nofollow":
+if not source:
+    os.execv("$real_dd_bin", ["dd", *sys.argv[1:]])
+if not arguments.get("bs", "").isdigit() or arguments.get("count") != "1" or arguments.get("iflag") != "nonblock,nofollow":
     raise SystemExit(64)
 if not source or not destination:
     raise SystemExit(64)
@@ -171,7 +205,7 @@ try:
 except OSError:
     raise SystemExit(1)
 try:
-    data = os.read(descriptor, 65)
+    data = os.read(descriptor, int(arguments["bs"]))
 finally:
     os.close(descriptor)
 descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -303,6 +337,232 @@ verify() {
     fact '.start_record.state' "$4"
     finish_case
 }
+
+probe_file=/usr/local/lib/jackin/probe-file
+file_helper() {
+    cat >"$1/run-helper.sh" <<'EOF'
+"$1" read "$2" "$3" 3>"$4" >"$5"
+EOF
+    chmod +x "$1/run-helper.sh"
+    bounded 5 sh "$1/run-helper.sh" "$probe_file" "$2" "$3" "$4" "$5"
+}
+
+mk probe_file_exact_byte_cap_returns_fd_metadata
+name=probe_file_exact_byte_cap_returns_fd_metadata
+problems=
+: >"$t/out"
+: >"$t/err"
+head -c 64 /dev/zero >"$t/input"
+metadata_expected=$(stat -c '%d|%i|%s|%a|%u' "$t/input")
+file_helper "$t" 64 "$t/input" "$t/metadata" "$t/helper.out"
+rc=$?
+[ "$rc" -eq 0 ] || problems="rc=$rc(want 0)"
+cmp -s "$t/input" "$t/helper.out" || problems="$problems bytes-changed"
+[ "$(cat "$t/metadata")" = "$metadata_expected" ] || problems="$problems fd-metadata-mismatch"
+cp "$scratch/bounded.out" "$t/out"
+cp "$scratch/bounded.err" "$t/err"
+finish_case
+
+mk probe_file_one_byte_over_cap_is_rejected_without_output
+name=probe_file_one_byte_over_cap_is_rejected_without_output
+problems=
+: >"$t/out"
+: >"$t/err"
+head -c 65 /dev/zero >"$t/input"
+file_helper "$t" 64 "$t/input" "$t/metadata" "$t/helper.out"
+rc=$?
+[ "$rc" -eq 66 ] || problems="rc=$rc(want 66)"
+[ ! -s "$t/helper.out" ] || problems="$problems partial-output"
+[ ! -s "$t/metadata" ] || problems="$problems metadata-on-failure"
+cp "$scratch/bounded.out" "$t/out"
+cp "$scratch/bounded.err" "$t/err"
+finish_case
+
+for kind in direct_fifo directory symlink_regular symlink_fifo symlink_parent missing; do
+    mk "probe_file_${kind}_is_rejected_bounded"
+    name="probe_file_${kind}_is_rejected_bounded"
+    problems=
+    input=$t/input
+    : >"$t/out"
+    : >"$t/err"
+    case $kind in
+        direct_fifo)
+            mkfifo "$t/input"
+            wanted=65
+            ;;
+        directory)
+            mkdir "$t/input"
+            wanted=65
+            ;;
+        symlink_regular)
+            printf 'unchanged' >"$t/target"
+            ln -s "$t/target" "$t/input"
+            wanted=68
+            ;;
+        symlink_fifo)
+            mkfifo "$t/target"
+            ln -s "$t/target" "$t/input"
+            wanted=68
+            ;;
+        symlink_parent)
+            mkdir "$t/target-dir"
+            printf 'unchanged' >"$t/target-dir/input"
+            ln -s "$t/target-dir" "$t/link-dir"
+            input="$t/link-dir/input"
+            wanted=68
+            ;;
+        missing)
+            input="$t/missing"
+            wanted=69
+            ;;
+    esac
+    input=${input:-$t/input}
+    file_helper "$t" 64 "$input" "$t/metadata" "$t/helper.out"
+    rc=$?
+    [ "$rc" -eq "$wanted" ] || problems="rc=$rc(want $wanted)"
+    [ ! -s "$t/helper.out" ] || problems="$problems output-on-rejection"
+    [ ! -s "$t/metadata" ] || problems="$problems metadata-on-rejection"
+    case $kind in
+        direct_fifo) [ -p "$t/input" ] || problems="$problems fifo-changed" ;;
+        directory) [ -d "$t/input" ] || problems="$problems directory-changed" ;;
+        symlink_regular)
+            [ -L "$t/input" ] && [ "$(cat "$t/target")" = unchanged ] || problems="$problems regular-link-target-changed"
+            ;;
+        symlink_fifo)
+            [ -L "$t/input" ] && [ -p "$t/target" ] || problems="$problems fifo-link-target-changed"
+            ;;
+        symlink_parent)
+            [ -L "$t/link-dir" ] && [ "$(cat "$t/target-dir/input")" = unchanged ] || problems="$problems parent-link-target-changed"
+            ;;
+    esac
+    cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
+    finish_case
+done
+
+mk probe_file_create_stays_on_the_fd_pinned_parent_after_rename
+name=probe_file_create_stays_on_the_fd_pinned_parent_after_rename
+problems=
+cat >"$t/pinned-parent.py" <<'PY'
+import fcntl
+import os
+import platform
+import subprocess
+import sys
+import time
+
+helper, root = sys.argv[1:3]
+original = os.path.join(root, "parent")
+moved = os.path.join(root, "parent-renamed")
+replacement = original
+name = "probe-artifact"
+os.mkdir(original, 0o700)
+original_stat = os.stat(original)
+read_fd, write_fd = os.pipe()
+read_copy = os.dup(read_fd)
+os.close(read_fd)
+read_fd = read_copy
+os.close(3) if 3 in {read_fd, write_fd} else None
+os.dup2(write_fd, 3)
+os.close(write_fd)
+old_flags = fcntl.fcntl(3, fcntl.F_GETFL)
+fcntl.fcntl(3, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+prefilled = 0
+try:
+    while True:
+        prefilled += os.write(3, b"x" * 4096)
+except BlockingIOError:
+    pass
+fcntl.fcntl(3, fcntl.F_SETFL, old_flags)
+process = None
+try:
+    process = subprocess.Popen(
+        [helper, "create", original, name],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        pass_fds=(3,),
+    )
+    process.stdin.write(b"probe-safe\n")
+    process.stdin.close()
+    os.close(3)
+    if platform.machine().lower() in ("x86_64", "amd64"):
+        write_number = 1
+    elif platform.machine().lower() in ("aarch64", "arm64"):
+        write_number = 64
+    else:
+        raise SystemExit("unsupported Linux syscall ABI")
+    deadline = time.monotonic() + 10
+    blocked = False
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{process.pid}/syscall", "r", encoding="ascii") as source:
+                fields = source.read().split()
+            if int(fields[0], 0) == write_number and int(fields[1], 0) == 3:
+                blocked = True
+                break
+        except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+            pass
+    if not blocked:
+        raise SystemExit("helper did not block writing DAC metadata to fd 3")
+    pinned = False
+    for descriptor in os.listdir(f"/proc/{process.pid}/fd"):
+        try:
+            status = os.stat(f"/proc/{process.pid}/fd/{descriptor}")
+        except (FileNotFoundError, PermissionError):
+            continue
+        if (status.st_dev, status.st_ino) == (original_stat.st_dev, original_stat.st_ino):
+            pinned = True
+            break
+    if not pinned:
+        raise SystemExit("helper did not retain the original parent directory fd")
+    os.rename(original, moved)
+    os.mkdir(replacement, 0o700)
+    replacement_stat = os.stat(replacement)
+    if (replacement_stat.st_dev, replacement_stat.st_ino) == (original_stat.st_dev, original_stat.st_ino):
+        raise SystemExit("replacement parent reused the opened directory identity")
+    remaining = prefilled
+    while remaining:
+        chunk = os.read(read_fd, min(65536, remaining))
+        if not chunk:
+            raise SystemExit("prefilled metadata pipe closed before it was drained")
+        remaining -= len(chunk)
+    if process.wait(timeout=10) != 0:
+        raise SystemExit("helper did not create the file under the pinned parent")
+    metadata = bytearray()
+    while True:
+        chunk = os.read(read_fd, 4096)
+        if not chunk:
+            break
+        metadata.extend(chunk)
+    if bytes(metadata) != b"1\n":
+        raise SystemExit("helper DAC metadata did not describe the pinned parent")
+    created = os.path.join(moved, name)
+    if open(created, "rb").read() != b"probe-safe\n":
+        raise SystemExit("created file content differs")
+    if os.path.lexists(os.path.join(replacement, name)):
+        raise SystemExit("created file followed the replaced parent path")
+finally:
+    if process is not None and process.poll() is None:
+        process.kill()
+        process.wait()
+    try:
+        os.close(3)
+    except OSError:
+        pass
+    try:
+        os.close(read_fd)
+    except OSError:
+        pass
+PY
+: >"$t/out"
+: >"$t/err"
+bounded 15 python3 "$t/pinned-parent.py" "$probe_file" "$t/pinned"
+rc=$?
+[ "$rc" -eq 0 ] || problems="rc=$rc(want 0)"
+cp "$scratch/bounded.out" "$t/out"
+cp "$scratch/bounded.err" "$t/err"
+finish_case
 
 mk pass_via_record
 state 'exited 1 0'
@@ -483,18 +743,6 @@ rm -f "$t/sandbox/.jackin/run/state"
 ln -s "$t/valid-state" "$t/sandbox/.jackin/run/state"
 record "$R_OK1"
 verify skip_symlink_run_state_with_matching_start_record SKIP stale stale
-
-mk skip_swapped_symlink_run_state_with_matching_start_record
-state 'exited 1 0'
-printf 'exited 1 0\n' >"$t/valid-state"
-record "$R_OK1"
-begin skip_swapped_symlink_run_state_with_matching_start_record \
-    env SENTINEL_DD_SWAP_PATH="$t/sandbox/.jackin/run/state" SENTINEL_DD_SWAP_TARGET="$t/valid-state" sh "$t/probe" --only J08
-expect_rc 0
-expect_report J08 sandbox
-expect environment SKIP 'stale'
-fact '.start_record.state' stale
-finish_case
 
 mk skip_codex_not_yet_started
 state waiting
@@ -765,7 +1013,7 @@ j10_seams "$t/missing"
 begin j10_missing_denied_directory_is_not_proof_of_a_policy sh "$t/probe" --only J10
 expect_rc 0
 expect_report J10 sandbox
-expect denied_writes PASS 'no file could be created'
+expect denied_writes SKIP 'no existing denied directory'
 expect denial_by_policy FAIL 'not proven'
 j10_stays_inside
 finish_case
@@ -779,7 +1027,7 @@ if [ "$(id -u)" -ne 0 ]; then
     chmod 755 "$t/denied_nosearch"
     expect_rc 0
     expect_report J10 sandbox
-    expect denied_writes PASS 'no file could be created'
+    expect denied_writes FAIL 'failed for another reason'
     expect denial_by_policy FAIL 'not proven'
     fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' false
     j10_stays_inside
@@ -799,33 +1047,37 @@ begin j10_eexist_in_a_mode_writable_directory_is_not_attributed_to_policy \
     sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
 expect_rc 0
 expect_report J10 sandbox
-expect denied_writes PASS 'no file could be created'
+expect denied_writes FAIL 'collided'
 expect denial_by_policy FAIL 'not proven'
 fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
 j10_stays_inside
 finish_case
 
 if [ "$(id -u)" -ne 0 ]; then
-    mk j10_eacces_in_a_mode_writable_directory_supports_policy_attribution
+    mk j10_mode_000_fifo_collision_does_not_support_policy_attribution
     mkdir "$t/denied_policy"
     j10_seams "$t/denied_policy"
     cat >"$t/occupy_then_probe.sh" <<'WRAP'
 mkfifo "$1/jackin-sentinel-j10-$$"
 chmod 000 "$1/jackin-sentinel-j10-$$"
+printf '%s\n' "$$" >"$3"
 exec sh "$2" --only J10
 WRAP
-    begin j10_eacces_in_a_mode_writable_directory_supports_policy_attribution \
-        sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
-    chmod 600 "$t/denied_policy/jackin-sentinel-j10-$$" 2>/dev/null || true
+    begin j10_mode_000_fifo_collision_does_not_support_policy_attribution \
+        sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe" "$t/candidate-pid"
     expect_rc 0
     expect_report J10 sandbox
-    expect denied_writes PASS 'no file could be created'
-    expect denial_by_policy PASS 'denied_policy'
+    expect denied_writes FAIL 'collided'
+    expect denial_by_policy FAIL 'not proven'
     fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
+    candidate_pid=$(cat "$t/candidate-pid")
+    candidate=$t/denied_policy/jackin-sentinel-j10-$candidate_pid
+    [ -p "$candidate" ] || problems="$problems fifo-collision-changed"
+    [ "$(stat -c %a "$candidate")" = 0 ] || problems="$problems fifo-mode-changed"
     j10_stays_inside
     finish_case
 else
-    echo "skip j10_eacces_case: running as root"
+    echo "skip j10_mode_000_fifo_collision_does_not_support_policy_attribution: running as root"
 fi
 
 mk j10_eisdir_in_a_mode_writable_directory_is_not_attributed_to_policy
@@ -839,16 +1091,30 @@ begin j10_eisdir_in_a_mode_writable_directory_is_not_attributed_to_policy \
     sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe"
 expect_rc 0
 expect_report J10 sandbox
-expect denied_writes PASS 'no file could be created'
+expect denied_writes FAIL 'collided'
 expect denial_by_policy FAIL 'not proven'
 fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
 j10_stays_inside
 finish_case
 
 proc_codex_child() {
+    proc_fixture_binaries
     mkdir -p "$t/proc/$1"
-    printf 'codex\0--sandbox\0' >"$t/proc/$1/cmdline"
-    printf '%s (codex) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$1" >"$t/proc/$1/stat"
+    parent=${2:-100}
+    printf '%s\0--sandbox\0' "$proc_codex_bin" >"$t/proc/$1/cmdline"
+    printf '%s (codex) S %s %s %s 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$parent" "$parent" "$parent" "$1" >"$t/proc/$1/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/$1/status"
+    ln -s "$proc_codex_exe" "$t/proc/$1/exe"
+}
+
+proc_orphan() {
+    proc_fixture_binaries
+    pid=$1
+    mkdir -p "$t/proc/$pid"
+    printf '/bin/sh\0-c\0sleep 100\0' >"$t/proc/$pid/cmdline"
+    printf '%s (sh) S 1 %s %s 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$pid" "$pid" "$pid" "$pid" >"$t/proc/$pid/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/$pid/status"
+    ln -s "$proc_shell_exe" "$t/proc/$pid/exe"
 }
 
 processes() {
@@ -958,10 +1224,26 @@ expect codex_child FAIL '2 Codex processes'
 finish_case
 
 proc_tty_process() {
+    proc_fixture_binaries
     mkdir -p "$t/proc/$1"
-    printf '%s\0' "$2" >"$t/proc/$1/cmdline"
+    case $3 in
+        jackin-start)
+            printf '%s\0%s\0' "$proc_shell_arg" "$proc_start_bin" >"$t/proc/$1/cmdline"
+            exe=$proc_shell_exe
+            ;;
+        codex)
+            printf '%s\0--sandbox\0' "$proc_codex_bin" >"$t/proc/$1/cmdline"
+            exe=$proc_codex_exe
+            ;;
+        *)
+            printf '%s\0' "$2" >"$t/proc/$1/cmdline"
+            exe=$(readlink -f /bin/sh)
+            ;;
+    esac
     printf '%s (%s) S %s %s %s %s -1 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' \
         "$1" "$3" "$4" "$1" "$1" "$5" "$1" >"$t/proc/$1/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/$1/status"
+    ln -s "$exe" "$t/proc/$1/exe"
 }
 
 j12_case() {
@@ -1033,10 +1315,15 @@ main_marker=jackin-sentinel-main-argv0-synthetic-41f2c86a
 child_marker=jackin-sentinel-codex-option-synthetic-b709d3e1
 self_marker=jackin-sentinel-probe-positional-synthetic-63ac951d
 mkdir -p "$t/proc/100" "$t/proc/101"
-printf '%s\0%s\0' "/usr/local/bin/jackin-start-$main_marker" '--role=jackin' >"$t/proc/100/cmdline"
+proc_fixture_binaries
+printf '%s\0%s\0%s\0' "$proc_shell_arg" "$proc_start_bin" "$main_marker" >"$t/proc/100/cmdline"
 printf '100 (jackin-start) S 1 100 100 768 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
-printf 'codex\0--model\0%s\0' "$child_marker" >"$t/proc/101/cmdline"
+printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/100/status"
+ln -s "$proc_shell_exe" "$t/proc/100/exe"
+printf '%s\0--model\0%s\0' "$proc_codex_bin" "$child_marker" >"$t/proc/101/cmdline"
 printf '101 (codex) S 100 100 100 512 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0 0\n' >"$t/proc/101/stat"
+printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/101/status"
+ln -s "$proc_codex_exe" "$t/proc/101/exe"
 cat >"$t/run-probe.sh" <<'EOF'
 #!/bin/sh
 pid=$$
@@ -3312,6 +3599,628 @@ if git_project; then
 else
     setup_failed sandbox_git_shadow
 fi
+
+mk j08_authenticated_process_identity_supplies_the_live_environment
+state 'running 1'
+record "$R_OK1"
+proc_main
+proc_codex
+environ 100 'GITHUB_TOKEN=' 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+environ 101 'GITHUB_TOKEN=' 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+report j08_authenticated_process_identity_supplies_the_live_environment
+expect environment PASS 'via /proc'
+fact '.agent_environment.main' read
+fact '.agent_environment.codex' read
+finish_case
+
+for step in J07 J11; do
+    case_name=${step}_launcher_path_in_a_later_decoy_argument_is_not_a_launcher
+    mk "$case_name"
+    proc_fixture_binaries
+    mkdir -p "$t/proc/100"
+    printf 'sh\0decoy\0%s\0' "$proc_start_bin" >"$t/proc/100/cmdline"
+    printf '100 (sh) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/100/status"
+    ln -s "$proc_shell_exe" "$t/proc/100/exe"
+    proc_codex_child 101 100
+    proc_orphan 200
+    environ 200 'STRIPE_SECRET=sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+    state 'running 1'
+    processes "$case_name" "$step"
+    expect main_process FAIL 'no authenticated process'
+    expect codex_child SKIP 'not running'
+    fact '.processes.main' null
+    fact '.processes.codex | length' 0
+    not_disclosed 'sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+    finish_case
+
+    case_name=${step}_forged_launcher_argv0_with_wrong_argv1_is_not_authenticated
+    mk "$case_name"
+    proc_fixture_binaries
+    mkdir -p "$t/proc/100"
+    printf '%s\0decoy\0%s\0' "$proc_start_bin" "$proc_start_bin" >"$t/proc/100/cmdline"
+    printf '100 (sh) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/100/status"
+    ln -s "$proc_shell_exe" "$t/proc/100/exe"
+    proc_codex_child 101 100
+    processes "$case_name" "$step"
+    expect main_process FAIL 'no authenticated process'
+    expect codex_child SKIP 'not running'
+    fact '.processes.main' null
+    fact '.processes.codex | length' 0
+    finish_case
+
+    case_name=${step}_newline_inside_launcher_argument_is_not_a_slot_boundary
+    mk "$case_name"
+    proc_fixture_binaries
+    mkdir -p "$t/proc/100"
+    printf '%s\0decoy\n%s\0' "$proc_shell_arg" "$proc_start_bin" >"$t/proc/100/cmdline"
+    printf '100 (sh) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/100/status"
+    ln -s "$proc_shell_exe" "$t/proc/100/exe"
+    proc_codex_child 101 100
+    processes "$case_name" "$step"
+    expect main_process FAIL 'no authenticated process'
+    expect codex_child SKIP 'not running'
+    fact '.processes.main' null
+    fact '.processes.codex | length' 0
+    finish_case
+
+    for variant in wrong_executable wrong_uid missing_identity; do
+        case_name=${step}_launcher_$variant
+        mk "$case_name"
+        state 'running 1'
+        proc_main
+        case $variant in
+            wrong_executable)
+                rm "$t/proc/100/exe"
+                ln -s "$(readlink -f /bin/false)" "$t/proc/100/exe"
+                ;;
+            wrong_uid)
+                wrong_uid=$(($(id -u) + 1000))
+                printf 'Uid:\t%s\t%s\t%s\t%s\n' "$wrong_uid" "$wrong_uid" "$wrong_uid" "$wrong_uid" >"$t/proc/100/status"
+                ;;
+            missing_identity)
+                rm "$t/proc/100/status"
+                ;;
+        esac
+        proc_codex
+        processes "$case_name" "$step"
+        expect main_process FAIL 'no authenticated process'
+        expect codex_child SKIP 'not running'
+        finish_case
+    done
+
+    for variant in wrong_executable wrong_uid wrong_argv; do
+        case_name=${step}_codex_$variant
+        mk "$case_name"
+        state 'running 1'
+        proc_main
+        proc_codex
+        case $variant in
+            wrong_executable)
+                rm "$t/proc/101/exe"
+                ln -s "$(readlink -f /bin/false)" "$t/proc/101/exe"
+                ;;
+            wrong_uid)
+                wrong_uid=$(($(id -u) + 1000))
+                printf 'Uid:\t%s\t%s\t%s\t%s\n' "$wrong_uid" "$wrong_uid" "$wrong_uid" "$wrong_uid" >"$t/proc/101/status"
+                ;;
+            wrong_argv)
+                printf 'decoy\0--sandbox\0' >"$t/proc/101/cmdline"
+                ;;
+        esac
+        processes "$case_name" "$step"
+        expect main_process PASS 'pid 100'
+        expect codex_child FAIL 'no Codex child'
+        finish_case
+    done
+
+    case_name=${step}_nested_launcher_is_not_a_second_top_level_process
+    mk "$case_name"
+    state 'running 1'
+    proc_main
+    proc_launcher 102 100 102
+    proc_codex_child 101 100
+    processes "$case_name" "$step"
+    expect main_process PASS 'pid 100'
+    expect codex_child PASS 'as a child of the main process'
+    fact '.processes.main.pid' 100
+    finish_case
+done
+
+for order in low_first high_first; do
+    for step in J07 J11 J08; do
+        case_name=${step}_multiple_authenticated_top_level_launchers_$order
+        mk "$case_name"
+        state 'running 1'
+        record "$R_OK1"
+        if [ "$order" = low_first ]; then
+            proc_launcher 90 1 90
+            proc_launcher 100 1 100
+            proc_codex_child 101 90
+            environ 100 'STRIPE_SECRET=sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+        else
+            proc_launcher 100 1 100
+            proc_launcher 200 1 200
+            environ 100 'STRIPE_SECRET=sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+            proc_codex_child 201 200
+        fi
+        if [ "$step" = J08 ]; then
+            report "$case_name"
+            expect environment FAIL 'not unique and stable'
+            not_disclosed 'sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+        else
+            processes "$case_name" "$step"
+            expect main_process FAIL 'multiple authenticated top-level'
+            expect codex_child SKIP 'not running'
+            fact '.processes.main' null
+            fact '.processes.codex | length' 0
+        fi
+        finish_case
+    done
+done
+
+mk j08_decoy_launcher_environment_is_not_read
+state 'running 1'
+proc_fixture_binaries
+mkdir -p "$t/proc/100"
+printf 'sh\0decoy\0%s\0' "$proc_start_bin" >"$t/proc/100/cmdline"
+printf '100 (sh) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+printf 'Uid:\t%s\t%s\t%s\t%s\n' "$(id -u)" "$(id -u)" "$(id -u)" "$(id -u)" >"$t/proc/100/status"
+ln -s "$proc_shell_exe" "$t/proc/100/exe"
+environ 100 'STRIPE_SECRET=sk-SYNTHETIC-DECOY-CREDENTIAL-0123456789'
+proc_codex_child 101 100
+proc_orphan 200
+environ 200 'STRIPE_SECRET=sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+report j08_decoy_launcher_environment_is_not_read
+expect environment SKIP 'no start record'
+fact '.agent_environment.main' absent
+not_disclosed 'sk-SYNTHETIC-DECOY-CREDENTIAL-0123456789'
+not_disclosed 'sk-SYNTHETIC-ORPHAN-CREDENTIAL-0123456789'
+finish_case
+
+for kind in direct_fifo symlink_fifo symlink_regular directory dangling; do
+    case_name=j08_auth_path_${kind}_is_not_parsed
+    mk "$case_name"
+    state waiting
+    record "$R_EMPTY"
+    mkdir -p "$t/sandbox/.codex"
+    target=$t/auth-target
+    case $kind in
+        direct_fifo)
+            mkfifo "$t/sandbox/.codex/auth.json"
+            ;;
+        symlink_fifo)
+            mkfifo "$target"
+            ln -s "$target" "$t/sandbox/.codex/auth.json"
+            ;;
+        symlink_regular)
+            printf '%s' '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}' >"$target"
+            ln -s "$target" "$t/sandbox/.codex/auth.json"
+            ;;
+        directory)
+            mkdir "$t/sandbox/.codex/auth.json"
+            ;;
+        dangling)
+            ln -s "$target" "$t/sandbox/.codex/auth.json"
+            ;;
+    esac
+    report "$case_name"
+    expect auth_file FAIL 'not a regular file'
+    fact '.auth_file' null
+    case $kind in
+        direct_fifo) [ -p "$t/sandbox/.codex/auth.json" ] || problems="$problems auth-fifo-changed" ;;
+        symlink_fifo)
+            [ -p "$target" ] || problems="$problems auth-target-fifo-changed"
+            [ "$(readlink "$t/sandbox/.codex/auth.json")" = "$target" ] || problems="$problems auth-symlink-changed"
+            ;;
+        symlink_regular)
+            [ "$(cat "$target")" = '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}' ] || problems="$problems auth-target-changed"
+            [ "$(readlink "$t/sandbox/.codex/auth.json")" = "$target" ] || problems="$problems auth-symlink-changed"
+            ;;
+        directory) [ -d "$t/sandbox/.codex/auth.json" ] || problems="$problems auth-directory-changed" ;;
+        dangling)
+            [ -L "$t/sandbox/.codex/auth.json" ] || problems="$problems auth-symlink-changed"
+            [ "$(readlink "$t/sandbox/.codex/auth.json")" = "$target" ] || problems="$problems auth-symlink-target-changed"
+            ;;
+    esac
+    finish_case
+done
+
+mk j14_fresh_marker_is_created_exclusively
+printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+begin j14_fresh_marker_is_created_exclusively sh "$t/probe" --only J14
+expect_rc 0
+expect_report J14 sandbox
+expect marker PASS 'created=true'
+fact '.marker.created' true
+marker_id=$(cat "$t/sandbox/.sentinel/marker")
+printf '%s' "$marker_id" | grep -qE '^[0-9a-f]{32}$' || problems="$problems invalid-created-marker"
+finish_case
+
+for kind in direct_fifo symlink_fifo symlink_regular directory device_link; do
+    case_name=j14_marker_path_${kind}_is_not_credited
+    mk "$case_name"
+    mkdir -p "$t/sandbox/.sentinel"
+    printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+    target=$t/marker-target
+    case $kind in
+        direct_fifo)
+            mkfifo "$t/sandbox/.sentinel/marker"
+            ;;
+        symlink_fifo)
+            mkfifo "$target"
+            ln -s "$target" "$t/sandbox/.sentinel/marker"
+            ;;
+        symlink_regular)
+            printf '%s\n' '0123456789abcdef0123456789abcdef' >"$target"
+            ln -s "$target" "$t/sandbox/.sentinel/marker"
+            ;;
+        directory)
+            mkdir "$t/sandbox/.sentinel/marker"
+            ;;
+        device_link)
+            ln -s /dev/null "$t/sandbox/.sentinel/marker"
+            ;;
+    esac
+    begin "$case_name" sh "$t/probe" --only J14
+    expect_rc 0
+    expect_report J14 sandbox
+    expect marker FAIL 'holds no valid id'
+    fact '.marker.id' ''
+    case $kind in
+        direct_fifo) [ -p "$t/sandbox/.sentinel/marker" ] || problems="$problems marker-fifo-changed" ;;
+        symlink_fifo)
+            [ -p "$target" ] || problems="$problems marker-target-fifo-changed"
+            [ "$(readlink "$t/sandbox/.sentinel/marker")" = "$target" ] || problems="$problems marker-symlink-changed"
+            ;;
+        symlink_regular)
+            [ "$(cat "$target")" = '0123456789abcdef0123456789abcdef' ] || problems="$problems marker-target-changed"
+            [ "$(readlink "$t/sandbox/.sentinel/marker")" = "$target" ] || problems="$problems marker-symlink-changed"
+            ;;
+        directory) [ -d "$t/sandbox/.sentinel/marker" ] || problems="$problems marker-directory-changed" ;;
+        device_link) [ "$(readlink "$t/sandbox/.sentinel/marker")" = /dev/null ] || problems="$problems marker-device-link-changed" ;;
+    esac
+    finish_case
+done
+
+hook_log_file() {
+    mode=$1
+    path=$2
+    python3 - "$mode" "$path" <<'PY'
+import sys
+
+mode, path = sys.argv[1:]
+with open(path, "wb") as output:
+    if mode == "exact_setup":
+        output.write(b"x" * 65535 + b"\n")
+    elif mode == "exact_preflight":
+        prefix = b"preflight fail"
+        output.write(prefix + b"x" * (65535 - len(prefix)) + b"\n")
+    elif mode == "over":
+        output.write(b"x" * 65536 + b"\n")
+    elif mode == "sparse":
+        output.truncate(104857600)
+PY
+}
+
+for step in J06 J14; do
+    for kind in setup preflight; do
+        case_name=${step}_hook_log_${kind}_exact_limit_is_counted
+        mk "$case_name"
+        mkdir -p "$t/sandbox/.sentinel"
+        hook_log_file exact_setup "$t/sandbox/.sentinel/setup.log"
+        hook_log_file exact_preflight "$t/sandbox/.sentinel/preflight.log"
+        if [ "$step" = J06 ]; then
+            begin "$case_name" sh "$t/probe" --only J06
+            expect_rc 0
+            expect_report J06 sandbox
+            expect setup_runs PASS 'setup ran once'
+            expect preflight_runs PASS 'preflight ran 1 times, 1 failed'
+            fact '.setup_runs' 1
+            fact '.preflight_runs' 1
+            fact '.preflight_failures' 1
+        else
+            printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+            begin "$case_name" sh "$t/probe" --only J14
+            expect_rc 0
+            expect_report J14 sandbox
+            expect hook_logs PASS 'stable regular files'
+            fact '.setup_runs' 1
+            fact '.preflight_runs' 1
+        fi
+        finish_case
+    done
+
+    for kind in setup preflight; do
+        case_name=${step}_hook_log_${kind}_over_limit_is_incomplete
+        mk "$case_name"
+        mkdir -p "$t/sandbox/.sentinel"
+        printf 'setup\n' >"$t/sandbox/.sentinel/setup.log"
+        printf 'preflight fail\n' >"$t/sandbox/.sentinel/preflight.log"
+        hook_log_file over "$t/sandbox/.sentinel/$kind.log"
+        if [ "$step" = J06 ]; then
+            begin "$case_name" sh "$t/probe" --only J06
+            expect_rc 0
+            expect_report J06 sandbox
+            expect "${kind}_runs" FAIL 'stable regular file'
+            fact '.' null
+        else
+            printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+            begin "$case_name" sh "$t/probe" --only J14
+            expect_rc 0
+            expect_report J14 sandbox
+            expect hook_logs FAIL 'stable regular file'
+            fact '.' null
+        fi
+        finish_case
+    done
+
+    case_name=${step}_hook_log_large_sparse_file_is_incomplete
+    mk "$case_name"
+    mkdir -p "$t/sandbox/.sentinel"
+    printf 'preflight fail\n' >"$t/sandbox/.sentinel/preflight.log"
+    hook_log_file sparse "$t/sandbox/.sentinel/setup.log"
+    if [ "$step" = J06 ]; then
+        begin "$case_name" sh "$t/probe" --only J06
+        expect_rc 0
+        expect_report J06 sandbox
+        expect setup_runs FAIL 'stable regular file'
+        fact '.' null
+    else
+        printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+        begin "$case_name" sh "$t/probe" --only J14
+        expect_rc 0
+        expect_report J14 sandbox
+        expect hook_logs FAIL 'stable regular file'
+        fact '.' null
+    fi
+    finish_case
+
+    case_name=${step}_hook_log_fifo_does_not_block_or_count
+    mk "$case_name"
+    mkdir -p "$t/sandbox/.sentinel"
+    mkfifo "$t/sandbox/.sentinel/setup.log"
+    printf 'preflight fail\n' >"$t/sandbox/.sentinel/preflight.log"
+    if [ "$step" = J06 ]; then
+        begin "$case_name" sh "$t/probe" --only J06
+        expect_rc 0
+        expect_report J06 sandbox
+        expect setup_runs FAIL 'stable regular file'
+        fact '.' null
+    else
+        printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id"
+        begin "$case_name" sh "$t/probe" --only J14
+        expect_rc 0
+        expect_report J14 sandbox
+        expect hook_logs FAIL 'stable regular file'
+        fact '.' null
+    fi
+    [ -p "$t/sandbox/.sentinel/setup.log" ] || problems="$problems hook-fifo-changed"
+    finish_case
+done
+
+launch_env_series() {
+    path=$1
+    first=$2
+    count=$3
+    physical_line_bytes=$4
+    python3 - "$path" "$first" "$count" "$physical_line_bytes" <<'PY'
+import sys
+
+path, first, count, physical_line_bytes = sys.argv[1:]
+first = int(first)
+count = int(count)
+physical_line_bytes = int(physical_line_bytes)
+line_bytes = physical_line_bytes - 1
+with open(path, "wb") as output:
+    for index in range(first, first + count):
+        name = f"TOKEN_{index:03d}"
+        prefix = f"export {name}='"
+        placeholder_prefix = "openshell:resolve:env:"
+        value_size = line_bytes - len(prefix) - 1
+        if value_size < len(placeholder_prefix):
+            raise SystemExit(2)
+        value = placeholder_prefix + "X" * (value_size - len(placeholder_prefix))
+        line = prefix + value + "'"
+        if len(line) != line_bytes:
+            raise SystemExit(3)
+        output.write(line.encode() + b"\n")
+PY
+}
+
+launch_env_small_files() {
+    directory=$1
+    count=$2
+    python3 - "$directory" "$count" <<'PY'
+import os
+import sys
+
+directory, count = sys.argv[1:]
+count = int(count)
+for index in range(count):
+    name = f"TOKEN_{index:03d}"
+    path = os.path.join(directory, f"env-{index:03d}")
+    with open(path, "wb") as output:
+        output.write(f"export {name}='openshell:resolve:env:{name}'\n".encode())
+PY
+}
+
+launch_env_record() {
+    state 'exited 1 0'
+    record "$R_OK1"
+}
+
+mk j08_launch_environment_exact_file_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 32 131072
+report j08_launch_environment_exact_file_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 32
+finish_case
+
+mk j08_launch_environment_over_file_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 32 131072
+printf '%s\n' "export TOKEN_032='openshell:resolve:env:TOKEN_032'" >>"$t/sandbox/.jackin/env-000"
+report j08_launch_environment_over_file_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+mk j08_launch_environment_exact_aggregate_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 32 131072
+launch_env_series "$t/sandbox/.jackin/env-001" 32 32 131072
+report j08_launch_environment_exact_aggregate_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 64
+finish_case
+
+mk j08_launch_environment_over_aggregate_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 32 131072
+launch_env_series "$t/sandbox/.jackin/env-001" 32 32 131072
+printf '%s\n' "export TOKEN_064='openshell:resolve:env:TOKEN_064'" >"$t/sandbox/.jackin/env-002"
+report j08_launch_environment_over_aggregate_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+mk j08_launch_environment_exact_line_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 1 131073
+report j08_launch_environment_exact_line_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 1
+finish_case
+
+mk j08_launch_environment_over_line_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 1 131074
+report j08_launch_environment_over_line_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+for count in 128 129; do
+    case_name=j08_launch_environment_${count}_files
+    mk "$case_name"
+    launch_env_record
+    mkdir -p "$t/sandbox/.jackin"
+    launch_env_small_files "$t/sandbox/.jackin" "$count"
+    report "$case_name"
+    if [ "$count" -eq 128 ]; then
+        expect environment PASS 'every credential variable is a placeholder'
+        fact '.environment | map(select(.source == "launch_env")) | length' 128
+    else
+        expect environment FAIL 'exceed bounded limits'
+    fi
+    finish_case
+done
+
+mk j08_launch_environment_malformed_file_cannot_be_hidden_by_a_placeholder
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$t/sandbox/.jackin/env-000"
+printf '%s\n' 'malformed' >"$t/sandbox/.jackin/env-001"
+report j08_launch_environment_malformed_file_cannot_be_hidden_by_a_placeholder
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+for kind in symlink_regular symlink_fifo direct_fifo; do
+    case_name=j08_launch_environment_${kind}_is_rejected
+    mk "$case_name"
+    launch_env_record
+    mkdir -p "$t/sandbox/.jackin"
+    target=$t/launch-target
+    case $kind in
+        symlink_regular)
+            printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$target"
+            ln -s "$target" "$t/sandbox/.jackin/env-000"
+            ;;
+        symlink_fifo)
+            mkfifo "$target"
+            ln -s "$target" "$t/sandbox/.jackin/env-000"
+            ;;
+        direct_fifo)
+            mkfifo "$t/sandbox/.jackin/env-000"
+            ;;
+    esac
+    report "$case_name"
+    expect environment FAIL 'exceed bounded limits'
+    fact '.environment | map(select(.source == "launch_env")) | length' 0
+    case $kind in
+        symlink_regular)
+            [ "$(cat "$target")" = "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" ] || problems="$problems launch-target-changed"
+            [ "$(readlink "$t/sandbox/.jackin/env-000")" = "$target" ] || problems="$problems launch-symlink-changed"
+            ;;
+        symlink_fifo)
+            [ -p "$target" ] || problems="$problems launch-target-fifo-changed"
+            [ "$(readlink "$t/sandbox/.jackin/env-000")" = "$target" ] || problems="$problems launch-symlink-changed"
+            ;;
+        direct_fifo) [ -p "$t/sandbox/.jackin/env-000" ] || problems="$problems launch-fifo-changed" ;;
+    esac
+    finish_case
+done
+
+for kind in mode000_fifo accessible_fifo symlink_fifo symlink_regular; do
+    case_name=j10_${kind}_collision_does_not_support_policy_attribution
+    mk "$case_name"
+    mkdir "$t/denied_policy"
+    j10_seams "$t/denied_policy"
+    cat >"$t/occupy_then_probe.sh" <<'WRAP'
+candidate=$1/jackin-sentinel-j10-$$
+case $4 in
+    mode000_fifo)
+        mkfifo "$candidate"
+        chmod 000 "$candidate"
+        ;;
+    accessible_fifo)
+        mkfifo "$candidate"
+        ;;
+    symlink_fifo)
+        mkfifo "$1/target"
+        ln -s "$1/target" "$candidate"
+        ;;
+    symlink_regular)
+        printf '%s' 'collision-target' >"$1/target"
+        ln -s "$1/target" "$candidate"
+        ;;
+esac
+printf '%s\n' "$$" >"$3"
+exec sh "$2" --only J10
+WRAP
+    begin "$case_name" sh "$t/occupy_then_probe.sh" "$t/denied_policy" "$t/probe" "$t/candidate-pid" "$kind"
+    expect_rc 0
+    expect_report J10 sandbox
+    expect denied_writes FAIL 'collided'
+    expect denial_by_policy FAIL 'not proven'
+    fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring) | join(",")' true
+    candidate_pid=$(cat "$t/candidate-pid")
+    candidate=$t/denied_policy/jackin-sentinel-j10-$candidate_pid
+    case $kind in
+        mode000_fifo)
+            [ -p "$candidate" ] || problems="$problems fifo-collision-changed"
+            [ "$(stat -c %a "$candidate")" = 0 ] || problems="$problems fifo-mode-changed"
+            ;;
+        accessible_fifo) [ -p "$candidate" ] || problems="$problems fifo-collision-changed" ;;
+        symlink_fifo)
+            [ -L "$candidate" ] && [ -p "$t/denied_policy/target" ] || problems="$problems fifo-symlink-changed"
+            [ "$(readlink "$candidate")" = "$t/denied_policy/target" ] || problems="$problems fifo-link-target-changed"
+            ;;
+        symlink_regular)
+            [ "$(cat "$t/denied_policy/target")" = collision-target ] || problems="$problems regular-target-changed"
+            [ "$(readlink "$candidate")" = "$t/denied_policy/target" ] || problems="$problems regular-link-target-changed"
+            ;;
+    esac
+    j10_stays_inside
+    finish_case
+done
 
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
