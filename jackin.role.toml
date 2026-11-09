@@ -25,3 +25,6 @@ instructions = "instructions/codex.md"
 [agents.omp]
 model = "glm-5.3"
 instructions = "instructions/omp.md"
+
+[agents.claude]
+instructions = "instructions/claude.md"
