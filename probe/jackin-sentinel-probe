@@ -11,9 +11,13 @@ SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin
 PROJECT=/sandbox/project
 STATE_DIR=/sandbox/.sentinel
 JACKIN_DIR=/sandbox/.jackin
-CODEX_HOME_DIR=/sandbox/.codex
-CODEX_BIN=/usr/local/bin/codex
-CODEX_COMM=codex
+AUTH_FILE=/sandbox/.codex/auth.json
+AGENT_BIN=/usr/local/bin/codex
+AGENT_COMM=codex
+EXPECTED_VERSION=
+PROVIDER_URL=
+PROVIDER_STATUS=0
+PROMPT_ARGV=
 START_BIN=/usr/local/bin/jackin-start
 HELLO_IMAGE='hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef'
 HOOK_DIR=/usr/local/lib/jackin/hooks
@@ -35,12 +39,11 @@ PLACEHOLDER_RE='^openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*'
 PLACEHOLDER_ID_TOKEN="${ID_TOKEN_HEADER}.${ID_TOKEN_PAYLOAD}.placeholder"
 J10_ALLOWED="$STATE_DIR /tmp"
 J10_DENIED="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
-PROMPT='Reply with the word ready'
 ALL_STEPS='J00 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 J14 J15 J16'
 JQN='def n: if . == "" then null else . end;'
 
 usage() {
-    echo "usage: $PROBE [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]" >&2
+    echo "usage: $PROBE --spec PATH [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]" >&2
     echo "       $PROBE --version" >&2
     exit 64
 }
@@ -352,7 +355,7 @@ EOF
     done
     self_pid=$$
     : >"$work/main.json"
-    : >"$work/codex.ndjson"
+    : >"$work/agent.ndjson"
     if [ -n "$main_pid" ]; then
         proc_json "$main_pid" >"$work/main.json"
         for dir in /proc/[0-9]*; do
@@ -362,8 +365,8 @@ EOF
 $stat_line
 EOF
             [ "$ppid" = "$main_pid" ] || continue
-            [ "$(proc_comm "$pid")" = "$CODEX_COMM" ] || continue
-            proc_json "$pid" >>"$work/codex.ndjson"
+            [ "$(proc_comm "$pid")" = "$AGENT_COMM" ] || continue
+            proc_json "$pid" >>"$work/agent.ndjson"
         done
     fi
     proc_json "$self_pid" >"$work/self.json"
@@ -380,15 +383,15 @@ EOF
         fi
     done
     jq -n --arg boot_id "$boot_id" --arg run_state "$run_state" --argjson descends "$descends" \
-        --slurpfile main "$work/main.json" --slurpfile codex "$work/codex.ndjson" --slurpfile self "$work/self.json" \
-        "$JQN"'{boot_id: $boot_id, run_state: ($run_state | n), main: ($main[0] // null), codex: $codex,
+        --slurpfile main "$work/main.json" --slurpfile agent "$work/agent.ndjson" --slurpfile self "$work/self.json" \
+        "$JQN"'{boot_id: $boot_id, run_state: ($run_state | n), main: ($main[0] // null), agent: $agent,
           self: $self[0], self_descends_from_main: $descends}' >"$work/processes.json"
 }
 
 process_checks() {
     main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
     state=$(jq -r '.run_state // ""' "$work/processes.json")
-    codex_count=$(jq -r '.codex | length' "$work/processes.json")
+    agent_count=$(jq -r '.agent | length' "$work/processes.json")
     if [ -n "$main_pid" ]; then
         pass main_process "pid $main_pid"
     else
@@ -398,24 +401,24 @@ process_checks() {
     case $state in
         running*)
             if ! run_state_attempt >/dev/null; then
-                fail codex_child "the lifecycle state '$state' is not a valid running state: expected 'running <attempt>'"
-            elif [ "$codex_count" -eq 1 ]; then
-                pass codex_child "1 Codex process as a child of the main process"
-            elif [ "$codex_count" -gt 1 ]; then
-                fail codex_child "$codex_count Codex processes are children of the main process, expected one"
+                fail agent_child "the lifecycle state '$state' is not a valid running state: expected 'running <attempt>'"
+            elif [ "$agent_count" -eq 1 ]; then
+                pass agent_child "1 Codex process as a child of the main process"
+            elif [ "$agent_count" -gt 1 ]; then
+                fail agent_child "$agent_count Codex processes are children of the main process, expected one"
             else
-                fail codex_child "state is $state but the main process has no Codex child"
+                fail agent_child "state is $state but the main process has no Codex child"
             fi
             ;;
-        *) skip codex_child "jackin-start state is '${state:-unknown}', not running" ;;
+        *) skip agent_child "jackin-start state is '${state:-unknown}', not running" ;;
     esac
 }
 
-ensure_codex_exec() {
-    [ -f "$work/codex_exec.json" ] && return 0
+ensure_agent_exec() {
+    [ -f "$work/agent_exec.json" ] && return 0
     launch_kind=none
     why="the sandbox holds no credential"
-    cred_path="$CODEX_HOME_DIR/auth.json"
+    cred_path="$AUTH_FILE"
     unsafe=
     if [ -e "$cred_path" ] || [ -L "$cred_path" ]; then
         kinds=$(token_kinds "$cred_path") || kinds="other other other"
@@ -435,7 +438,7 @@ ensure_codex_exec() {
             printf '!P\t%s\n' "$producer_status" >&3
         } | {
             classifier_status=0
-            classified=$(credential_variables codex_exec 3>&- 2>/dev/null) || classifier_status=$?
+            classified=$(credential_variables agent_exec 3>&- 2>/dev/null) || classifier_status=$?
             if [ -n "$classified" ]; then
                 printf '%s\n' "$classified" >&3
             fi
@@ -454,7 +457,7 @@ ensure_codex_exec() {
             next
         }
         NF != 3 || $1 !~ /^[A-Za-z_][A-Za-z0-9_]*$/ ||
-            ($2 != "empty" && $2 != "placeholder" && $2 != "other") || $3 != "codex_exec" {
+            ($2 != "empty" && $2 != "placeholder" && $2 != "other") || $3 != "agent_exec" {
             invalid = 1
             next
         }
@@ -496,15 +499,15 @@ EOF
     elif [ -n "$inspection_unavailable" ]; then
         why="codex exec was not run: could not inspect inherited credentials"
     elif [ "$login_ready" = 1 ]; then
-        launch_kind=chatgpt_login
+        launch_kind=oauth_login
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
-        launch_kind=chatgpt_login
+        launch_kind=oauth_login
     elif [ "$api_ready" = 1 ]; then
         launch_kind=api_key
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
     fi
-    printf '%s' "$why" >"$work/codex_exec.why"
+    printf '%s' "$why" >"$work/agent_exec.why"
     unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
@@ -514,13 +517,21 @@ EOF
     exit_code=
     answered=false
     bytes=0
+    set --
+    while IFS= read -r encoded; do
+        [ -n "$encoded" ] || continue
+        arg=$(printf '%s' "$encoded" | base64 -d) || return 65
+        set -- "$@" "$arg"
+    done <<EOF
+$PROMPT_ARGV
+EOF
     if [ "$launch_kind" != none ]; then
         attempted=true
         if _jks_stdout_capture=$(
             exec 3>&1 || exit 1
             (
                 _jks_stdout_producer_status=0
-                if (cd "$SCAN_ROOT" && timeout --kill-after=5 240 "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT" 3>&- 2>/dev/null </dev/null); then
+                if (cd "$SCAN_ROOT" && timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
                     :
                 else
                     _jks_stdout_producer_status=$?
@@ -765,7 +776,7 @@ EOF
     jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
-          answered: $answered, output_bytes: $bytes}' >"$work/codex_exec.json"
+          answered: $answered, output_bytes: $bytes}' >"$work/agent_exec.json"
 }
 
 egress() {
@@ -773,7 +784,7 @@ egress() {
     bearer=${2-}
     body=${3-/dev/null}
     if ! have curl; then
-        jq -cn --arg url "$url" '{url: $url, curl_found: false, curl_exit: null, http_code: 0}'
+        jq -cn --arg url "$url" '{url: $url, curl_found: false, curl_exit: null, http_code: 0, body: null}'
         return 0
     fi
     if [ -n "$bearer" ]; then
@@ -785,7 +796,7 @@ egress() {
         rc=$?
     fi
     jq -cn --arg url "$url" --argjson rc "$rc" --arg code "${code:-000}" \
-        '{url: $url, curl_found: true, curl_exit: $rc, http_code: ($code | tonumber)}'
+        '{url: $url, curl_found: true, curl_exit: $rc, http_code: ($code | tonumber), body: null}'
 }
 
 egress_outcome() {
@@ -1003,25 +1014,27 @@ step_J00() (
     present=false
     executable=false
     version=
-    [ -e "$CODEX_BIN" ] && present=true
-    if [ -f "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]; then
+    [ -e "$AGENT_BIN" ] && present=true
+    if [ -f "$AGENT_BIN" ] && [ -x "$AGENT_BIN" ]; then
         executable=true
     fi
     if [ "$executable" = true ]; then
         home=$(mktemp -d "$work/codexhome.XXXXXX")
-        if ! version=$(CODEX_HOME=$home timeout 30 "$CODEX_BIN" --version 2>/dev/null </dev/null); then
+        if ! version=$(CODEX_HOME=$home timeout 30 "$AGENT_BIN" --version 2>/dev/null </dev/null); then
             version=
-            fail codex_version "codex --version failed"
+            fail agent_version "codex --version failed"
         elif [ -z "$version" ]; then
-            fail codex_version "codex --version printed nothing"
+            fail agent_version "codex --version printed nothing"
+        elif [ "$version" != "$EXPECTED_VERSION" ]; then
+            fail agent_version "got '$version', expected '$EXPECTED_VERSION'"
         else
-            pass codex_version "$version"
+            pass agent_version "$version"
         fi
     else
-        fail codex_binary "$CODEX_BIN is not an executable file"
+        fail agent_binary "$AGENT_BIN is not an executable file"
     fi
-    jq -n --arg path "$CODEX_BIN" --argjson present "$present" --argjson executable "$executable" --arg version "$version" \
-        "$JQN"'{codex: {path: $path, present: $present, executable: $executable, version: ($version | n)}}' >"$work/facts"
+    jq -n --arg path "$AGENT_BIN" --argjson present "$present" --argjson executable "$executable" --arg version "$version" \
+        "$JQN"'{agent: {path: $path, present: $present, executable: $executable, version: ($version | n)}}' >"$work/facts"
 )
 
 step_J04() (
@@ -1147,20 +1160,20 @@ EOF
 
 step_J07() (
     collect_processes
-    ensure_codex_exec
+    ensure_agent_exec
     process_checks
-    attempted=$(jq -r '.attempted' "$work/codex_exec.json")
+    attempted=$(jq -r '.attempted' "$work/agent_exec.json")
     if [ "$attempted" = true ]; then
-        if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
-            pass codex_exec "codex exec answered the fixed prompt"
+        if [ "$(jq -r '.answered' "$work/agent_exec.json")" = true ]; then
+            pass agent_exec "codex exec answered the fixed prompt"
         else
-            fail codex_exec "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
+            fail agent_exec "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
         fi
     else
-        skip codex_exec "$(cat "$work/codex_exec.why")"
+        skip agent_exec "$(cat "$work/agent_exec.why")"
     fi
-    jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/codex_exec.json" \
-        '{processes: $p[0], codex_exec: $x[0]}' >"$work/facts"
+    jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
+        '{processes: $p[0], agent_exec: $x[0]}' >"$work/facts"
 )
 
 agent_env() {
@@ -1204,25 +1217,27 @@ agent_env() {
 record_parse() {
     LC_ALL=C awk '
         function bad() { failed = 1; exit 1 }
-        NR == 1 { if ($0 != "jackin-env-kinds 1") bad(); next }
+        NR == 1 { if ($0 != "jackin-env-kinds 2") bad(); next }
         NR == 2 {
             if ($0 !~ /^attempt (0|[1-9][0-9]*)$/) bad()
             split($0, parts, " ")
             if (length(parts[2]) > 18) bad()
+            attempt_number = parts[2]
             print "attempt\t" parts[2]
             next
         }
         {
-            if ($0 !~ /^(main|codex) [A-Za-z_][A-Za-z0-9_]* (placeholder|empty|other)$/) bad()
+            if ($0 !~ /^(main|agent) [A-Za-z_][A-Za-z0-9_]* (placeholder|empty|other)$/) bad()
             split($0, parts, " ")
-            if (parts[1] == "main" && seen_codex) bad()
-            if (parts[1] == "codex") seen_codex = 1
+            if (parts[1] == "main" && seen_agent) bad()
+            if (parts[1] == "main") seen_main = 1
+            if (parts[1] == "agent") seen_agent = 1
             key = parts[1] " " parts[2]
             if (key in used) bad()
             used[key] = 1
             print parts[1] "\t" parts[2] "\t" parts[3]
         }
-        END { if (!failed && NR < 2) exit 1 }'
+        END { if (!failed && (NR < 2 || !seen_main || (attempt_number > 0 && !seen_agent))) exit 1 }'
 }
 
 record_load() {
@@ -1318,12 +1333,12 @@ settle() {
 step_J08() (
     : >"$work/variables.tsv"
     main_pid=
-    codex_pids=
-    codex_children=0
+    agent_pids=
+    agent_children=0
     if collect_processes 2>/dev/null; then
         main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
-        codex_pids=$(jq -r '.codex[].pid' "$work/processes.json")
-        codex_children=$(jq -r '.codex | length' "$work/processes.json")
+        agent_pids=$(jq -r '.agent[].pid' "$work/processes.json")
+        agent_children=$(jq -r '.agent | length' "$work/processes.json")
     fi
     env -0 | credential_variables probe >>"$work/variables.tsv"
     launch_files=0
@@ -1348,65 +1363,71 @@ step_J08() (
         record_state=stale
     fi
     main_known=0
-    codex_known=0
+    agent_known=0
     if [ "$record_state" = read ]; then
         main_known=1
-        codex_lines=$(awk -F'\t' '$1 == "codex"' "$work/record.tsv" | wc -l | tr -d ' ')
+        agent_lines=$(awk -F'\t' '$1 == "agent"' "$work/record.tsv" | wc -l | tr -d ' ')
         if [ "$record_attempt" -ge 1 ]; then
             case $run_state in
-                'exited '*' 65') [ "$codex_lines" -eq 0 ] || codex_known=1 ;;
-                *) codex_known=1 ;;
+                'exited '*' 65') [ "$agent_lines" -eq 0 ] || agent_known=1 ;;
+                *) agent_known=1 ;;
             esac
         fi
     fi
     main_env=$(agent_env main "$work/live.main.tsv" "$main_pid")
-    codex_env=absent
-    codex_read_failed=0
-    codex_read_count=0
-    codex_fail_count=0
-    : >"$work/live.codex.tsv"
-    for pid in $codex_pids; do
-        child_env=$(agent_env codex "$work/live.codex.$pid.tsv" "$pid")
+    agent_env=absent
+    agent_read_failed=0
+    agent_read_count=0
+    agent_fail_count=0
+    : >"$work/live.agent.tsv"
+    for pid in $agent_pids; do
+        child_env=$(agent_env agent "$work/live.agent.$pid.tsv" "$pid")
         if [ "$child_env" = read ]; then
-            codex_read_count=$((codex_read_count + 1))
-            cat "$work/live.codex.$pid.tsv" >>"$work/live.codex.tsv"
+            agent_read_count=$((agent_read_count + 1))
+            cat "$work/live.agent.$pid.tsv" >>"$work/live.agent.tsv"
         else
-            codex_read_failed=1
-            codex_fail_count=$((codex_fail_count + 1))
+            agent_read_failed=1
+            agent_fail_count=$((agent_fail_count + 1))
         fi
     done
-    if [ "$codex_read_count" -gt 0 ]; then
-        codex_env='read'
-    elif [ "$codex_read_failed" -eq 1 ]; then
-        codex_env=denied
+    if [ "$agent_read_count" -gt 0 ]; then
+        agent_env='read'
+    elif [ "$agent_read_failed" -eq 1 ]; then
+        agent_env=denied
     fi
-    codex_read_label="$codex_read_count child environments"
-    codex_fail_label="$codex_fail_count child environments"
-    [ "$codex_read_count" -eq 1 ] && codex_read_label='1 child environment'
-    [ "$codex_fail_count" -eq 1 ] && codex_fail_label='1 child environment'
-    if [ "$codex_fail_count" -gt 0 ] && [ "$codex_known" -ne 1 ]; then
-        unread_from="${unread_from:+$unread_from; }$codex_fail_count Codex child environment(s) could not be read"
+    agent_read_label="$agent_read_count child environments"
+    agent_fail_label="$agent_fail_count child environments"
+    [ "$agent_read_count" -eq 1 ] && agent_read_label='1 child environment'
+    [ "$agent_fail_count" -eq 1 ] && agent_fail_label='1 child environment'
+    if [ "$agent_fail_count" -gt 0 ] && [ "$agent_known" -ne 1 ]; then
+        unread_from="${unread_from:+$unread_from; }$agent_fail_count Codex child environment(s) could not be read"
     fi
     disagree=
     settle main "$main_env" "$main_known"
     main_env=$settled
-    settle codex "$codex_env" "$codex_known"
-    codex_env=$settled
-    if [ "$codex_read_count" -gt 0 ] && [ "$codex_fail_count" -gt 0 ] && [ "$codex_known" -eq 1 ]; then
-        cat "$work/rec.codex.tsv" >>"$work/variables.tsv"
+    settle agent "$agent_env" "$agent_known"
+    agent_env=$settled
+    if [ "$agent_read_count" -gt 0 ] && [ "$agent_fail_count" -gt 0 ] && [ "$agent_known" -eq 1 ]; then
+        cat "$work/rec.agent.tsv" >>"$work/variables.tsv"
         read_from="$read_from, the fresh aggregate Codex record"
     fi
     sort -u -o "$work/variables.tsv" "$work/variables.tsv"
     environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
     others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | unique | join(" ")')
     placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder")] | length')
-    scope="checked: $read_from, $CODEX_HOME_DIR/auth.json, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
-    auth_file=null
+    scope="checked: $read_from, $AUTH_FILE, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
+    auth_file=$(jq -n --arg path "$AUTH_FILE" \
+        '{state: "absent", path: $path, mode: null, access_token: "absent", refresh_token: "absent", id_token: "absent"}')
     auth_problem=
     auth_placeholders=0
-    auth="$CODEX_HOME_DIR/auth.json"
+    auth="$AUTH_FILE"
     if [ -f "$auth" ]; then
-        kinds=$(token_kinds "$auth") || kinds=
+        auth_state=present
+        kinds=$(token_kinds "$auth") || {
+            kinds="other other other"
+            auth_state=malformed
+            auth_problem=1
+        }
         read -r access refresh idt <<EOF
 $kinds
 EOF
@@ -1414,12 +1435,16 @@ EOF
         read -r _ mode <<EOF
 $meta
 EOF
-        auth_file=$(jq -n --arg path "$auth" --arg mode "$mode" --arg a "${access:-other}" --arg r "${refresh:-other}" --arg i "${idt:-other}" \
-            '{path: $path, mode: $mode, access_token: $a, refresh_token: $r, id_token: $i}')
+        auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --arg a "${access:-other}" --arg r "${refresh:-other}" --arg i "${idt:-other}" \
+            '{state: $state, path: $path, mode: $mode, access_token: $a, refresh_token: $r, id_token: $i}')
         for kind in "${access:-other}" "${refresh:-other}" "${idt:-other}"; do
             [ "$kind" = other ] && auth_problem=1
             [ "$kind" = placeholder ] && auth_placeholders=$((auth_placeholders + 1))
         done
+    elif [ -e "$auth" ] || [ -L "$auth" ]; then
+        auth_file=$(jq -n --arg path "$auth" \
+            '{state: "malformed", path: $path, mode: null, access_token: "other", refresh_token: "other", id_token: "other"}')
+        auth_problem=1
     fi
     if [ "$placeholders" -eq 0 ] && [ "$auth_placeholders" -eq 0 ]; then
         skip credential "the sandbox holds no credential placeholder ($scope)"
@@ -1430,22 +1455,22 @@ EOF
         fail environment "malformed start record"
     elif [ -n "$others" ]; then
         detail="not a placeholder: $others"
-        if [ "$codex_children" -gt 1 ]; then
-            detail="$detail; $codex_children Codex processes, read $codex_read_label"
-            if [ "$codex_fail_count" -gt 0 ]; then
-                if [ "$codex_known" -eq 1 ]; then
-                    detail="$detail; $codex_fail_label unread; the fresh aggregate Codex record is retained"
+        if [ "$agent_children" -gt 1 ]; then
+            detail="$detail; $agent_children Codex processes, read $agent_read_label"
+            if [ "$agent_fail_count" -gt 0 ]; then
+                if [ "$agent_known" -eq 1 ]; then
+                    detail="$detail; $agent_fail_label unread; the fresh aggregate Codex record is retained"
                 else
-                    detail="$detail; $codex_fail_label unread"
+                    detail="$detail; $agent_fail_label unread"
                 fi
             fi
         fi
         fail environment "$detail${disagree:+ (/proc and the start record disagree for: $disagree)}"
-    elif [ "$codex_children" -gt 1 ]; then
-        detail="$codex_children Codex processes are children of the main process; read $codex_read_label"
-        if [ "$codex_fail_count" -gt 0 ]; then
-            detail="$detail; $codex_fail_label could not be read"
-            if [ "$codex_known" -eq 1 ]; then
+    elif [ "$agent_children" -gt 1 ]; then
+        detail="$agent_children Codex processes are children of the main process; read $agent_read_label"
+        if [ "$agent_fail_count" -gt 0 ]; then
+            detail="$detail; $agent_fail_label could not be read"
+            if [ "$agent_known" -eq 1 ]; then
                 detail="$detail; the fresh aggregate Codex record is retained"
             fi
         fi
@@ -1456,7 +1481,7 @@ EOF
             unreadable) skip environment "the start record at $RECORD_FILE cannot be read" ;;
             *) skip environment "the start record is stale (record attempt $record_attempt, run state '${run_state:-absent}')" ;;
         esac
-    elif [ "$codex_known" -ne 1 ]; then
+    elif [ "$agent_known" -ne 1 ]; then
         skip environment "the Codex environment is not known: the record at attempt $record_attempt holds no Codex environment"
     else
         pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
@@ -1470,7 +1495,7 @@ EOF
     elif [ -e "$auth" ] || [ -L "$auth" ]; then
         fail auth_file "$auth exists but is not a regular file, so the probe did not examine its tokens"
     else
-        skip auth_file "no auth.json at $auth, so there is no file to examine"
+        fail auth_file "the selected target requires auth.json at $auth"
     fi
     if [ "$leaks" != '[]' ]; then
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
@@ -1484,15 +1509,15 @@ EOF
         *) attempt_fact=null ;;
     esac
     jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
-        --arg main_env "$main_env" --arg codex_env "$codex_env" \
+        --arg main_env "$main_env" --arg agent_env "$agent_env" \
         --arg record_state "$record_state" --argjson record_attempt "$attempt_fact" \
-        '{environment: $environment, agent_environment: {main: $main_env, codex: $codex_env},
+        '{environment: $environment, agent_environment: {main: $main_env, agent: $agent_env},
           start_record: {state: $record_state, attempt: $record_attempt},
           auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
 )
 
 step_J09() (
-    ensure_codex_exec
+    ensure_agent_exec
     outside=$(egress https://example.com)
     metadata=$(egress http://169.254.169.254/latest/meta-data/)
     proxies=$(proxy_variables | tr '\n' ' ' | sed 's/ $//')
@@ -1502,22 +1527,27 @@ step_J09() (
     elif [ "${OPENAI_API_KEY-}" != "" ]; then
         bearer=$OPENAI_API_KEY
     fi
-    if [ -z "$bearer" ] && [ -f "$CODEX_HOME_DIR/auth.json" ]; then
-        bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$CODEX_HOME_DIR/auth.json" 2>/dev/null) || bearer=
+    if [ -z "$bearer" ] && [ -f "$AUTH_FILE" ]; then
+        bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$AUTH_FILE" 2>/dev/null) || bearer=
     fi
     provider=null
     if [ -n "$bearer" ] && printf '%s' "$bearer" | is_placeholder; then
         : >"$work/provider.body"
-        provider=$(egress https://api.openai.com/v1/models "$bearer" "$work/provider.body")
-    fi
-    if [ "$(jq -r '.attempted' "$work/codex_exec.json")" = true ]; then
-        if [ "$(jq -r '.answered' "$work/codex_exec.json")" = true ]; then
-            pass codex_reaches_api "codex exec answered"
+        provider=$(egress "$PROVIDER_URL" "$bearer" "$work/provider.body")
+        if provider_saw_only "$bearer" "$work/provider.body"; then
+            provider=$(printf '%s' "$provider" | jq -c '.body = "invalid_api_key"')
         else
-            fail codex_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/codex_exec.json") gave no answer"
+            provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
+        fi
+    fi
+    if [ "$(jq -r '.attempted' "$work/agent_exec.json")" = true ]; then
+        if [ "$(jq -r '.answered' "$work/agent_exec.json")" = true ]; then
+            pass agent_reaches_api "codex exec answered"
+        else
+            fail agent_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
         fi
     else
-        skip codex_reaches_api "$(cat "$work/codex_exec.why")"
+        skip agent_reaches_api "$(cat "$work/agent_exec.why")"
     fi
     if [ -n "$proxies" ]; then
         fail outside_host_denied "proxy variables are set: $proxies"
@@ -1536,21 +1566,17 @@ step_J09() (
         fail provider_no_credential "api.openai.com gave no HTTP response, so the probe cannot show that no credential was applied"
     else
         code=$(printf '%s' "$provider" | jq -r '.http_code')
-        case $code in
-            2??) fail provider_no_credential "curl got HTTP $code from the provider host" ;;
-            401)
-                if provider_saw_only "$bearer" "$work/provider.body"; then
-                    pass provider_no_credential "HTTP 401: the provider named only the placeholder, so no credential was applied"
-                else
-                    fail provider_no_credential "HTTP 401 without the invalid-key answer for the placeholder: the provider may have seen another credential"
-                fi
-                ;;
-            *) fail provider_no_credential "curl got HTTP $code, not the 401 that shows the provider saw only the placeholder" ;;
-        esac
+        if [ "$code" != "$PROVIDER_STATUS" ]; then
+            fail provider_no_credential "curl got HTTP $code, not the $PROVIDER_STATUS that shows the provider saw only the placeholder"
+        elif provider_saw_only "$bearer" "$work/provider.body"; then
+            pass provider_no_credential "HTTP $code: the provider named only the placeholder, so no credential was applied"
+        else
+            fail provider_no_credential "HTTP $code without the invalid-key answer for the placeholder: the provider may have seen another credential"
+        fi
     fi
     rm -f "$work/provider.body"
-    jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/codex_exec.json" \
-        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, codex_exec: $x[0]}' >"$work/facts"
+    jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/agent_exec.json" \
+        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}' >"$work/facts"
 )
 
 step_J10() (
@@ -1625,14 +1651,14 @@ step_J12() (
         fail not_descendant "the probe runs below the main process"
     fi
     self_tty=$(jq -r '.self.tty // ""' "$work/processes.json")
-    codex_children=$(jq -r '.codex | length' "$work/processes.json")
-    codex_ttys_known=$(jq -r 'all(.codex[]; .tty != null and .tty != "")' "$work/processes.json")
-    shared_ttys=$(jq -r --arg tty "$self_tty" '[.codex[] | select(.tty == $tty)] | length' "$work/processes.json")
-    if [ -z "$self_tty" ] || [ "$codex_children" -eq 0 ]; then
+    agent_children=$(jq -r '.agent | length' "$work/processes.json")
+    agent_ttys_known=$(jq -r 'all(.agent[]; .tty != null and .tty != "")' "$work/processes.json")
+    shared_ttys=$(jq -r --arg tty "$self_tty" '[.agent[] | select(.tty == $tty)] | length' "$work/processes.json")
+    if [ -z "$self_tty" ] || [ "$agent_children" -eq 0 ]; then
         skip distinct_tty "the tty of the probe or of Codex is unknown"
     elif [ "$shared_ttys" -gt 0 ]; then
         fail distinct_tty "$shared_ttys Codex child process(es) share the probe tty $self_tty"
-    elif [ "$codex_ttys_known" != true ]; then
+    elif [ "$agent_ttys_known" != true ]; then
         skip distinct_tty "the tty of the probe or of Codex is unknown"
     else
         pass distinct_tty "probe $self_tty, every Codex child has a distinct tty"
@@ -2148,6 +2174,7 @@ main() {
     docker=off
     engine=
     only=
+    spec=
     while [ $# -gt 0 ]; do
         case $1 in
             --version)
@@ -2171,6 +2198,11 @@ main() {
                     *:*) engine=$2 ;;
                     *) usage ;;
                 esac
+                shift
+                ;;
+            --spec)
+                [ $# -ge 2 ] || usage
+                spec=$2
                 shift
                 ;;
             --only)
@@ -2202,6 +2234,33 @@ main() {
         echo "$PROBE: jq is required" >&2
         exit 69
     }
+    if [ -z "$spec" ] || [ ! -f "$spec" ] || [ -L "$spec" ]; then
+        echo "$PROBE: --spec must name a regular private probe specification" >&2
+        exit 65
+    fi
+    if ! jq -e '
+        (.target | type == "object" and .tuple == "T01" and .agent == "codex" and
+            .provider == "codex" and (.model | type == "string" and length > 0) and
+            .adapter == "t01-codex-v1" and (.spec_sha256 | test("^[0-9a-f]{64}$"))) and
+        (.behavior.version.binary | type == "string" and length > 0) and
+        (.behavior.version.exact_output | type == "string" and length > 0) and
+        (.behavior.process.comm | type == "string" and length > 0) and
+        (.behavior.prompt.argv | type == "array" and length > 0 and all(.[]; type == "string")) and
+        (.behavior.prompt.answer.word_case_insensitive.word == "ready") and
+        (.behavior.credential.auth_file.path | type == "string" and length > 0) and
+        (.behavior.provider.accepted_status | type == "number") and
+        (.behavior.provider.accepted_body.json_error_code.code == "invalid_api_key")
+    ' "$spec" >/dev/null 2>&1; then
+        echo "$PROBE: the private probe specification is malformed or unsupported" >&2
+        exit 65
+    fi
+    AGENT_BIN=$(jq -r '.behavior.version.binary' "$spec") || exit 65
+    EXPECTED_VERSION=$(jq -r '.behavior.version.exact_output' "$spec") || exit 65
+    AGENT_COMM=$(jq -r '.behavior.process.comm' "$spec") || exit 65
+    AUTH_FILE=$(jq -r '.behavior.credential.auth_file.path' "$spec") || exit 65
+    PROVIDER_URL=$(jq -r '.behavior.provider.probe_url' "$spec") || exit 65
+    PROVIDER_STATUS=$(jq -r '.behavior.provider.accepted_status' "$spec") || exit 65
+    PROMPT_ARGV=$(jq -r '.behavior.prompt.argv[] | @base64' "$spec") || exit 65
     [ "$mode" = host ] || require_sandbox
     work=$(mktemp -d) || exit 70
     trap 'rm -rf "$work"' EXIT
@@ -2217,8 +2276,10 @@ main() {
         fi
         finish "$id"
     done
-    cat "$work"/step.J* | jq -cMs --arg mode "$mode" --arg docker "$docker" \
-        '{schema: 2, probe: "jackin-sentinel-probe", mode: $mode, docker: $docker, steps: add}'
+    cat "$work"/step.J* | jq -cMs --arg mode "$mode" --arg docker "$docker" --arg engine "$engine" \
+        --slurpfile spec "$spec" \
+        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $spec[0].target,
+          mode: $mode, docker: $docker, engine: ($engine | n), steps: add}'
 }
 
 main "$@"

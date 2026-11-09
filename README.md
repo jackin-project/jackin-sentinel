@@ -71,18 +71,19 @@ The launch stops with the hook error. Load again with the same launch ID and wit
 `jackin-sentinel-probe` prints one JSON object on stdout. `rewrite/probe-schema.json` in jackin defines it. `xtask e2e` reads it, so change the probe, the schema, and `crates/xtask/src/e2e/` in one task.
 
 ```text
-jackin-sentinel-probe [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]
+jackin-sentinel-probe --spec PATH [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]
 jackin-sentinel-probe --version
 ```
 
 | Flag | Meaning |
 |---|---|
+| `--spec PATH` | The private target and behavior specification. The probe requires this flag and rejects an unreadable, malformed, or unsupported file. |
 | `--host` | Dry run. Every selected step is `SKIP` with `facts: null`. Use it to check the output shape outside a sandbox. |
 | `--docker on\|off` | The Docker capability that the caller expects. The default is `off`. `on` runs J15 and skips J16. `off` skips J15 and runs J16. |
 | `--engine HOST:PORT` | The engine endpoint that J16 tries to reach. Without it, the connection check of J16 is `SKIP`. |
 | `--only` | A comma-separated list of steps. An unselected step is absent from the report. |
 
-Without `--host`, the probe runs only on Linux as the user `sandbox` with `/sandbox` present. Otherwise it exits 66. The probe exits 0 whenever it printed a report, even when a step is `FAIL`. It exits 64 for a usage error and 69 when `jq` is missing.
+Without `--host`, the probe runs only on Linux as the user `sandbox` with `/sandbox` present. Otherwise it exits 66. The probe exits 0 whenever it printed a report, even when a step is `FAIL`. It exits 64 for a usage error, 65 for an invalid probe specification, and 69 when `jq` is missing.
 
 Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, and typed `facts`. A step that needs a credential or a capability that the sandbox lacks is `SKIP`. It is never `PASS`.
 
@@ -108,14 +109,14 @@ J01, J02, J03, and J17 have no in-sandbox part. `xtask e2e` runs them on the hos
 Run a dry run on any host that has `jq`:
 
 ```sh
-probe/jackin-sentinel-probe --host | jq .
+probe/jackin-sentinel-probe --spec /path/to/probe-spec.json --host | jq .
 ```
 
 In a sandbox of this role, run `jackin shell <sandbox>` and then:
 
 ```sh
-jackin-sentinel-probe | jq .
-jackin-sentinel-probe --docker on --only J15 | jq .
+jackin-sentinel-probe --spec /sandbox/.jackin/e2e/probe-spec.json | jq .
+jackin-sentinel-probe --spec /sandbox/.jackin/e2e/probe-spec.json --docker on --only J15 | jq .
 ```
 
 J07 and J09 run the selected agent's execution command only when the sandbox has a configured OpenShell placeholder credential. The bounded stdout capture can wait up to 280 seconds, separate from the deadlines for other journey checks. The `output_bytes` fact counts the observed stdout prefix, up to 65,537 bytes. Byte 65,537 marks overflow, so output longer than 65,536 bytes fails even when `ready` appears in the prefix. J15 pulls `hello-world` through the engine. Its run and info commands accept at most 65,536 output bytes each; overflow or incomplete capture fails the affected check. Run captures merged stdout and stderr; info captures stdout. Producer and capture deadlines are 300 seconds for run and 60 seconds for info, with a further drain deadline of 30 seconds and a five-second kill grace. These bounds do not establish descendant cleanup.

@@ -11,22 +11,26 @@ failures=0
 total=0
 
 mkdir -p "$scratch/tools" "$scratch/shim"
-for tool in awk basename cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
-    found=$(command -v "$tool") || {
-        echo "FAIL setup: $tool is not installed"
-        exit 70
-    }
+for tool in awk basename base64 cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
+    if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
+        found=$(mise which jq) || exit 70
+    else
+        found=$(command -v "$tool") || {
+            echo "FAIL setup: $tool is not installed"
+            exit 70
+        }
+    fi
     ln -s "$found" "$scratch/tools/$tool"
 done
 real_id=$(command -v id) || exit 70
 real_uname=$(command -v uname) || exit 70
 
-R_OK1='jackin-env-kinds 1\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_KEY placeholder\ncodex GITHUB_TOKEN empty\ncodex OPENAI_API_KEY placeholder\n'
-R_W0='jackin-env-kinds 1\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
-R_EMPTY='jackin-env-kinds 1\nattempt 0\nmain GITHUB_TOKEN empty\n'
-R_NOCODEX='jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\n'
-R_OTHER_MAIN='jackin-env-kinds 1\nattempt 1\nmain P73_FAKE_API_KEY other\ncodex OPENAI_API_KEY placeholder\n'
-R_OTHER_CODEX='jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET other\n'
+R_OK1='jackin-env-kinds 2\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_KEY placeholder\nagent GITHUB_TOKEN empty\nagent OPENAI_API_KEY placeholder\n'
+R_W0='jackin-env-kinds 2\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
+R_EMPTY='jackin-env-kinds 2\nattempt 0\nmain GITHUB_TOKEN empty\n'
+R_NOCODEX='jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY placeholder\n'
+R_OTHER_MAIN='jackin-env-kinds 2\nattempt 1\nmain P73_FAKE_API_KEY other\nagent OPENAI_API_KEY placeholder\n'
+R_OTHER_CODEX='jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY placeholder\nagent STRIPE_SECRET other\n'
 
 mk() {
     t=$scratch/$1
@@ -36,16 +40,23 @@ mk() {
 
 prepare_probe() {
     fixture_path=${1:-$t/bin:$scratch/shim:$scratch/tools}
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" "$probe" >"$t/probe"
-    if grep -q '^SANDBOX_PATH=' "$t/probe"; then
-        sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe" >"$t/probe.next" || return 1
-        mv "$t/probe.next" "$t/probe" || return 1
-        grep -Fq "SANDBOX_PATH=$fixture_path" "$t/probe" || return 1
-        if grep -Fq 'SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin' "$t/probe"; then
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#/proc/#$t/proc/#g" "$probe" >"$t/probe.impl"
+    if grep -q '^SANDBOX_PATH=' "$t/probe.impl"; then
+        sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe.impl" >"$t/probe.next" || return 1
+        mv "$t/probe.next" "$t/probe.impl" || return 1
+        grep -Fq "SANDBOX_PATH=$fixture_path" "$t/probe.impl" || return 1
+        if grep -Fq 'SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin' "$t/probe.impl"; then
             return 1
         fi
     fi
-    chmod +x "$t/probe"
+    cat >"$t/spec" <<EOF
+{"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
+EOF
+    cat >"$t/probe" <<EOF
+#!/bin/sh
+exec "$t/probe.impl" --spec "$t/spec" "\$@"
+EOF
+    chmod +x "$t/probe" "$t/probe.impl"
 }
 
 state() {
@@ -100,7 +111,7 @@ jq_fail_for_codex_filter() {
 #!/bin/sh
 if [ "${1-}" = -Rrs ]; then
     case " $* " in
-        *" --arg source codex "*) exit 9 ;;
+        *" --arg source agent "*) exit 9 ;;
     esac
 fi
 exec "$SENTINEL_REAL_JQ" "$@"
@@ -194,8 +205,13 @@ begin() {
         echo "FAIL setup $name: the sandbox path fixture was not safely substituted"
         return
     }
+    if [ -f "$t/expected-version" ]; then
+        "$scratch/tools/jq" --arg version "$(cat "$t/expected-version")" ".behavior.version.exact_output = \$version" "$t/spec" >"$t/spec.next"
+        mv "$t/spec.next" "$t/spec"
+    fi
     if [ -f "$t/seams.sed" ]; then
-        sed -f "$t/seams.sed" "$t/probe" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe"
+        sed -f "$t/seams.sed" "$t/probe.impl" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe.impl"
+        chmod +x "$t/probe.impl"
     fi
     bounded 20 env -i PATH="$t/bin:$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$@"
     rc=$?
@@ -209,7 +225,7 @@ expect_rc() {
 
 expect_report() {
     jq -e --arg step "$1" --arg mode "$2" \
-        '.schema == 2 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
+        '.schema == 3 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
         problems="$problems report-shape"
     if [ "$1" = J15 ]; then
         [ -f "$t/bin/docker-data/run.called" ] || problems="$problems run-not-invoked"
@@ -311,17 +327,17 @@ verify pass_via_record PASS 'via record' read
 
 mk fail_other_in_main_at_attempt_zero
 state waiting
-record 'jackin-env-kinds 1\nattempt 0\nmain P73_FAKE_API_KEY other\n'
+record 'jackin-env-kinds 2\nattempt 0\nmain P73_FAKE_API_KEY other\n'
 verify fail_other_in_main_at_attempt_zero FAIL 'P73_FAKE_API_KEY' read
 
 mk fail_other_in_codex
 state 'exited 1 0'
-record 'jackin-env-kinds 1\nattempt 1\nmain GITHUB_TOKEN empty\ncodex STRIPE_SECRET other\n'
+record 'jackin-env-kinds 2\nattempt 1\nmain GITHUB_TOKEN empty\nagent STRIPE_SECRET other\n'
 verify fail_other_in_codex FAIL 'STRIPE_SECRET' read
 
 mk fail_invalid_name_other
 state waiting
-record 'jackin-env-kinds 1\nattempt 0\nmain INVALID_NAME other\n'
+record 'jackin-env-kinds 2\nattempt 0\nmain INVALID_NAME other\n'
 verify fail_invalid_name_other FAIL 'INVALID_NAME' read
 
 mk fail_proc_other_without_record
@@ -371,7 +387,7 @@ begin codex_environ_failed_read_falls_back_to_the_other_start_record env PATH="$
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'STRIPE_SECRET'
-fact '.agent_environment.codex' record
+fact '.agent_environment.agent' record
 fact '.start_record.state' read
 not_disclosed 'sk-FAKE-CODEX-SECRET-0123456789abcdef'
 finish_case
@@ -501,10 +517,10 @@ state waiting
 record "$R_W0"
 verify skip_codex_not_yet_started SKIP 'Codex environment is not known' read
 
-mk skip_codex_rejected
+mk reject_missing_agent_evidence
 state 'exited 1 65'
 record "$R_NOCODEX"
-verify skip_codex_rejected SKIP 'Codex environment is not known' read
+verify reject_missing_agent_evidence FAIL 'malformed start record' malformed
 
 mk fail_proc_wins_over_record
 state 'exited 1 0'
@@ -517,7 +533,7 @@ mk pass_proc_wins_and_notes_disagreement
 state 'exited 1 0'
 proc_main
 environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
-record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY other\ncodex OPENAI_API_KEY placeholder\n'
+record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY other\nagent OPENAI_API_KEY placeholder\n'
 verify pass_proc_wins_and_notes_disagreement PASS 'disagree' read
 
 mk malformed_symlink_to_dev_zero
@@ -533,7 +549,7 @@ verify malformed_directory FAIL 'malformed start record' malformed
 mk malformed_one_mebibyte
 state waiting
 {
-    printf 'jackin-env-kinds 1\nattempt 0\n'
+    printf 'jackin-env-kinds 2\nattempt 0\n'
     head -c 1048576 /dev/zero | tr '\0' 'a'
 } >"$t/sandbox/.jackin/run/env-kinds"
 verify malformed_one_mebibyte FAIL 'malformed start record' malformed
@@ -547,7 +563,7 @@ verify malformed_symlink_to_a_valid_record FAIL 'malformed start record' malform
 mk malformed_oversized_valid_grammar
 state waiting
 {
-    printf 'jackin-env-kinds 1\nattempt 0\n'
+    printf 'jackin-env-kinds 2\nattempt 0\n'
     i=0
     while [ "$i" -lt 2338 ]; do
         printf 'main P%05d_KEY placeholder\n' "$i"
@@ -563,22 +579,24 @@ verify malformed_oversized_valid_grammar FAIL 'malformed start record' malformed
 
 mk malformed_nul_byte
 state waiting
-record 'jackin-env-kinds 1\nattempt 0\nmain A\0KEY other\n'
+record 'jackin-env-kinds 2\nattempt 0\nmain A\0KEY other\n'
 verify malformed_nul_byte FAIL 'malformed start record' malformed
 
 for variant in \
+    'version_one|jackin-env-kinds 1\nattempt 0\nmain A_KEY empty\n' \
+    'codex_section|jackin-env-kinds 2\nattempt 1\nmain A_KEY empty\ncodex A_KEY empty\n' \
     'bad_version|jackin-env-kinds 2\nattempt 0\n' \
-    'missing_attempt|jackin-env-kinds 1\nmain OPENAI_API_KEY placeholder\n' \
-    'leading_zero_attempt|jackin-env-kinds 1\nattempt 00\n' \
-    'duplicate_main_name|jackin-env-kinds 1\nattempt 0\nmain A_KEY empty\nmain A_KEY empty\n' \
-    'main_after_codex|jackin-env-kinds 1\nattempt 0\ncodex A_KEY empty\nmain A_KEY empty\n' \
-    'escape_in_name|jackin-env-kinds 1\nattempt 0\nmain X\033]0;pwn other\n' \
-    'capitalised_kind|jackin-env-kinds 1\nattempt 0\nmain A_KEY Placeholder\n' \
-    'bad_name|jackin-env-kinds 1\nattempt 0\nmain 1A_KEY other\n' \
-    'carriage_return|jackin-env-kinds 1\r\nattempt 0\r\n' \
-    'blank_line|jackin-env-kinds 1\nattempt 0\n\n' \
-    'unknown_section|jackin-env-kinds 1\nattempt 0\nextra A_KEY other\n' \
-    'header_only|jackin-env-kinds 1\n'; do
+    'missing_attempt|jackin-env-kinds 2\nmain OPENAI_API_KEY placeholder\n' \
+    'leading_zero_attempt|jackin-env-kinds 2\nattempt 00\n' \
+    'duplicate_main_name|jackin-env-kinds 2\nattempt 0\nmain A_KEY empty\nmain A_KEY empty\n' \
+    'main_after_codex|jackin-env-kinds 2\nattempt 0\nagent A_KEY empty\nmain A_KEY empty\n' \
+    'escape_in_name|jackin-env-kinds 2\nattempt 0\nmain X\033]0;pwn other\n' \
+    'capitalised_kind|jackin-env-kinds 2\nattempt 0\nmain A_KEY Placeholder\n' \
+    'bad_name|jackin-env-kinds 2\nattempt 0\nmain 1A_KEY other\n' \
+    'carriage_return|jackin-env-kinds 2\r\nattempt 0\r\n' \
+    'blank_line|jackin-env-kinds 2\nattempt 0\n\n' \
+    'unknown_section|jackin-env-kinds 2\nattempt 0\nextra A_KEY other\n' \
+    'header_only|jackin-env-kinds 2\n'; do
     vname=${variant%%|*}
     mk "malformed_$vname"
     state waiting
@@ -845,7 +863,7 @@ fact '[.writes[] | select(.expected == "denied") | .dac_writable] | map(tostring
 j10_stays_inside
 finish_case
 
-proc_codex_child() {
+proc_agent_child() {
     mkdir -p "$t/proc/$1"
     printf 'codex\0--sandbox\0' >"$t/proc/$1/cmdline"
     printf '%s (codex) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$1" >"$t/proc/$1/stat"
@@ -857,27 +875,27 @@ processes() {
     expect_report "$2" sandbox
 }
 
-mk j11_one_codex_child_in_a_running_state_passes
+mk j11_one_agent_child_in_a_running_state_passes
 state 'running 1'
 proc_main
 proc_codex
-processes j11_one_codex_child_in_a_running_state_passes J11
-expect codex_child PASS 'as a child of the main process'
+processes j11_one_agent_child_in_a_running_state_passes J11
+expect agent_child PASS 'as a child of the main process'
 finish_case
 
-mk j11_a_state_that_is_not_running_skips_the_codex_child_check
+mk j11_a_state_that_is_not_running_skips_the_agent_child_check
 state waiting
 proc_main
-processes j11_a_state_that_is_not_running_skips_the_codex_child_check J11
-expect codex_child SKIP 'not running'
+processes j11_a_state_that_is_not_running_skips_the_agent_child_check J11
+expect agent_child SKIP 'not running'
 finish_case
 
-mk j07_one_codex_child_in_a_running_state_passes
+mk j07_one_agent_child_in_a_running_state_passes
 state 'running 1'
 proc_main
 proc_codex
-processes j07_one_codex_child_in_a_running_state_passes J07
-expect codex_child PASS 'as a child of the main process'
+processes j07_one_agent_child_in_a_running_state_passes J07
+expect agent_child PASS 'as a child of the main process'
 finish_case
 
 multiline_running_state=$(printf 'running 1\nextra')
@@ -888,7 +906,7 @@ for variant in 'running-bad' 'running' 'running ' 'running 0' 'running 01' 'runn
     proc_main
     proc_codex
     processes "$case_name" J11
-    expect codex_child FAIL 'not a valid running state'
+    expect agent_child FAIL 'not a valid running state'
     finish_case
 done
 
@@ -899,7 +917,7 @@ for variant in 'running 1 garbage' 'running 1 ' 'running 1 2' "$multiline_runnin
     proc_main
     proc_codex
     processes "$case_name" J07
-    expect codex_child FAIL 'not a valid running state'
+    expect agent_child FAIL 'not a valid running state'
     finish_case
 done
 
@@ -910,7 +928,7 @@ for step in J07 J11; do
     proc_main
     proc_codex
     processes "$case_name" "$step"
-    expect codex_child FAIL 'not a valid running state'
+    expect agent_child FAIL 'not a valid running state'
     finish_case
 
     case_name=${step}_fifo_run_state_does_not_block_or_pass
@@ -920,7 +938,7 @@ for step in J07 J11; do
     proc_main
     proc_codex
     processes "$case_name" "$step"
-    expect codex_child SKIP 'not running'
+    expect agent_child SKIP 'not running'
     finish_case
 
     case_name=${step}_symlink_run_state_is_not_followed
@@ -931,7 +949,7 @@ for step in J07 J11; do
     proc_main
     proc_codex
     processes "$case_name" "$step"
-    expect codex_child SKIP 'not running'
+    expect agent_child SKIP 'not running'
     finish_case
 
     case_name=${step}_oversized_running_state_is_not_a_pass
@@ -944,17 +962,17 @@ for step in J07 J11; do
     proc_main
     proc_codex
     processes "$case_name" "$step"
-    expect codex_child FAIL 'not a valid running state'
+    expect agent_child FAIL 'not a valid running state'
     finish_case
 done
 
-mk j11_two_codex_children_are_not_a_pass
+mk j11_two_agent_children_are_not_a_pass
 state 'running 1'
 proc_main
 proc_codex
-proc_codex_child 102
-processes j11_two_codex_children_are_not_a_pass J11
-expect codex_child FAIL '2 Codex processes'
+proc_agent_child 102
+processes j11_two_agent_children_are_not_a_pass J11
+expect agent_child FAIL '2 Codex processes'
 finish_case
 
 proc_tty_process() {
@@ -986,15 +1004,15 @@ EOF
     expect_report J12 sandbox
 }
 
-j12_case j12_all_codex_children_have_distinct_ttys 512 768
+j12_case j12_all_agent_children_have_distinct_ttys 512 768
 expect distinct_tty PASS 'every Codex child'
 finish_case
 
-j12_case j12_second_codex_child_sharing_the_probe_tty_fails 512 256
+j12_case j12_second_agent_child_sharing_the_probe_tty_fails 512 256
 expect distinct_tty FAIL 'share'
 finish_case
 
-j12_case j12_first_codex_child_sharing_the_probe_tty_fails 256 768
+j12_case j12_first_agent_child_sharing_the_probe_tty_fails 256 768
 expect distinct_tty FAIL 'share'
 finish_case
 
@@ -1010,7 +1028,7 @@ j12_case j12_all_unknown_child_ttys_remain_unknown 0 0
 expect distinct_tty SKIP 'unknown'
 finish_case
 
-mk j12_no_codex_children_remain_unknown
+mk j12_no_agent_children_remain_unknown
 state 'running 1'
 proc_tty_process 100 /usr/local/bin/jackin-start jackin-start 1 0
 cat >"$t/run-probe.sh" <<'EOF'
@@ -1021,7 +1039,7 @@ printf 'sh\0' >"$1/$pid/cmdline"
 printf '%s (sh) S 1 %s %s 256 -1 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$pid" "$pid" "$pid" "$pid" >"$1/$pid/stat"
 exec sh "$2" --only J12
 EOF
-begin j12_no_codex_children_remain_unknown sh "$t/run-probe.sh" "$t/proc" "$t/probe"
+begin j12_no_agent_children_remain_unknown sh "$t/run-probe.sh" "$t/proc" "$t/probe"
 expect_rc 0
 expect_report J12 sandbox
 expect distinct_tty SKIP 'unknown'
@@ -1056,17 +1074,17 @@ fact '.processes.main.pid' 100
 fact '.processes.main.ppid' 1
 fact '.processes.main.start_ticks' 100
 fact '.processes.main.tty' 'tty:3:0'
-fact '.processes.codex | length' 1
-fact '.processes.codex[0].pid' 101
-fact '.processes.codex[0].ppid' 100
-fact '.processes.codex[0].start_ticks' 101
-fact '.processes.codex[0].tty' 'tty:2:0'
+fact '.processes.agent | length' 1
+fact '.processes.agent[0].pid' 101
+fact '.processes.agent[0].ppid' 100
+fact '.processes.agent[0].start_ticks' 101
+fact '.processes.agent[0].tty' 'tty:2:0'
 fact '.processes.self.pid' "$expected_self_pid"
 fact '.processes.self.ppid' 1
 fact '.processes.self.start_ticks' "$expected_self_pid"
 fact '.processes.self.tty' 'tty:1:0'
 fact '.processes.main | has("args")' false
-fact '.processes.codex[0] | has("args")' false
+fact '.processes.agent[0] | has("args")' false
 fact '.processes.self | has("args")' false
 public_not_disclosed main "$main_marker"
 public_not_disclosed codex "$child_marker"
@@ -1074,28 +1092,28 @@ public_not_disclosed self "$self_marker"
 if jq -e --arg marker "$main_marker" \
     '.steps[].facts.processes.main | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems main_marker_in_main_process"; fi
 if jq -e --arg marker "$child_marker" \
-    '.steps[].facts.processes.codex[0] | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems codex_marker_in_codex_process"; fi
+    '.steps[].facts.processes.agent[0] | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems codex_marker_in_codex_process"; fi
 if jq -e --arg marker "$self_marker" \
     '.steps[].facts.processes.self | type == "object" and (tojson | contains($marker) | not)' "$t/out" >/dev/null 2>&1; then :; else problems="$problems self_marker_in_self_process"; fi
 finish_case
 
-mk j08_a_second_codex_child_with_a_real_credential_is_not_a_pass
+mk j08_a_second_agent_child_with_a_real_credential_is_not_a_pass
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 102 'OPENAI_API_KEY=sk-real-value-0123456789abcdef'
 record "$R_OK1"
-begin j08_a_second_codex_child_with_a_real_credential_is_not_a_pass sh "$t/probe" --only J08
+begin j08_a_second_agent_child_with_a_real_credential_is_not_a_pass sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'not a placeholder'
-fact '.agent_environment.codex' read
+fact '.agent_environment.agent' read
 fact '.start_record.state' read
 detail_contains environment '2 Codex processes'
 detail_contains environment 'read 2 child environments'
-fact '.environment | map(select(.name == "OPENAI_API_KEY" and .kind == "other" and .source == "codex")) | length' 1
+fact '.environment | map(select(.name == "OPENAI_API_KEY" and .kind == "other" and .source == "agent")) | length' 1
 not_disclosed 'sk-real-value-0123456789abcdef'
 finish_case
 
@@ -1103,7 +1121,7 @@ mk codex_environments_preserve_first_child_evidence_when_second_read_fails
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'STRIPE_SECRET=sk-FAKE-FIRST-CHILD-SECRET-0123456789'
 environ 102 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record "$R_OK1"
@@ -1116,9 +1134,9 @@ detail_contains environment 'STRIPE_SECRET'
 detail_contains environment '2 Codex processes'
 detail_contains environment 'read 1 child environment'
 detail_contains environment '1 child environment unread; the fresh aggregate Codex record is retained'
-fact '.agent_environment.codex' read
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "codex")) | length' 1
-fact '.environment | map(select(.name == "GITHUB_TOKEN" and .source == "codex")) | length' 1
+fact '.agent_environment.agent' read
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "agent")) | length' 1
+fact '.environment | map(select(.name == "GITHUB_TOKEN" and .source == "agent")) | length' 1
 not_disclosed 'sk-FAKE-FIRST-CHILD-SECRET-0123456789'
 finish_case
 
@@ -1126,7 +1144,7 @@ mk codex_environments_preserve_second_child_evidence_when_first_read_fails
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 102 'STRIPE_SECRET=sk-FAKE-SECOND-CHILD-SECRET-0123456789'
 record "$R_OK1"
@@ -1139,9 +1157,9 @@ detail_contains environment 'STRIPE_SECRET'
 detail_contains environment '2 Codex processes'
 detail_contains environment 'read 1 child environment'
 detail_contains environment '1 child environment unread; the fresh aggregate Codex record is retained'
-fact '.agent_environment.codex' read
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "codex")) | length' 1
-fact '.environment | map(select(.name == "GITHUB_TOKEN" and .source == "codex")) | length' 1
+fact '.agent_environment.agent' read
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "agent")) | length' 1
+fact '.environment | map(select(.name == "GITHUB_TOKEN" and .source == "agent")) | length' 1
 not_disclosed 'sk-FAKE-SECOND-CHILD-SECRET-0123456789'
 finish_case
 
@@ -1149,10 +1167,10 @@ mk codex_same_name_live_placeholder_keeps_fresh_record_other
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 environ 102 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
-record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET other\n'
+record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY placeholder\nagent STRIPE_SECRET other\n'
 cat_fail_for_proc "$t/proc/102/environ" 0
 begin codex_same_name_live_placeholder_keeps_fresh_record_other env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
@@ -1162,9 +1180,9 @@ detail_contains environment 'not a placeholder: STRIPE_SECRET'
 detail_contains environment '2 Codex processes'
 detail_contains environment 'read 1 child environment'
 detail_contains environment '1 child environment unread; the fresh aggregate Codex record is retained'
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "placeholder" and .source == "codex")) | length' 1
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "codex")) | length' 1
-fact '.agent_environment.codex' read
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "placeholder" and .source == "agent")) | length' 1
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "agent")) | length' 1
+fact '.agent_environment.agent' read
 fact '.start_record.state' read
 finish_case
 
@@ -1172,10 +1190,10 @@ mk codex_same_name_live_other_keeps_fresh_record_placeholder
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'STRIPE_SECRET=sk-FAKE-SAME-NAME-OTHER-0123456789'
 environ 102 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
-record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET placeholder\n'
+record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY placeholder\nagent STRIPE_SECRET placeholder\n'
 cat_fail_for_proc "$t/proc/102/environ" 0
 begin codex_same_name_live_other_keeps_fresh_record_placeholder env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
@@ -1185,9 +1203,9 @@ detail_contains environment 'not a placeholder: STRIPE_SECRET'
 detail_contains environment '2 Codex processes'
 detail_contains environment 'read 1 child environment'
 detail_contains environment '1 child environment unread; the fresh aggregate Codex record is retained'
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "codex")) | length' 1
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "placeholder" and .source == "codex")) | length' 1
-fact '.agent_environment.codex' read
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "agent")) | length' 1
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "placeholder" and .source == "agent")) | length' 1
+fact '.agent_environment.agent' read
 fact '.start_record.state' read
 not_disclosed 'sk-FAKE-SAME-NAME-OTHER-0123456789'
 finish_case
@@ -1196,10 +1214,10 @@ mk codex_same_name_placeholder_observations_keep_child_multiplicity
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
 environ 102 'STRIPE_SECRET=openshell:resolve:env:STRIPE_SECRET'
-record 'jackin-env-kinds 1\nattempt 1\nmain OPENAI_API_KEY placeholder\ncodex STRIPE_SECRET placeholder\n'
+record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY placeholder\nagent STRIPE_SECRET placeholder\n'
 cat_fail_for_proc "$t/proc/102/environ" 0
 begin codex_same_name_placeholder_observations_keep_child_multiplicity env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
@@ -1207,15 +1225,15 @@ expect_report J08 sandbox
 expect environment FAIL '2 Codex processes'
 detail_contains environment 'read 1 child environment'
 detail_contains environment '1 child environment could not be read; the fresh aggregate Codex record is retained'
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "placeholder" and .source == "codex")) | length' 1
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "codex")) | length' 0
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "placeholder" and .source == "agent")) | length' 1
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "agent")) | length' 0
 finish_case
 
 mk codex_environment_count_reports_every_clean_child_read
 state 'exited 1 0'
 proc_main
 proc_codex
-proc_codex_child 102
+proc_agent_child 102
 environ 101 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 environ 102 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record "$R_OK1"
@@ -1238,7 +1256,7 @@ begin codex_filter_failure_uses_fresh_clean_record_without_claiming_live_read en
 expect_rc 0
 expect_report J08 sandbox
 expect environment PASS 'via record'
-fact '.agent_environment.codex' record
+fact '.agent_environment.agent' record
 not_disclosed 'sk-FAKE-FILTER-SECRET-0123456789'
 finish_case
 
@@ -1254,8 +1272,8 @@ begin codex_filter_failure_keeps_fresh_other_record_evidence env SENTINEL_REAL_J
 expect_rc 0
 expect_report J08 sandbox
 expect environment FAIL 'STRIPE_SECRET'
-fact '.agent_environment.codex' record
-fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "codex")) | length' 1
+fact '.agent_environment.agent' record
+fact '.environment | map(select(.name == "STRIPE_SECRET" and .kind == "other" and .source == "agent")) | length' 1
 not_disclosed 'sk-FAKE-FILTER-OTHER-SECRET-0123456789'
 finish_case
 
@@ -2998,33 +3016,38 @@ codex_prints() {
     mkdir -p "$t/bin"
     printf '#!/bin/sh\nprintf "%%s" "%s"\nexit %s\n' "$1" "$2" >"$t/bin/codex"
     chmod +x "$t/bin/codex"
-    seam CODEX_BIN "$t/bin/codex"
+    if [ -n "$1" ]; then
+        printf '%s' "$1" >"$t/expected-version"
+    else
+        printf 'expected-nonempty-version' >"$t/expected-version"
+    fi
+    seam AGENT_BIN "$t/bin/codex"
 }
 
-mk j00_a_silent_codex_version_is_not_a_pass
+mk j00_a_silent_agent_version_is_not_a_pass
 codex_prints '' 0
-begin j00_a_silent_codex_version_is_not_a_pass sh "$t/probe" --only J00
+begin j00_a_silent_agent_version_is_not_a_pass sh "$t/probe" --only J00
 expect_rc 0
 expect_report J00 sandbox
-expect codex_version FAIL 'printed nothing'
-fact '.codex.version' null
+expect agent_version FAIL 'printed nothing'
+fact '.agent.version' null
 finish_case
 
-mk j00_a_printed_codex_version_passes
+mk j00_a_printed_agent_version_passes
 codex_prints 'codex-cli 9.9.9' 0
-begin j00_a_printed_codex_version_passes sh "$t/probe" --only J00
+begin j00_a_printed_agent_version_passes sh "$t/probe" --only J00
 expect_rc 0
 expect_report J00 sandbox
-expect codex_version PASS 'codex-cli 9.9.9'
-fact '.codex.version' 'codex-cli 9.9.9'
+expect agent_version PASS 'codex-cli 9.9.9'
+fact '.agent.version' 'codex-cli 9.9.9'
 finish_case
 
-mk j00_a_failing_codex_version_fails
+mk j00_a_failing_agent_version_fails
 codex_prints 'codex-cli 9.9.9' 3
-begin j00_a_failing_codex_version_fails sh "$t/probe" --only J00
+begin j00_a_failing_agent_version_fails sh "$t/probe" --only J00
 expect_rc 0
 expect_report J00 sandbox
-expect codex_version FAIL 'failed'
+expect agent_version FAIL 'failed'
 finish_case
 
 mk name_rule
@@ -3205,12 +3228,14 @@ report file_scan_flags_a_refresh_token_that_only_starts_like_a_placeholder
 expect file_scan FAIL 'session.json'
 finish_case
 
-mk auth_file_skips_when_auth_json_is_absent
+mk auth_file_fails_when_auth_json_is_absent
 state waiting
 record "$R_EMPTY"
-report auth_file_skips_when_auth_json_is_absent
-expect auth_file SKIP 'no auth.json'
-fact '.auth_file' null
+report auth_file_fails_when_auth_json_is_absent
+expect auth_file FAIL 'requires auth.json'
+fact '.auth_file.state' absent
+fact '.auth_file.path' "$t/sandbox/.codex/auth.json"
+fact '.auth_file.mode' null
 finish_case
 
 mk auth_file_fails_when_auth_json_is_a_directory
@@ -3219,7 +3244,8 @@ record "$R_EMPTY"
 mkdir -p "$t/sandbox/.codex/auth.json"
 report auth_file_fails_when_auth_json_is_a_directory
 expect auth_file FAIL 'not a regular file'
-fact '.auth_file' null
+fact '.auth_file.state' malformed
+fact '.auth_file.mode' null
 finish_case
 
 mk auth_file_fails_when_auth_json_is_a_dangling_symlink
@@ -3248,7 +3274,7 @@ shadow_case() {
     cp "$scratch/bounded.out" "$t/out"
     cp "$scratch/bounded.err" "$t/err"
     [ "$rc" -eq 0 ] || problems=" rc=$rc"
-    jq -e '.schema == 2 and .mode == "sandbox" and (.steps | keys) == ["J08"] and ([.steps.J08.checks[] | select(.name == "environment")] | length) == 1 and ([.steps.J08.checks[] | select(.name == "environment")][0].result == "PASS") and .steps.J08.facts.start_record.state == "read"' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-result"
+    jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J08"] and ([.steps.J08.checks[] | select(.name == "environment")] | length) == 1 and ([.steps.J08.checks[] | select(.name == "environment")][0].result == "PASS") and .steps.J08.facts.start_record.state == "read"' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-result"
     [ ! -e "$t/$tool.selected" ] || problems="$problems inherited-$tool-selected"
     finish_case
 }
@@ -3269,7 +3295,7 @@ rc=$?
 cp "$scratch/bounded.out" "$t/out"
 cp "$scratch/bounded.err" "$t/err"
 [ "$rc" -eq 0 ] || problems=" rc=$rc"
-jq -e '.schema == 2 and .mode == "sandbox" and (.steps | keys) == ["J08"] and ([.steps.J08.checks[] | select(.name == "environment")] | length) == 1 and ([.steps.J08.checks[] | select(.name == "environment")][0].result == "PASS") and .steps.J08.facts.start_record.state == "read"' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-result"
+jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J08"] and ([.steps.J08.checks[] | select(.name == "environment")] | length) == 1 and ([.steps.J08.checks[] | select(.name == "environment")][0].result == "PASS") and .steps.J08.facts.start_record.state == "read"' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-result"
 finish_case
 
 mk host_tools_outside_sandbox_path
@@ -3290,7 +3316,7 @@ rc=$?
 cp "$scratch/bounded.out" "$t/out"
 cp "$scratch/bounded.err" "$t/err"
 [ "$rc" -eq 0 ] || problems=" rc=$rc"
-jq -e '.schema == 2 and .mode == "host" and .steps.J08.result == "SKIP" and .steps.J08.facts == null and ([.steps.J08.checks[].result] | all(. == "SKIP"))' "$t/out" >/dev/null 2>&1 || problems="$problems host-skip-null-boundary"
+jq -e '.schema == 3 and .mode == "host" and .steps.J08.result == "SKIP" and .steps.J08.facts == null and ([.steps.J08.checks[].result] | all(. == "SKIP"))' "$t/out" >/dev/null 2>&1 || problems="$problems host-skip-null-boundary"
 finish_case
 
 mk sandbox_git_shadow
@@ -3306,7 +3332,7 @@ if git_project; then
     cp "$scratch/bounded.out" "$t/out"
     cp "$scratch/bounded.err" "$t/err"
     [ "$rc" -eq 0 ] || problems=" rc=$rc"
-    jq -e '.schema == 2 and .mode == "sandbox" and .steps.J13.result == "PASS" and .steps.J13.facts.work_tree == true and .steps.J13.facts.clean == true' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-git-facts"
+    jq -e '.schema == 3 and .mode == "sandbox" and .steps.J13.result == "PASS" and .steps.J13.facts.work_tree == true and .steps.J13.facts.clean == true' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape-or-git-facts"
     [ ! -e "$t/git.selected" ] || problems="$problems inherited-git-selected"
     finish_case
 else

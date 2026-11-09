@@ -11,11 +11,15 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh jq sed tr cat env awk grep mktemp rm wc head od mkdir cp; do
-    found=$(command -v "$tool") || {
-        echo "FAIL setup: $tool is not installed"
-        exit 70
-    }
+for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp; do
+    if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
+        found=$(mise which jq) || exit 70
+    else
+        found=$(command -v "$tool") || {
+            echo "FAIL setup: $tool is not installed"
+            exit 70
+        }
+    fi
     ln -s "$found" "$scratch/tools/$tool"
 done
 jq() {
@@ -80,16 +84,23 @@ mk() {
 
 prepare_probe() {
     fixture_path=$t/bin:$scratch/tools
-    sed -e "s#/sandbox#$t/sandbox#g" -e "s#^CODEX_BIN=.*#CODEX_BIN=$t/bin/codex#" "$probe" >"$t/probe"
-    if grep -q '^SANDBOX_PATH=' "$t/probe"; then
-        sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe" >"$t/probe.next" || return 1
-        mv "$t/probe.next" "$t/probe" || return 1
-        grep -Fq "SANDBOX_PATH=$fixture_path" "$t/probe" || return 1
-        if grep -Fq 'SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin' "$t/probe"; then
+    sed -e "s#/sandbox#$t/sandbox#g" -e "s#^AGENT_BIN=.*#AGENT_BIN=$t/bin/codex#" "$probe" >"$t/probe.impl"
+    if grep -q '^SANDBOX_PATH=' "$t/probe.impl"; then
+        sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe.impl" >"$t/probe.next" || return 1
+        mv "$t/probe.next" "$t/probe.impl" || return 1
+        grep -Fq "SANDBOX_PATH=$fixture_path" "$t/probe.impl" || return 1
+        if grep -Fq 'SANDBOX_PATH=/usr/local/bin:/usr/bin:/bin' "$t/probe.impl"; then
             return 1
         fi
     fi
-    chmod +x "$t/probe"
+    cat >"$t/spec" <<EOF
+{"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
+EOF
+    cat >"$t/probe" <<EOF
+#!/bin/sh
+exec "$t/probe.impl" --spec "$t/spec" "\$@"
+EOF
+    chmod +x "$t/probe" "$t/probe.impl"
 }
 
 codex_says() {
@@ -195,10 +206,10 @@ codex_stream_case() {
     expected_bytes=$5
     if [ "$selected_step" = J07 ]; then
         step_name=j07
-        check_name=codex_exec
+        check_name=agent_exec
     else
         step_name=j09
-        check_name=codex_reaches_api
+        check_name=agent_reaches_api
         with_curl
         answer "$OUTSIDE" 7 000
         answer "$METADATA" 7 000
@@ -208,9 +219,9 @@ codex_stream_case() {
     begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER"
     expect "$check_name" "$expected_result" "$(if [ "$expected_result" = PASS ]; then printf 'codex exec answered'; else printf 'gave no answer'; fi)"
     if [ -n "$expected_exit" ]; then
-        fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered) \(.output_bytes)"' "true api_key $expected_exit $([ "$expected_result" = PASS ] && printf true || printf false) $expected_bytes"
+        fact '.agent_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered) \(.output_bytes)"' "true api_key $expected_exit $([ "$expected_result" = PASS ] && printf true || printf false) $expected_bytes"
     else
-        fact '.codex_exec | "\(.attempted) \(.credential) \(.answered) \(.output_bytes)"' "true api_key false $expected_bytes"
+        fact '.agent_exec | "\(.attempted) \(.credential) \(.answered) \(.output_bytes)"' "true api_key false $expected_bytes"
     fi
     expect_absent_from_report OUT-RAW-SECRET-MARKER
     finish_case
@@ -318,7 +329,7 @@ begin() {
         else
             problems=" the probe did not finish in time or failed"
         fi
-    elif ! jq -e --arg step "${1#step_}" '.schema == 2 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
+    elif ! jq -e --arg step "${1#step_}" '.schema == 3 and .mode == "sandbox" and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1; then
         problems=" report-shape"
     fi
 }
@@ -365,7 +376,7 @@ finish_case() {
 
 OUTSIDE=https://example.com
 METADATA=http://169.254.169.254/latest/meta-data/
-PROVIDER=https://api.openai.com/v1/models
+PROVIDER=https://chatgpt.com/backend-api/models
 ENGINE=host.openshell.internal:2376
 PING=https://$ENGINE/_ping
 PLACEHOLDER=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN
@@ -463,7 +474,7 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_provider_refused step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
-expect codex_reaches_api PASS 'codex exec answered'
+expect agent_reaches_api PASS 'codex exec answered'
 expect provider_no_credential PASS 'refused the connection'
 expect_sent "Authorization: Bearer $PLACEHOLDER"
 finish_case
@@ -587,8 +598,8 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_codex_answers step_J09 '' OPENAI_API_KEY="$PLACEHOLDER"
-expect codex_reaches_api PASS 'codex exec answered'
-fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
 finish_case
 
 mk j09_codex_timeout_after_partial_output_is_not_an_answer
@@ -598,8 +609,8 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_codex_timeout_after_partial_output_is_not_an_answer step_J09 '' OPENAI_API_KEY="$PLACEHOLDER"
-expect codex_reaches_api FAIL 'exit 124 gave no answer'
-fact '.codex_exec | "\(.attempted) \(.exit_code) \(.answered)"' 'true 124 false'
+expect agent_reaches_api FAIL 'exit 124 gave no answer'
+fact '.agent_exec | "\(.attempted) \(.exit_code) \(.answered)"' 'true 124 false'
 finish_case
 
 for selected_step in J07 J09; do
@@ -654,8 +665,8 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_codex_uses_the_api_key_of_auth_json step_J09 ''
-expect codex_reaches_api PASS 'codex exec answered'
-fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true api_key'
 finish_case
 
 mk j09_codex_uses_the_access_token_variable
@@ -665,8 +676,8 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_codex_uses_the_access_token_variable step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
-expect codex_reaches_api PASS 'codex exec answered'
-fact '.codex_exec | "\(.attempted) \(.credential)"' 'true chatgpt_login'
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
 finish_case
 
 mk j09_an_empty_access_token_in_auth_json_does_not_hide_the_api_key
@@ -679,7 +690,7 @@ answer "$PROVIDER" 0 401 "$(openai_401 "$API_PLACEHOLDER_SHOWN")"
 begin j09_an_empty_access_token_in_auth_json_does_not_hide_the_api_key step_J09 ''
 expect provider_no_credential PASS 'no credential was applied'
 expect_sent "Authorization: Bearer $API_PLACEHOLDER"
-fact '.codex_exec | "\(.attempted) \(.credential)"' 'true api_key'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true api_key'
 finish_case
 
 mk j09_provider_check_sends_the_placeholder_of_auth_json
@@ -714,18 +725,18 @@ answer "$METADATA" 7 000
 answer "$PROVIDER" 0 200
 begin j09_a_real_token_in_auth_json_is_never_sent step_J09 ''
 expect provider_no_credential SKIP 'no placeholder to send'
-expect codex_reaches_api SKIP 'not a full placeholder'
+expect agent_reaches_api SKIP 'not a full placeholder'
 fact '.provider_host' null
-fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
 expect_codex_not_run
 expect_never_sent FAKE-real-token
 finish_case
 
 never_used() {
     expect provider_no_credential SKIP 'no placeholder to send'
-    expect codex_reaches_api SKIP 'not a full placeholder'
+    expect agent_reaches_api SKIP 'not a full placeholder'
     fact '.provider_host' null
-    fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
+    fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
     expect_codex_not_run
     expect_never_sent X-Exfil
     expect_never_sent 'curl https://api.openai.com'
@@ -774,7 +785,7 @@ auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 begin j09_a_real_api_key_variable_blocks_codex_exec_next_to_a_placeholder_in_auth_json step_J09 '' OPENAI_API_KEY=FAKE-real-key
-expect codex_reaches_api SKIP 'not a full placeholder'
+expect agent_reaches_api SKIP 'not a full placeholder'
 expect_codex_not_run
 finish_case
 
@@ -786,7 +797,7 @@ answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
 begin j09_a_real_refresh_token_blocks_codex_exec_next_to_a_placeholder_access_token step_J09 ''
-expect codex_reaches_api SKIP 'not a full placeholder'
+expect agent_reaches_api SKIP 'not a full placeholder'
 expect_codex_not_run
 finish_case
 
@@ -795,8 +806,8 @@ with_curl
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 begin j09_no_credential_skips_codex step_J09 ''
-expect codex_reaches_api SKIP 'no credential'
-fact '.codex_exec | "\(.attempted) \(.credential)"' 'false none'
+expect agent_reaches_api SKIP 'no credential'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
 finish_case
 
 INHERITED_CREDENTIAL_VALUE=FAKE-inherited-credential-value-7d95c2
@@ -815,17 +826,17 @@ credential_case_setup() {
 for selected_step in J07 J09; do
     if [ "$selected_step" = J07 ]; then
         step_name=j07
-        check_name=codex_exec
+        check_name=agent_exec
     else
         step_name=j09
-        check_name=codex_reaches_api
+        check_name=agent_reaches_api
     fi
     for credential_name in KEY X_TOKEN A_SECRET_B PASSWORD DB_PASSWD CREDENTIAL CREDENTIALS AUTH github_token auth credential; do
         case_name="${step_name}_inherited_${credential_name}_nonplaceholder_skips_codex"
         credential_case_setup "$case_name" "$selected_step"
         begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER" "$credential_name=$INHERITED_CREDENTIAL_VALUE"
         expect "$check_name" SKIP 'not a full placeholder'
-        fact '.codex_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
+        fact '.agent_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
         expect_codex_not_run
         expect_absent_from_report "$INHERITED_CREDENTIAL_VALUE"
         finish_case
@@ -835,7 +846,7 @@ for selected_step in J07 J09; do
     credential_case_setup "$case_name" "$selected_step"
     begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER" GITHUB_TOKEN="$PLACEHOLDER" auth="$PLACEHOLDER" credential="$PLACEHOLDER" AWS_SECRET_ACCESS_KEY= KEYBOARD=ordinary-keyboard TOKENIZER=ordinary-tokenizer OAUTH_X=ordinary-oauth SSH_AUTH_SOCK=ordinary-socket
     expect "$check_name" PASS 'codex exec answered'
-    fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
+    fact '.agent_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
     [ -e "$t/codex.ran" ] || problems="$problems codex-not-run"
     finish_case
 
@@ -843,7 +854,7 @@ for selected_step in J07 J09; do
     credential_case_setup "$case_name" "$selected_step"
     begin "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER"
     expect "$check_name" PASS 'codex exec answered'
-    fact '.codex_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
+    fact '.agent_exec | "\(.attempted) \(.credential) \(.exit_code) \(.answered)"' 'true api_key 0 true'
     [ -e "$t/codex.ran" ] || problems="$problems codex-not-run"
     finish_case
 
@@ -851,7 +862,7 @@ for selected_step in J07 J09; do
     credential_case_setup "$case_name" "$selected_step"
     begin_without_probe_env "$case_name" "step_$selected_step" '' OPENAI_API_KEY="$API_PLACEHOLDER"
     expect "$check_name" SKIP 'could not inspect'
-    fact '.codex_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
+    fact '.agent_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
     expect_codex_not_run
     finish_case
 done
