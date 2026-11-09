@@ -209,6 +209,10 @@ begin() {
         "$scratch/tools/jq" --arg version "$(cat "$t/expected-version")" ".behavior.version.exact_output = \$version" "$t/spec" >"$t/spec.next"
         mv "$t/spec.next" "$t/spec"
     fi
+    if [ -f "$t/spec-filter" ]; then
+        "$scratch/tools/jq" -f "$t/spec-filter" "$t/spec" >"$t/spec.next"
+        mv "$t/spec.next" "$t/spec"
+    fi
     if [ -f "$t/seams.sed" ]; then
         sed -f "$t/seams.sed" "$t/probe.impl" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe.impl"
         chmod +x "$t/probe.impl"
@@ -224,8 +228,8 @@ expect_rc() {
 }
 
 expect_report() {
-    jq -e --arg step "$1" --arg mode "$2" \
-        '.schema == 3 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step]' "$t/out" >/dev/null 2>&1 ||
+    jq -e --arg step "$1" --arg mode "$2" --slurpfile spec "$t/spec" \
+        '.schema == 3 and .probe == "jackin-sentinel-probe" and .mode == $mode and (.steps | keys) == [$step] and .target == $spec[0].target' "$t/out" >/dev/null 2>&1 ||
         problems="$problems report-shape"
     if [ "$1" = J15 ]; then
         [ -f "$t/bin/docker-data/run.called" ] || problems="$problems run-not-invoked"
@@ -588,6 +592,7 @@ for variant in \
     'bad_version|jackin-env-kinds 2\nattempt 0\n' \
     'missing_attempt|jackin-env-kinds 2\nmain OPENAI_API_KEY placeholder\n' \
     'leading_zero_attempt|jackin-env-kinds 2\nattempt 00\n' \
+    'leading_zero_attempt_with_main_and_agent|jackin-env-kinds 2\nattempt 00\nmain A_KEY empty\nagent A_KEY empty\n' \
     'duplicate_main_name|jackin-env-kinds 2\nattempt 0\nmain A_KEY empty\nmain A_KEY empty\n' \
     'main_after_codex|jackin-env-kinds 2\nattempt 0\nagent A_KEY empty\nmain A_KEY empty\n' \
     'escape_in_name|jackin-env-kinds 2\nattempt 0\nmain X\033]0;pwn other\n' \
@@ -3236,6 +3241,49 @@ expect auth_file FAIL 'requires auth.json'
 fact '.auth_file.state' absent
 fact '.auth_file.path' "$t/sandbox/.codex/auth.json"
 fact '.auth_file.mode' null
+finish_case
+
+spec_auth_path() {
+    printf '.behavior.credential.auth_file.path = "%s"\n' "$1" >"$t/spec-filter"
+}
+
+mk auth_file_path_comes_from_the_spec
+state waiting
+record "$R_EMPTY"
+spec_auth_path "$t/sandbox/spec-chosen/auth.json"
+auth_json '{"tokens":{"access_token":"FAKE-real-token"}}'
+mkdir -p "$t/sandbox/spec-chosen"
+printf '{"tokens":{"access_token":"%s","refresh_token":""}}\n' "$PLACEHOLDER_ACCESS" >"$t/sandbox/spec-chosen/auth.json"
+report auth_file_path_comes_from_the_spec
+expect auth_file PASS 'only placeholders'
+fact '.auth_file.state' present
+fact '.auth_file.path' "$t/sandbox/spec-chosen/auth.json"
+finish_case
+
+mk auth_file_path_from_the_spec_is_required_even_when_the_default_exists
+state waiting
+record "$R_EMPTY"
+spec_auth_path "$t/sandbox/spec-chosen/auth.json"
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"\"}}"
+report auth_file_path_from_the_spec_is_required_even_when_the_default_exists
+expect auth_file FAIL 'requires auth.json'
+fact '.auth_file.state' absent
+fact '.auth_file.path' "$t/sandbox/spec-chosen/auth.json"
+finish_case
+
+mk report_target_echoes_the_private_spec_identity
+state waiting
+record "$R_EMPTY"
+auth_json '{}'
+printf '.target.model = "gpt-spec-echo-model" | .target.spec_sha256 = "%s"\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb >"$t/spec-filter"
+report report_target_echoes_the_private_spec_identity
+jq -e --slurpfile spec "$t/spec" '
+    .target == $spec[0].target and
+    .target.tuple == "T01" and .target.agent == "codex" and .target.provider == "codex" and
+    .target.model == "gpt-spec-echo-model" and .target.adapter == "t01-codex-v1" and
+    .target.spec_sha256 == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and
+    (.target | keys) == ["adapter", "agent", "model", "provider", "spec_sha256", "tuple"]' "$t/out" >/dev/null 2>&1 ||
+    problems="$problems target-not-echoed"
 finish_case
 
 mk auth_file_fails_when_auth_json_is_a_directory

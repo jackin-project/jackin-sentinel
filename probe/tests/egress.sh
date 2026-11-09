@@ -258,8 +258,12 @@ provider_body() {
     echo "$t/body"
 }
 
+openai_error() {
+    provider_body "{\"error\": {\"message\": \"Incorrect API key provided: $1. You can find your API key at https://platform.openai.com/account/api-keys.\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": \"$2\"}}"
+}
+
 openai_401() {
-    provider_body "{\"error\": {\"message\": \"Incorrect API key provided: $1. You can find your API key at https://platform.openai.com/account/api-keys.\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": \"invalid_api_key\"}}"
+    openai_error "$1" invalid_api_key
 }
 
 expect_never_sent() {
@@ -565,6 +569,28 @@ answer "$PROVIDER" 0 401
 begin j09_provider_401_with_an_empty_body_fails step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
 expect provider_no_credential FAIL 'may have seen another credential'
 finish_case
+
+mk j09_provider_401_with_the_invalid_key_code_is_classified_invalid_api_key
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 0 401 "$(openai_401 "$PLACEHOLDER_SHOWN")"
+begin j09_provider_401_with_the_invalid_key_code_is_classified_invalid_api_key step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect provider_no_credential PASS 'no credential was applied'
+fact '.provider_host | "\(.http_code) \(.body)"' '401 invalid_api_key'
+finish_case
+
+for error_code in insufficient_quota invalid_api_key_expired INVALID_API_KEY; do
+    mk "j09_provider_401_with_the_error_code_${error_code}_fails"
+    with_curl
+    answer "$OUTSIDE" 7 000
+    answer "$METADATA" 7 000
+    answer "$PROVIDER" 0 401 "$(openai_error "$PLACEHOLDER_SHOWN" "$error_code")"
+    begin "j09_provider_401_with_the_error_code_${error_code}_fails" step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+    expect provider_no_credential FAIL 'may have seen another credential'
+    fact '.provider_host | "\(.http_code) \(.body)"' '401 other'
+    finish_case
+done
 
 for refusal in 403 429 500; do
     mk "j09_provider_${refusal}_is_not_proof"
