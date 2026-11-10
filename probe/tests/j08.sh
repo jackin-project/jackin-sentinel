@@ -707,7 +707,7 @@ record "$R_W0"
 auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\",\"refresh_token\":\"rt_FAKE_refresh_value\"}}"
 report file_scan_flags_real_refresh_token
 expect auth_file FAIL 'not a placeholder'
-expect file_scan FAIL 'auth.json'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/.codex/auth.json" | sha256sum | cut -c1-12)"
 finish_case
 
 mk file_scan_flags_a_multiline_refresh_token_outside_the_project_without_disclosing_it
@@ -716,8 +716,9 @@ record "$R_W0"
 multiline_refresh=$(printf '%s%s' 'refresh-' 'token-value-0123456789')
 printf '{\n  "refresh_token":\n    "%s"\n}\n' "$multiline_refresh" >"$t/sandbox/session.json"
 report file_scan_flags_a_multiline_refresh_token_outside_the_project_without_disclosing_it
-expect file_scan FAIL 'session.json'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/session.json" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
+fact '.leak_count' 1
 if grep -Fq "$multiline_refresh" "$t/out"; then
     problems="$problems report-disclosed-refresh-token"
 fi
@@ -731,6 +732,7 @@ printf '{\n  "refresh_token":\n    ""\n}\n' >"$t/sandbox/empty-session.json"
 report file_scan_accepts_multiline_refresh_placeholders_and_empty_values
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
 finish_case
 
 mk file_scan_flags_token_in_file_over_two_mebibytes
@@ -741,8 +743,9 @@ record "$R_W0"
     printf '\nsk-%s\n' abcdefghijklmnopqrstuvwxyz
 } >"$t/sandbox/big.log"
 report file_scan_flags_token_in_file_over_two_mebibytes
-expect file_scan FAIL 'big.log'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/big.log" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
+fact '.leak_count' 1
 finish_case
 
 mk file_scan_passes_clean_sandbox
@@ -752,6 +755,63 @@ printf 'nothing here\n' >"$t/sandbox/note.txt"
 report file_scan_passes_clean_sandbox
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
+finish_case
+
+mk file_scan_names_do_not_disclose
+state waiting
+record "$R_W0"
+token_name='sk-abcdefghijklmnopqrstuvwx'
+outside_path="$t/sandbox/${token_name}.txt"
+backup_dir="$t/sandbox/credential-backup"
+backup_path="$backup_dir/secret.txt"
+mkdir -p "$backup_dir"
+printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$outside_path"
+printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$backup_path"
+report file_scan_names_do_not_disclose
+expect file_scan FAIL 'token-shaped strings in'
+fact '.leak_count' 2
+if grep -Fq "$token_name" "$t/out"; then
+    problems="$problems report-disclosed-token-name"
+fi
+if grep -Fq 'credential-backup' "$t/out"; then
+    problems="$problems report-disclosed-credential-backup"
+fi
+if grep -Fq "$outside_path" "$t/out" || grep -Fq "$backup_path" "$t/out"; then
+    problems="$problems report-disclosed-raw-path"
+fi
+finish_case
+
+mk file_scan_unscanned_name
+state waiting
+record "$R_W0"
+seam SCAN_MAX_KIB 1
+token_name='sk-abcdefghijklmnopqrstuvwx'
+oversize_path="$t/sandbox/${token_name}.txt"
+{
+    head -c 3145728 /dev/zero | tr '\0' 'a'
+    printf '\nsk-%s\n' abcdefghijklmnopqrstuvwxyz
+} >"$oversize_path"
+report file_scan_unscanned_name
+expect file_scan SKIP 'over the size cap'
+fact '.leak_count' 0
+if grep -Fq "$token_name" "$t/out"; then
+    problems="$problems report-disclosed-unscanned-name"
+fi
+finish_case
+
+mk file_scan_leak_count_over_cap
+state waiting
+record "$R_W0"
+i=1
+while [ "$i" -le 51 ]; do
+    printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/leak-$i.txt"
+    i=$((i + 1))
+done
+report file_scan_leak_count_over_cap
+expect file_scan FAIL 'token-shaped strings in'
+fact '.leak_count' 51
+fact '.leaks | length' 50
 finish_case
 
 mk api_key_in_auth_file_is_not_a_placeholder
@@ -1507,7 +1567,8 @@ state waiting
 record "$R_W0"
 printf 'head\0tail\nsk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/blob.bin"
 report file_scan_flags_token_in_binary_file
-expect file_scan FAIL 'blob.bin'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/blob.bin" | sha256sum | cut -c1-12)"
+fact '.leak_count' 1
 finish_case
 
 mk file_scan_ignores_sk_inside_a_word
@@ -1534,6 +1595,7 @@ printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$JWT_
 report file_scan_passes_a_jwt_without_a_sub_claim_in_a_binary_file
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
 finish_case
 
 mk file_scan_flags_a_jwt_with_a_sub_claim_in_a_binary_file
@@ -1541,8 +1603,9 @@ state waiting
 record "$R_W0"
 printf 'head\0Set-Cookie: __oailb=%s.%s.%s; Path=/\0tail\n' "$JWT_HEADER" "$JWT_WITH_SUB" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
 report file_scan_flags_a_jwt_with_a_sub_claim_in_a_binary_file
-expect file_scan FAIL 'logs.sqlite'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/logs.sqlite" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
+fact '.leak_count' 1
 finish_case
 
 jwt_flagged() {
@@ -1551,8 +1614,9 @@ jwt_flagged() {
     record "$R_W0"
     printf 'head\0token=%s.%s.%s\0tail\n' "$2" "$3" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
     report "$1"
-    expect file_scan FAIL 'logs.sqlite'
+    expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/logs.sqlite" | sha256sum | cut -c1-12)"
     fact '.leaks | length' 1
+    fact '.leak_count' 1
     finish_case
 }
 
@@ -1562,9 +1626,10 @@ record "$R_W0"
 cookie_schema_issuer_jwt=$JWT_HEADER.$(b64url '{"aud":["chatgpt.com"],"exp":1,"host":"x","iat":1,"iss":"other-service"}').$JWT_SIGNATURE
 printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_issuer_jwt" >"$t/sandbox/logs.sqlite"
 report file_scan_flags_a_subless_jwt_of_another_issuer
-expect file_scan FAIL 'logs.sqlite'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/logs.sqlite" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
-fact '.leaks[0] | endswith("/logs.sqlite")' true
+fact '.leak_count' 1
+fact '.leaks[0] | test("^leak-[0-9a-f]{12}$")' true
 not_disclosed "$cookie_schema_issuer_jwt"
 finish_case
 jwt_flagged file_scan_flags_a_subless_jwt_of_another_audience "$JWT_HEADER" "$(b64url '{"aud":["api.example.com"],"exp":1,"iss":"edge-gateway"}')"
@@ -1591,8 +1656,9 @@ record "$R_W0"
 JWT_NOT_JSON=$(b64url '{"not json at all')
 printf 'head\0token=%s.%s.%s\0tail\n' "$JWT_HEADER" "$JWT_NOT_JSON" "$JWT_SIGNATURE" >"$t/sandbox/logs.sqlite"
 report file_scan_flags_a_jwt_shaped_string_that_does_not_decode
-expect file_scan FAIL 'logs.sqlite'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/logs.sqlite" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
+fact '.leak_count' 1
 finish_case
 
 cookie_schema_flagged() {
@@ -1602,9 +1668,10 @@ cookie_schema_flagged() {
     cookie_schema_jwt=$2.$3.$JWT_SIGNATURE
     printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_jwt" >"$t/sandbox/logs.sqlite"
     report "$1"
-    expect file_scan FAIL 'logs.sqlite'
+    expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/logs.sqlite" | sha256sum | cut -c1-12)"
     fact '.leaks | length' 1
-    fact '.leaks[0] | endswith("/logs.sqlite")' true
+    fact '.leak_count' 1
+    fact '.leaks[0] | test("^leak-[0-9a-f]{12}$")' true
     not_disclosed "$cookie_schema_jwt"
     if [ -n "${4-}" ]; then
         not_disclosed "$4"
@@ -1626,6 +1693,7 @@ printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_without_ty
 report file_scan_passes_a_cookie_without_typ
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
 not_disclosed "$cookie_schema_without_typ_jwt"
 finish_case
 
@@ -1641,6 +1709,7 @@ printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_whitespace
 report file_scan_passes_a_cookie_with_json_whitespace
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
 not_disclosed "$cookie_schema_whitespace_jwt"
 finish_case
 
@@ -1656,6 +1725,7 @@ printf 'head\0Set-Cookie: __oailb=%s; Path=/\0tail\n' "$cookie_schema_punctuatio
 report file_scan_passes_a_cookie_with_punctuation_in_host
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
 not_disclosed "$cookie_schema_punctuation_jwt"
 not_disclosed "$cookie_schema_punctuation_host"
 finish_case
@@ -1682,6 +1752,7 @@ report file_scan_accepts_a_placeholder_id_token
 expect auth_file PASS 'only placeholders'
 expect file_scan PASS 'no token-shaped string'
 fact '.leaks | length' 0
+fact '.leak_count' 0
 finish_case
 
 mk auth_file_rejects_an_id_token_with_only_the_placeholder_suffix
@@ -1721,11 +1792,13 @@ finish_case
 mk file_scan_flags_token_in_name_with_newline
 state waiting
 record "$R_W0"
-printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/$(printf 'to\nken.txt')"
+newline_path="$t/sandbox/$(printf 'to\nken.txt')"
+printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$newline_path"
 report file_scan_flags_token_in_name_with_newline
-expect file_scan FAIL 'token-shaped strings in'
+expect file_scan FAIL "leak-$(printf '%s' "$newline_path" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
-fact '.leaks[0] | endswith("to\nken.txt")' true
+fact '.leak_count' 1
+fact '.leaks[0] | test("^leak-[0-9a-f]{12}$")' true
 finish_case
 
 mk file_scan_skips_a_file_over_the_size_cap
@@ -1737,8 +1810,9 @@ seam SCAN_MAX_KIB 1
     printf '\nsk-%s\n' abcdefghijklmnopqrstuvwxyz
 } >"$t/sandbox/big.log"
 report file_scan_skips_a_file_over_the_size_cap
-expect file_scan SKIP 'big.log (over the size cap)'
+expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/big.log" | sha256sum | cut -c1-12) (over the size cap)"
 fact '.leaks | length' 0
+fact '.leak_count' 0
 finish_case
 
 mk file_scan_skips_when_grep_fails
@@ -1750,7 +1824,7 @@ printf 'plain\n' >"$t/sandbox/bad.dat"
 begin file_scan_skips_when_grep_fails env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
-expect file_scan SKIP 'bad.dat'
+expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/bad.dat" | sha256sum | cut -c1-12) (grep failed)"
 finish_case
 
 mk file_scan_flags_a_token_next_to_a_failed_grep
@@ -1763,7 +1837,8 @@ printf 'sk-%s\n' abcdefghijklmnopqrstuvwxyz >"$t/sandbox/secret.txt"
 begin file_scan_flags_a_token_next_to_a_failed_grep env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
-expect file_scan FAIL 'secret.txt'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/secret.txt" | sha256sum | cut -c1-12)"
+fact '.leak_count' 1
 finish_case
 
 mk file_scan_skip_keeps_its_reason_before_a_long_path
@@ -1789,7 +1864,7 @@ printf 'plain\n' >"$t/sandbox/slow.dat"
 begin file_scan_skips_when_grep_times_out env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
-expect file_scan SKIP 'slow.dat (grep timed out)'
+expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/slow.dat" | sha256sum | cut -c1-12) (grep timed out)"
 finish_case
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -1799,7 +1874,7 @@ if [ "$(id -u)" -ne 0 ]; then
     printf 'plain\n' >"$t/sandbox/locked.txt"
     chmod 000 "$t/sandbox/locked.txt"
     report file_scan_skips_an_unreadable_file
-    expect file_scan SKIP 'locked.txt (unreadable)'
+    expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/locked.txt" | sha256sum | cut -c1-12) (unreadable)"
     finish_case
 
     mk file_scan_skips_an_unreadable_directory
@@ -1810,7 +1885,7 @@ if [ "$(id -u)" -ne 0 ]; then
     chmod 000 "$t/sandbox/locked"
     report file_scan_skips_an_unreadable_directory
     chmod 755 "$t/sandbox/locked"
-    expect file_scan SKIP 'locked'
+    expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/locked" | sha256sum | cut -c1-12)"
     finish_case
 else
     echo "skip file_scan_skips_an_unreadable_file and directory: running as root"
@@ -3252,8 +3327,9 @@ state waiting
 record "$R_W0"
 printf '{"k":"x\\nsk-%s"}\n' FAKEFAKEFAKEFAKEFAKE0123456789ABCD >"$t/sandbox/notes.json"
 report file_scan_flags_sk_after_a_json_newline_escape
-expect file_scan FAIL 'notes.json'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/notes.json" | sha256sum | cut -c1-12)"
 fact '.leaks | length' 1
+fact '.leak_count' 1
 finish_case
 
 mk file_scan_flags_sk_after_a_json_unicode_escape
@@ -3261,7 +3337,8 @@ state waiting
 record "$R_W0"
 printf '{"k":"x\\u000ask-%s"}\n' FAKEFAKEFAKEFAKEFAKE0123456789ABCD >"$t/sandbox/notes.json"
 report file_scan_flags_sk_after_a_json_unicode_escape
-expect file_scan FAIL 'notes.json'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/notes.json" | sha256sum | cut -c1-12)"
+fact '.leak_count' 1
 finish_case
 
 mk file_scan_ignores_sk_inside_a_word_after_an_escape_letter
@@ -3277,7 +3354,8 @@ state waiting
 record "$R_W0"
 printf '{"refresh_token":"openshell:resolve:env:A-real-secret-0123456789"}\n' >"$t/sandbox/session.json"
 report file_scan_flags_a_refresh_token_that_only_starts_like_a_placeholder
-expect file_scan FAIL 'session.json'
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/session.json" | sha256sum | cut -c1-12)"
+fact '.leak_count' 1
 finish_case
 
 mk auth_file_fails_when_auth_json_is_absent

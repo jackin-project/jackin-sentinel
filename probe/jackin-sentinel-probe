@@ -987,6 +987,23 @@ is_placeholder() {
     jq -Rrse --arg re "$PLACEHOLDER_RE" 'test($re + "\\z")' >/dev/null 2>&1
 }
 
+leak_id() {
+    printf '%s' "$1" | sha256sum | cut -c1-12 | sed 's/^/leak-/'
+}
+
+sanitize_find_error() {
+    error_line=$1
+    error_path=$(printf '%s\n' "$error_line" | sed -nE "s#^find: ['‘](/[^:]*)['’]: .*#\\1#p")
+    if [ -z "$error_path" ]; then
+        error_path=$(printf '%s\n' "$error_line" | sed -nE 's#^find: (/[^:]*): .*#\1#p')
+    fi
+    if [ -n "$error_path" ]; then
+        leak_id "$error_path"
+    else
+        printf 'find error\n'
+    fi
+}
+
 scan_leaks() {
     cat >"$work/scan-file.sh" <<'EOF'
 emit() {
@@ -1098,16 +1115,54 @@ EOF
         \( -size +"${SCAN_MAX_KIB}k" -exec sh "$work/scan-file.sh" oversize {} + \
         -o -exec sh "$work/scan-file.sh" scan {} + \) >"$work/scan.ndjson" 2>"$work/scan.err"
     find_rc=$?
-    scan_result=$(jq -n --slurpfile found "$work/scan.ndjson" --rawfile err "$work/scan.err" --argjson rc "$find_rc" '
-        ($err | split("\n") | map(select(. != "") | sub("^find: "; ""))) as $e
-        | {leaks: ([$found[] | select(.kind == "leak") | .path] | .[0:50]),
-           unscanned: ([$found[] | select(.kind == "unscanned") | "\(.path) (\(.why))"]
-                       + $e
-                       + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end)),
-           reasons: (([$found[] | select(.kind == "unscanned") | .why]
-                      + (if ($e | length) > 0 then ["find error"] else [] end)
-                      + (if $rc != 0 and ($e | length) == 0 then ["find exited \($rc)"] else [] end)) | unique | join(", "))}') ||
-        scan_result='{"leaks": [], "unscanned": ["the scan output could not be read"], "reasons": "the scan output could not be read"}'
+    if prepared=$(jq -s '
+            {leak_paths: [.[] | select(.kind == "leak") | .path],
+             unscanned: [.[] | select(.kind == "unscanned") | {path: (.path | @base64), why: .why}],
+             unscanned_reasons: [.[] | select(.kind == "unscanned") | .why]}
+        ' "$work/scan.ndjson") &&
+        leak_count=$(printf '%s' "$prepared" | jq '.leak_paths | length') &&
+        leak_ids=$(
+            printf '%s' "$prepared" | jq -r '.leak_paths[] | @base64' |
+                while IFS= read -r encoded_path; do
+                    path=$(printf '%s' "$encoded_path" | base64 -d) || exit 1
+                    leak_id "$path"
+                done | jq -Rn '[inputs]'
+        ) &&
+        unscanned_entries=$(
+            printf '%s' "$prepared" | jq -c '.unscanned[]' |
+                while IFS= read -r unscanned_record; do
+                    encoded_path=$(printf '%s' "$unscanned_record" | jq -r '.path')
+                    why=$(printf '%s' "$unscanned_record" | jq -r '.why')
+                    path=$(printf '%s' "$encoded_path" | base64 -d) || exit 1
+                    printf '%s (%s)\n' "$(leak_id "$path")" "$why"
+                done | jq -Rn '[inputs]'
+        ) &&
+        unscanned_reasons=$(printf '%s' "$prepared" | jq -c '.unscanned_reasons') &&
+        find_errors=$(
+            while IFS= read -r error_line || [ -n "$error_line" ]; do
+                [ -n "$error_line" ] || continue
+                sanitize_find_error "$error_line"
+            done <"$work/scan.err" | jq -Rn '[inputs]'
+        ) &&
+        scan_result=$(jq -n \
+            --argjson leaks "$leak_ids" \
+            --argjson leak_count "$leak_count" \
+            --argjson unscanned "$unscanned_entries" \
+            --argjson unscanned_reasons "$unscanned_reasons" \
+            --argjson find_errors "$find_errors" \
+            --argjson rc "$find_rc" '
+            {leaks: ($leaks[0:50]),
+             leak_count: $leak_count,
+             unscanned: ($unscanned + $find_errors
+                         + (if $rc != 0 and ($find_errors | length) == 0 then ["find exited \($rc)"] else [] end)),
+             reasons: (($unscanned_reasons
+                        + (if ($find_errors | length) > 0 then ["find error"] else [] end)
+                        + (if $rc != 0 and ($find_errors | length) == 0 then ["find exited \($rc)"] else [] end))
+                       | unique | join(", "))}'); then
+        :
+    else
+        scan_result='{"leaks": [], "leak_count": 0, "unscanned": ["the scan output could not be read"], "reasons": "the scan output could not be read"}'
+    fi
 }
 
 try_create() {
@@ -1468,6 +1523,7 @@ step_J08() (
     unread_from=
     scan_leaks
     leaks=$(printf '%s' "$scan_result" | jq -c '.leaks')
+    leak_count=$(printf '%s' "$scan_result" | jq -r '.leak_count')
     unscanned=$(printf '%s' "$scan_result" | jq -r '.unscanned | length')
     if [ "$unscanned" -gt 0 ]; then
         unscanned_text="$unscanned paths under $SCAN_ROOT not scanned ($(printf '%s' "$scan_result" | jq -r '.reasons')): $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
@@ -1641,11 +1697,12 @@ EOF
         *) attempt_fact=null ;;
     esac
     jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
+        --argjson leak_count "$leak_count" \
         --arg main_env "$main_env" --arg agent_env "$agent_env" \
         --arg record_state "$record_state" --argjson record_attempt "$attempt_fact" \
         '{environment: $environment, agent_environment: {main: $main_env, agent: $agent_env},
           start_record: {state: $record_state, attempt: $record_attempt},
-          auth_file: $auth_file, leaks: $leaks}' >"$work/facts"
+          auth_file: $auth_file, leaks: $leaks, leak_count: $leak_count}' >"$work/facts"
 )
 
 step_J09() (
