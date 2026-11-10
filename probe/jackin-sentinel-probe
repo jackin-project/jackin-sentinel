@@ -168,7 +168,6 @@ git_index_flags_state() {
     index_file=$1
     index_hex=$2
     od -A n -v -t x1 "$index_file" >"$index_hex" 2>/dev/null || return 2
-    # shellcheck disable=SC2016
     awk '
         BEGIN { record_length=0; dirty=0; invalid=0 }
         {
