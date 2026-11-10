@@ -76,7 +76,7 @@ chmod +x "$scratch/stub-curl"
 mk() {
     t=$scratch/$1
     rm -rf "$t"
-    mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox" "$t/tmp"
+    mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox/project" "$t/tmp"
     : >"$t/table"
     : >"$t/curl.log"
     pathvar=$t/bad-bin:$t/bin:$scratch/tools
@@ -96,6 +96,24 @@ prepare_probe() {
     cat >"$t/spec" <<EOF
 {"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
 EOF
+    # shellcheck disable=SC2016
+    "$scratch/tools/jq" \
+        --arg binary "$t/bin/codex" --arg workdir "$t/sandbox/project" \
+        '.behavior.credential.classification = "oauth_login" |
+         .behavior.credential.environment = [{"name":"CODEX_AUTH_ACCESS_TOKEN","kind":"placeholder"}] |
+         .behavior.credential.auth_file.required_state = "present" |
+         .behavior.credential.auth_file.fields = [
+             {"name":"/tokens/access_token","kind":"placeholder"},
+             {"name":"/tokens/refresh_token","kind":"empty"},
+             {"name":"/tokens/id_token","kind":"empty"}
+         ] |
+         .behavior.prompt.tool = {
+             argv: [$binary, "exec", "--skip-git-repo-check", "Use one shell tool to run ls -A, then reply with exactly ready"],
+             answer: {"word_case_insensitive":{"word":"ready"}},
+             kind: "shell", workdir: $workdir,
+             observation: {directory_contains: {entries: ["AGENTS.md","Dockerfile","instructions","jackin.role.toml","probe","tests"]}}
+         }' "$t/spec" >"$t/spec.next" || return 1
+    mv "$t/spec.next" "$t/spec" || return 1
     cat >"$t/probe" <<EOF
 #!/bin/sh
 exec "$t/probe.impl" --spec "$t/spec" "\$@"
@@ -104,7 +122,21 @@ EOF
 }
 
 codex_says() {
-    printf '#!/bin/sh\necho ran >>"%s"\necho "%s"\nexit %s\n' "$t/codex.ran" "$1" "$2" >"$t/bin/codex"
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit $2
+        ;;
+esac
+echo "$1"
+exit $2
+EOF
     chmod +x "$t/bin/codex"
 }
 
@@ -193,8 +225,20 @@ PY
     kind_arg=$(shell_quote "$fixture_kind")
     exit_arg=$(shell_quote "$fixture_exit")
     ran_arg=$(shell_quote "$t/codex.ran")
-    printf '#!/bin/sh\necho ran >>%s\nexec %s %s %s %s\n' \
-        "$ran_arg" "$python_arg" "$generator_arg" "$kind_arg" "$exit_arg" >"$t/bin/codex"
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>$ran_arg
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit $fixture_exit
+        ;;
+esac
+exec $python_arg $generator_arg $kind_arg $exit_arg
+EOF
     chmod +x "$t/bin/codex"
 }
 

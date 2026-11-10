@@ -52,6 +52,24 @@ prepare_probe() {
     cat >"$t/spec" <<EOF
 {"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
 EOF
+    # shellcheck disable=SC2016
+    "$scratch/tools/jq" \
+        --arg binary "$t/bin/codex" --arg workdir "$t/sandbox/project" \
+        '.behavior.credential.classification = "oauth_login" |
+         .behavior.credential.environment = [{"name":"CODEX_AUTH_ACCESS_TOKEN","kind":"placeholder"}] |
+         .behavior.credential.auth_file.required_state = "present" |
+         .behavior.credential.auth_file.fields = [
+             {"name":"/tokens/access_token","kind":"placeholder"},
+             {"name":"/tokens/refresh_token","kind":"empty"},
+             {"name":"/tokens/id_token","kind":"empty"}
+         ] |
+         .behavior.prompt.tool = {
+             argv: [$binary, "exec", "--skip-git-repo-check", "Use one shell tool to run ls -A, then reply with exactly ready"],
+             answer: {"word_case_insensitive":{"word":"ready"}},
+             kind: "shell", workdir: $workdir,
+             observation: {directory_contains: {entries: ["AGENTS.md","Dockerfile","instructions","jackin.role.toml","probe","tests"]}}
+         }' "$t/spec" >"$t/spec.next" || return 1
+    mv "$t/spec.next" "$t/spec" || return 1
     cat >"$t/probe" <<EOF
 #!/bin/sh
 exec "$t/probe.impl" --spec "$t/spec" "\$@"
@@ -722,7 +740,7 @@ record "$R_EMPTY"
 auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\"},\"OPENAI_API_KEY\":\"FAKE-real-key\"}"
 report auth_file_flags_a_top_level_key_behind_a_nested_placeholder
 expect auth_file FAIL 'not a placeholder'
-fact '.auth_file.access_token' other
+fact '.auth_file.fields[0].kind' other
 finish_case
 
 mk auth_file_flags_a_nested_token_behind_a_top_level_placeholder
@@ -731,7 +749,7 @@ record "$R_EMPTY"
 auth_json "{\"tokens\":{\"access_token\":\"FAKE-real-token\"},\"OPENAI_API_KEY\":\"$PLACEHOLDER_ACCESS\"}"
 report auth_file_flags_a_nested_token_behind_a_top_level_placeholder
 expect auth_file FAIL 'not a placeholder'
-fact '.auth_file.access_token' other
+fact '.auth_file.fields[0].kind' other
 finish_case
 
 mk auth_file_accepts_two_placeholders_and_an_empty_key
@@ -740,7 +758,7 @@ record "$R_EMPTY"
 auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER_ACCESS\"},\"OPENAI_API_KEY\":\"\"}"
 report auth_file_accepts_two_placeholders_and_an_empty_key
 expect auth_file PASS 'only placeholders'
-fact '.auth_file.access_token' placeholder
+fact '.auth_file.fields[0].kind' placeholder
 finish_case
 
 j10_seams() {
@@ -3078,7 +3096,7 @@ auth_json "{\"tokens\":{\"access_token\":\"$INJECTED_JSON\"}}"
 report auth_file_flags_a_newline_after_the_placeholder_prefix
 expect auth_file FAIL 'not a placeholder'
 expect credential SKIP 'no credential placeholder'
-fact '.auth_file.access_token' other
+fact '.auth_file.fields[0].kind' other
 finish_case
 
 for partial in 'openshell:resolve:' 'openshell:resolve:env:' 'openshell:resolve:env:A B' 'openshell:resolve:env:1A' 'openshell:resolve:file:A' 'openshell:resolve:env:A-B' 'openshell:resolve:env:A\n'; do

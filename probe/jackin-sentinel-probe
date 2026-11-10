@@ -18,6 +18,16 @@ EXPECTED_VERSION=
 PROVIDER_URL=
 PROVIDER_STATUS=0
 PROMPT_ARGV=
+TOOL_ARGV=
+TOOL_KIND=
+TOOL_WORKDIR=
+TOOL_OBSERVATION=
+CREDENTIAL_CLASS=
+CREDENTIAL_ENV=
+EXPECTED_PROVIDER=
+EXPECTED_MODEL=
+ADAPTER=
+AUTH_REQUIRED=present
 START_BIN=/usr/local/bin/jackin-start
 HELLO_IMAGE='hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef'
 HOOK_DIR=/usr/local/lib/jackin/hooks
@@ -413,6 +423,74 @@ process_checks() {
     esac
 }
 
+agent_tool_evidence() {
+    : >"$work/tool.out"
+    : >"$work/tool.observation"
+    tool_attempted=false
+    tool_succeeded=false
+    tool_exit=
+    actual_provider=
+    actual_model=
+    tool_workdir=
+    if [ "$launch_kind" != none ]; then
+        set --
+        while IFS= read -r encoded; do
+            [ -n "$encoded" ] || continue
+            arg=$(printf '%s' "$encoded" | base64 -d) || return 65
+            set -- "$@" "$arg"
+        done <<EOF
+$TOOL_ARGV
+EOF
+        (
+            ulimit -f 128
+            cd "$PROJECT" || exit 1
+            timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
+        )
+        tool_exit=$?
+        events=$(jq -Rs '[split("\n")[] | select(length > 0) | fromjson?]' "$work/tool.out" 2>/dev/null) || events='[]'
+        actual_provider=$(printf '%s' "$events" | jq -r '[.. | objects | .provider? // .provider_name? // .model_provider? // empty | select(type == "string" and length > 0)] | .[0] // ""')
+        actual_model=$(printf '%s' "$events" | jq -r '[.. | objects | .model? // .canonicalModel? // (.modelUsage? | if type == "object" then keys[] else empty end) // empty | select(type == "string" and length > 0)] | .[0] // ""')
+        case $ADAPTER in
+            t01-codex-v1 | t18-codex-zai-v1)
+                tool_attempted=$(printf '%s' "$events" | jq -r 'any(.. | objects; .type? == "exec_command_begin")')
+                tool_result=$(printf '%s' "$events" | jq -r 'any(.. | objects; .type? == "exec_command_end" and .exit_code? == 0)')
+                ;;
+            t09-omp-zai-v1)
+                tool_attempted=$(printf '%s' "$events" | jq -r --arg kind "$TOOL_KIND" 'any(.. | objects; .type? == "tool_call" and (.name? == $kind or .toolName? == $kind))')
+                tool_result=$(printf '%s' "$events" | jq -r 'any(.. | objects; .type? == "tool_result" and .isError? == false)')
+                ;;
+            t14-claude-zai-v1)
+                tool_attempted=$(printf '%s' "$events" | jq -r --arg kind "$TOOL_KIND" 'any(.. | objects; .type? == "tool_use" and .name? == $kind)')
+                tool_result=$(printf '%s' "$events" | jq -r 'any(.. | objects; .type? == "tool_result" and .is_error? == false)')
+                ;;
+            *) tool_result=false ;;
+        esac
+        tool_workdir=$(printf '%s' "$events" | jq -r '[.. | objects | .workdir? // .cwd? // empty | select(type == "string" and length > 0)] | .[0] // ""')
+        [ -n "$tool_workdir" ] || tool_workdir=$PROJECT
+        tool_answered=$(printf '%s' "$events" | jq -r 'any(.. | strings; ascii_downcase | gsub("^\\s+|\\s+$"; "") == "ready")')
+        if [ "$tool_attempted" = true ] && [ "$tool_result" = true ] && [ "$tool_exit" -eq 0 ] && [ "$tool_answered" = true ]; then
+            tool_succeeded=true
+        fi
+        while IFS= read -r encoded; do
+            [ -n "$encoded" ] || continue
+            entry=$(printf '%s' "$encoded" | base64 -d) || return 65
+            if [ "$tool_succeeded" = true ] && grep -Fq -- "$entry" "$work/tool.out"; then
+                printf '%s\n' "$entry" >>"$work/tool.observation"
+            fi
+        done <<EOF
+$TOOL_OBSERVATION
+EOF
+    fi
+    observation=$(jq -Rn '[inputs]' <"$work/tool.observation")
+    jq -cn --arg provider "$actual_provider" --arg model "$actual_model" --arg kind "$TOOL_KIND" \
+        --argjson attempted "$tool_attempted" --argjson succeeded "$tool_succeeded" --arg exit_code "$tool_exit" \
+        --arg workdir "$tool_workdir" --argjson observation "$observation" \
+        "$JQN"'{actual_provider: $provider, actual_model: $model,
+          tool: {kind: $kind, attempted: $attempted, succeeded: $succeeded,
+                 exit_code: ($exit_code | n | if . == null then null else tonumber end),
+                 workdir: $workdir, observation: $observation}}'
+}
+
 ensure_agent_exec() {
     [ -f "$work/agent_exec.json" ] && return 0
     launch_kind=none
@@ -427,6 +505,7 @@ ensure_agent_exec() {
     fi
     login_ready=0
     api_ready=0
+    static_ready=0
     has_other=0
     inspection_unavailable=
     env_inventory=$(
@@ -444,7 +523,7 @@ ensure_agent_exec() {
             printf '!C\t%s\n' "$classifier_status" >&3
         }
     )
-    inventory_summary=$(printf '%s\n' "$env_inventory" | LC_ALL=C awk -F '\t' '
+    inventory_summary=$(printf '%s\n' "$env_inventory" | LC_ALL=C awk -F '\t' -v credential_env="$CREDENTIAL_ENV" -v credential_class="$CREDENTIAL_CLASS" '
         $1 == "!P" {
             if (NF != 2 || $2 !~ /^[0-9]+$/ || producer_seen++) invalid = 1
             else producer_status = $2
@@ -460,26 +539,28 @@ ensure_agent_exec() {
             invalid = 1
             next
         }
-        $2 == "other" { other = 1 }
+        $2 == "other" && ($1 != credential_env || credential_class != "static_key") { other = 1 }
+        credential_class == "static_key" && $1 == credential_env && $2 != "empty" { static = 1 }
         $1 == "CODEX_AUTH_ACCESS_TOKEN" && $2 == "placeholder" { login = 1 }
         $1 == "OPENAI_API_KEY" && $2 == "placeholder" { api = 1 }
         END {
             if (invalid || producer_seen != 1 || classifier_seen != 1) exit 2
-            printf "%d %d %d %s %s\n", login, api, other, producer_status, classifier_status
+            printf "%d %d %d %d %s %s\n", login, api, other, static, producer_status, classifier_status
         }
     ' 2>/dev/null) || inspection_unavailable=1
     if [ -z "$inspection_unavailable" ] && [ -n "$inventory_summary" ]; then
         extra=
-        if read -r inventory_login_ready inventory_api_ready inventory_has_other producer_status classifier_status extra <<EOF
+        if read -r inventory_login_ready inventory_api_ready inventory_has_other inventory_static_ready producer_status classifier_status extra <<EOF
 $inventory_summary
 EOF
         then
-            case "$inventory_login_ready:$inventory_api_ready:$inventory_has_other:${extra-}" in
-                [01]:[01]:[01]:)
+            case "$inventory_login_ready:$inventory_api_ready:$inventory_has_other:$inventory_static_ready:${extra-}" in
+                [01]:[01]:[01]:[01]:)
                     if [ "$producer_status" = 0 ] && [ "$classifier_status" = 0 ]; then
                         login_ready=$inventory_login_ready
                         api_ready=$inventory_api_ready
                         has_other=$inventory_has_other
+                        static_ready=$inventory_static_ready
                     else
                         inspection_unavailable=1
                     fi
@@ -497,6 +578,8 @@ EOF
         why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
     elif [ -n "$inspection_unavailable" ]; then
         why="codex exec was not run: could not inspect inherited credentials"
+    elif [ "$CREDENTIAL_CLASS" = static_key ] && [ "$static_ready" = 1 ]; then
+        launch_kind=static_key
     elif [ "$login_ready" = 1 ]; then
         launch_kind=oauth_login
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.tokens.access_token | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
@@ -772,10 +855,12 @@ EOF
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
     unset _jks_stdout_parsed_answer _jks_stdout_extra
+    evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
     jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
-        --argjson answered "$answered" --argjson bytes "$bytes" \
+        --argjson answered "$answered" --argjson bytes "$bytes" --argjson evidence "$evidence" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
-          answered: $answered, output_bytes: $bytes}' >"$work/agent_exec.json"
+          answered: $answered, output_bytes: $bytes,
+          actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model, tool: $evidence.tool}' >"$work/agent_exec.json"
 }
 
 egress() {
@@ -1162,11 +1247,17 @@ step_J07() (
     ensure_agent_exec
     process_checks
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
+    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" '
+        .answered == true and .actual_provider == $provider and .actual_model == $model and
+        .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
+        .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
     if [ "$attempted" = true ]; then
-        if [ "$(jq -r '.answered' "$work/agent_exec.json")" = true ]; then
-            pass agent_exec "codex exec answered the fixed prompt"
-        else
+        if [ "$complete" = true ]; then
+            pass agent_exec "codex exec answered the fixed prompt and completed the declared tool"
+        elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
             fail agent_exec "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
+        else
+            fail agent_exec "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
         fi
     else
         skip agent_exec "$(cat "$work/agent_exec.why")"
@@ -1412,37 +1503,57 @@ step_J08() (
     fi
     sort -u -o "$work/variables.tsv" "$work/variables.tsv"
     environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
+    environment=$(printf '%s' "$environment" | jq -c --arg name "$CREDENTIAL_ENV" --arg class "$CREDENTIAL_CLASS" '
+        map(if $class == "static_key" and .name == $name and .kind == "other" then .kind = "brokered" else . end)')
     others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | unique | join(" ")')
-    placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder")] | length')
+    placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder" or .kind == "brokered")] | length')
     scope="checked: $read_from, $AUTH_FILE, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
-    auth_file=$(jq -n --arg path "$AUTH_FILE" \
-        '{state: "absent", path: $path, mode: null, access_token: "absent", refresh_token: "absent", id_token: "absent"}')
+    auth_file=$(jq -n --arg path "$AUTH_FILE" '{state: "absent", path: $path, mode: null, fields: []}')
     auth_problem=
     auth_placeholders=0
     auth="$AUTH_FILE"
     if [ -f "$auth" ]; then
         auth_state=present
-        kinds=$(token_kinds "$auth") || {
-            kinds="other other other"
-            auth_state=malformed
-            auth_problem=1
-        }
-        read -r access refresh idt <<EOF
-$kinds
-EOF
         meta=$(file_meta "$auth") || meta="65534 000"
         read -r _ mode <<EOF
 $meta
 EOF
-        auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --arg a "${access:-other}" --arg r "${refresh:-other}" --arg i "${idt:-other}" \
-            '{state: $state, path: $path, mode: $mode, access_token: $a, refresh_token: $r, id_token: $i}')
-        for kind in "${access:-other}" "${refresh:-other}" "${idt:-other}"; do
-            [ "$kind" = other ] && auth_problem=1
-            [ "$kind" = placeholder ] && auth_placeholders=$((auth_placeholders + 1))
-        done
+        fields=$(jq -cn --slurpfile parsed "$auth" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+            def pointer($name): $name | split("/") | map(select(length > 0));
+            def kind($value; $jwt):
+                if $value == null then "absent"
+                elif $value == "" then "empty"
+                elif $jwt and $value == $id_token then "placeholder"
+                elif ($value | type == "string" and (test($re + "\\z") or . == "placeholder")) then "placeholder"
+                else "other" end;
+            [$selected[0].behavior.credential.auth_file.fields[] as $field |
+                ($parsed[0] | getpath(pointer($field.name))) as $value |
+                if ($field.kind | type) == "object" and $field.kind.literal.value != null then
+                    {name: $field.name, kind: (if $value == $field.kind.literal.value then "literal:" + $value else "other" end)}
+                else
+                    {name: $field.name, kind: kind($value; $field.name == "/tokens/id_token")}
+                end]') || fields='[]'
+        auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
+            '{state: $state, path: $path, mode: $mode, fields: $fields}')
+        if [ "$ADAPTER" = t01-codex-v1 ]; then
+            kinds=$(token_kinds "$auth") || kinds="other other other"
+            case $kinds in
+                *other*)
+                    auth_problem=1
+                    fields=$(printf '%s' "$fields" | jq -c 'map(if .name == "/tokens/access_token" then .kind = "other" else . end)')
+                    auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
+                        '{state: $state, path: $path, mode: $mode, fields: $fields}')
+                    ;;
+            esac
+        fi
+        if [ "$(printf '%s' "$fields" | jq -r 'any(.[]; .kind == "other")')" = true ]; then
+            auth_problem=1
+        fi
+        auth_placeholders=$(printf '%s' "$fields" | jq -r '[.[] | select(.kind == "placeholder")] | length')
     elif [ -e "$auth" ] || [ -L "$auth" ]; then
-        auth_file=$(jq -n --arg path "$auth" \
-            '{state: "malformed", path: $path, mode: null, access_token: "other", refresh_token: "other", id_token: "other"}')
+        auth_file=$(jq -n --arg path "$auth" '{state: "malformed", path: $path, mode: null, fields: []}')
+        auth_problem=1
+    elif [ "$AUTH_REQUIRED" = present ]; then
         auth_problem=1
     fi
     if [ "$placeholders" -eq 0 ] && [ "$auth_placeholders" -eq 0 ]; then
@@ -1486,15 +1597,19 @@ EOF
         pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
     fi
     if [ -f "$auth" ]; then
-        if [ -z "$auth_problem" ]; then
+        if [ "$AUTH_REQUIRED" = absent ]; then
+            fail auth_file "the selected target requires an absent auth file"
+        elif [ -z "$auth_problem" ]; then
             pass auth_file "auth.json holds only placeholders and empty values"
         else
             fail auth_file "auth.json holds a token that is not a placeholder"
         fi
     elif [ -e "$auth" ] || [ -L "$auth" ]; then
         fail auth_file "$auth exists but is not a regular file, so the probe did not examine its tokens"
-    else
+    elif [ "$AUTH_REQUIRED" = present ]; then
         fail auth_file "the selected target requires auth.json at $auth"
+    else
+        pass auth_file "the selected target auth file is absent"
     fi
     if [ "$leaks" != '[]' ]; then
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
@@ -1529,6 +1644,9 @@ step_J09() (
     if [ -z "$bearer" ] && [ -f "$AUTH_FILE" ]; then
         bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$AUTH_FILE" 2>/dev/null) || bearer=
     fi
+    if [ "$CREDENTIAL_CLASS" = static_key ]; then
+        bearer="openshell:resolve:env:$CREDENTIAL_ENV"
+    fi
     provider=null
     if [ -n "$bearer" ] && printf '%s' "$bearer" | is_placeholder; then
         : >"$work/provider.body"
@@ -1539,11 +1657,17 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
+    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" '
+        .answered == true and .actual_provider == $provider and .actual_model == $model and
+        .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
+        .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
     if [ "$(jq -r '.attempted' "$work/agent_exec.json")" = true ]; then
-        if [ "$(jq -r '.answered' "$work/agent_exec.json")" = true ]; then
-            pass agent_reaches_api "codex exec answered"
-        else
+        if [ "$complete" = true ]; then
+            pass agent_reaches_api "codex exec answered and completed the declared tool"
+        elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
             fail agent_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
+        else
+            fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
         fi
     else
         skip agent_reaches_api "$(cat "$work/agent_exec.why")"
@@ -2238,17 +2362,31 @@ main() {
         exit 65
     fi
     if ! jq -e '
-        (.target | type == "object" and .tuple == "T01" and .agent == "codex" and
-            .provider == "codex" and (.model | type == "string" and length > 0) and
-            .adapter == "t01-codex-v1" and (.spec_sha256 | test("^[0-9a-f]{64}$"))) and
+        (.target | type == "object" and (.model | type == "string" and length > 0) and
+            (.provider | type == "string" and length > 0) and
+            (.adapter | type == "string" and length > 0) and
+            (.spec_sha256 | test("^[0-9a-f]{64}$")) and
+            ((.tuple == "T01" and .agent == "codex" and .provider == "codex" and .adapter == "t01-codex-v1") or
+             (.tuple == "T09" and .agent == "omp" and .provider == "zai" and .adapter == "t09-omp-zai-v1") or
+             (.tuple == "T14" and .agent == "claude" and .provider == "zai" and .adapter == "t14-claude-zai-v1") or
+             (.tuple == "T18" and .agent == "codex" and .provider == "zai" and .adapter == "t18-codex-zai-v1"))) and
         (.behavior.version.binary | type == "string" and length > 0) and
         (.behavior.version.exact_output | type == "string" and length > 0) and
         (.behavior.process.comm | type == "string" and length > 0) and
         (.behavior.prompt.argv | type == "array" and length > 0 and all(.[]; type == "string")) and
         (.behavior.prompt.answer.word_case_insensitive.word == "ready") and
+        (.behavior.prompt.tool.argv | type == "array" and length > 0 and all(.[]; type == "string")) and
+        (.behavior.prompt.tool.answer.word_case_insensitive.word == "ready") and
+        (.behavior.prompt.tool.kind | type == "string" and length > 0) and
+        (.behavior.prompt.tool.workdir | type == "string" and length > 0) and
+        (.behavior.prompt.tool.observation.directory_contains.entries | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
+        (.behavior.credential.classification | type == "string" and (IN("oauth_login", "static_key", "api_key"))) and
+        (.behavior.credential.environment | type == "array" and length > 0 and (.[0].name | type == "string" and length > 0)) and
         (.behavior.credential.auth_file.path | type == "string" and length > 0) and
-        (.behavior.provider.accepted_status | type == "number") and
-        (.behavior.provider.accepted_body.json_error_code.code == "invalid_api_key")
+        (.behavior.credential.auth_file.required_state | IN("present", "absent")) and
+        (.behavior.credential.auth_file.fields | type == "array") and
+        ((.behavior.provider.accepted_status == null and .behavior.provider.accepted_body == null) or
+         (.behavior.provider.accepted_status | type == "number") and .behavior.provider.accepted_body.json_error_code.code == "invalid_api_key")
     ' "$spec" >/dev/null 2>&1; then
         echo "$PROBE: the private probe specification is malformed or unsupported" >&2
         exit 65
@@ -2257,9 +2395,19 @@ main() {
     EXPECTED_VERSION=$(jq -r '.behavior.version.exact_output' "$spec") || exit 65
     AGENT_COMM=$(jq -r '.behavior.process.comm' "$spec") || exit 65
     AUTH_FILE=$(jq -r '.behavior.credential.auth_file.path' "$spec") || exit 65
+    AUTH_REQUIRED=$(jq -r '.behavior.credential.auth_file.required_state' "$spec") || exit 65
     PROVIDER_URL=$(jq -r '.behavior.provider.probe_url' "$spec") || exit 65
-    PROVIDER_STATUS=$(jq -r '.behavior.provider.accepted_status' "$spec") || exit 65
+    PROVIDER_STATUS=$(jq -r '.behavior.provider.accepted_status // 0' "$spec") || exit 65
     PROMPT_ARGV=$(jq -r '.behavior.prompt.argv[] | @base64' "$spec") || exit 65
+    TOOL_ARGV=$(jq -r '.behavior.prompt.tool.argv[] | @base64' "$spec") || exit 65
+    TOOL_KIND=$(jq -r '.behavior.prompt.tool.kind' "$spec") || exit 65
+    TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
+    TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
+    CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
+    CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
+    EXPECTED_PROVIDER=$(jq -r '.target.provider' "$spec") || exit 65
+    EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
+    ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
     [ "$mode" = host ] || require_sandbox
     work=$(mktemp -d) || exit 70
     trap 'rm -rf "$work"' EXIT
