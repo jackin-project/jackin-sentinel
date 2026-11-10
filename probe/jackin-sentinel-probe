@@ -24,6 +24,8 @@ TOOL_WORKDIR=
 TOOL_OBSERVATION=
 CREDENTIAL_CLASS=
 CREDENTIAL_ENV=
+CREDENTIAL_FINGERPRINT=
+RAW_CREDENTIAL=0
 EXPECTED_PROVIDER=
 EXPECTED_MODEL=
 ADAPTER=
@@ -548,6 +550,7 @@ ensure_agent_exec() {
             printf "%d %d %d %d %s %s\n", login, api, other, static, producer_status, classifier_status
         }
     ' 2>/dev/null) || inspection_unavailable=1
+    [ "$RAW_CREDENTIAL" -eq 0 ] || unsafe=1
     if [ -z "$inspection_unavailable" ] && [ -n "$inventory_summary" ]; then
         extra=
         if read -r inventory_login_ready inventory_api_ready inventory_has_other inventory_static_ready producer_status classifier_status extra <<EOF
@@ -578,7 +581,7 @@ EOF
         why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
     elif [ -n "$inspection_unavailable" ]; then
         why="codex exec was not run: could not inspect inherited credentials"
-    elif [ "$CREDENTIAL_CLASS" = static_key ] && [ "$static_ready" = 1 ]; then
+    elif [ "$CREDENTIAL_CLASS" = static_key ] && [ "$static_ready" = 1 ] && [ "$RAW_CREDENTIAL" -eq 0 ]; then
         launch_kind=static_key
     elif [ "$login_ready" = 1 ]; then
         launch_kind=oauth_login
@@ -1503,8 +1506,8 @@ step_J08() (
     fi
     sort -u -o "$work/variables.tsv" "$work/variables.tsv"
     environment=$(jq -Rn '[inputs | split("\t") | {name: .[0], kind: .[1], source: .[2]}]' <"$work/variables.tsv")
-    environment=$(printf '%s' "$environment" | jq -c --arg name "$CREDENTIAL_ENV" --arg class "$CREDENTIAL_CLASS" '
-        map(if $class == "static_key" and .name == $name and .kind == "other" then .kind = "brokered" else . end)')
+    environment=$(printf '%s' "$environment" | jq -c --arg name "$CREDENTIAL_ENV" --arg class "$CREDENTIAL_CLASS" --argjson raw "$RAW_CREDENTIAL" '
+        map(if $class == "static_key" and .name == $name and .kind == "other" and $raw == 0 then .kind = "brokered" else . end)')
     others=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "other") | .name] | unique | join(" ")')
     placeholders=$(printf '%s' "$environment" | jq -r '[.[] | select(.kind == "placeholder" or .kind == "brokered")] | length')
     scope="checked: $read_from, $AUTH_FILE, the files under $SCAN_ROOT; unreadable: ${unread_from:-nothing}"
@@ -1518,7 +1521,12 @@ step_J08() (
         read -r _ mode <<EOF
 $meta
 EOF
-        fields=$(jq -cn --slurpfile parsed "$auth" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+        if ! jq -e . "$auth" >/dev/null 2>&1; then
+            fields='[]'
+            auth_state=malformed
+            auth_problem=1
+        else
+            fields=$(jq -cn --slurpfile parsed "$auth" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
             def pointer($name): $name | split("/") | map(select(length > 0));
             def kind($value; $jwt):
                 if $value == null then "absent"
@@ -1533,6 +1541,7 @@ EOF
                 else
                     {name: $field.name, kind: kind($value; $field.name == "/tokens/id_token")}
                 end]') || fields='[]'
+        fi
         auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
             '{state: $state, path: $path, mode: $mode, fields: $fields}')
         if [ "$ADAPTER" = t01-codex-v1 ]; then
@@ -1644,7 +1653,7 @@ step_J09() (
     if [ -z "$bearer" ] && [ -f "$AUTH_FILE" ]; then
         bearer=$(jq -r '[.tokens.access_token, .OPENAI_API_KEY] | map(select(type == "string" and . != "")) | .[0] // empty' "$AUTH_FILE" 2>/dev/null) || bearer=
     fi
-    if [ "$CREDENTIAL_CLASS" = static_key ]; then
+    if [ "$CREDENTIAL_CLASS" = static_key ] && [ "$RAW_CREDENTIAL" -eq 0 ]; then
         bearer="openshell:resolve:env:$CREDENTIAL_ENV"
     fi
     provider=null
@@ -2381,7 +2390,9 @@ main() {
         (.behavior.prompt.tool.workdir | type == "string" and length > 0) and
         (.behavior.prompt.tool.observation.directory_contains.entries | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
         (.behavior.credential.classification | type == "string" and (IN("oauth_login", "static_key", "api_key"))) and
-        (.behavior.credential.environment | type == "array" and length > 0 and (.[0].name | type == "string" and length > 0)) and
+        (.behavior.credential.environment | type == "array" and length > 0 and (.[0].name | test("^[A-Za-z_][A-Za-z0-9_]*$"))) and
+        ((.behavior.credential.classification == "static_key" and (.credential_sha256 | test("^[0-9a-f]{64}$"))) or
+         (.behavior.credential.classification != "static_key")) and
         (.behavior.credential.auth_file.path | type == "string" and length > 0) and
         (.behavior.credential.auth_file.required_state | IN("present", "absent")) and
         (.behavior.credential.auth_file.fields | type == "array") and
@@ -2405,9 +2416,16 @@ main() {
     TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
     CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
     CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
+    CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
     EXPECTED_PROVIDER=$(jq -r '.target.provider' "$spec") || exit 65
     EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
     ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
+    if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
+        eval "selected_value=\${$CREDENTIAL_ENV-}"
+        if [ -n "$selected_value" ] && [ "$(printf '%s' "$selected_value" | sha256sum | cut -d' ' -f1)" = "$CREDENTIAL_FINGERPRINT" ]; then
+            RAW_CREDENTIAL=1
+        fi
+    fi
     [ "$mode" = host ] || require_sandbox
     work=$(mktemp -d) || exit 70
     trap 'rm -rf "$work"' EXIT

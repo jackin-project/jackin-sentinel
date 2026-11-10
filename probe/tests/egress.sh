@@ -11,7 +11,7 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp; do
+for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp sha256sum cut; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
     else
@@ -79,6 +79,7 @@ mk() {
     mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox/project" "$t/tmp"
     : >"$t/table"
     : >"$t/curl.log"
+    PROVIDER=https://chatgpt.com/backend-api/models
     pathvar=$t/bad-bin:$t/bin:$scratch/tools
 }
 
@@ -119,6 +120,89 @@ EOF
 exec "$t/probe.impl" --spec "$t/spec" "\$@"
 EOF
     chmod +x "$t/probe" "$t/probe.impl"
+}
+
+zai_spec() {
+    adapter=$1
+    agent=$2
+    comm=$3
+    version=$4
+    kind=$5
+    env_name=$6
+    provider_url=$7
+    auth_state=$8
+    fingerprint=$9
+    PROVIDER=$provider_url
+    # shellcheck disable=SC2016
+    "$scratch/tools/jq" \
+        --arg adapter "$adapter" --arg agent "$agent" --arg comm "$comm" --arg version "$version" \
+        --arg kind "$kind" --arg env_name "$env_name" --arg provider_url "$provider_url" \
+        --arg auth_state "$auth_state" --arg fingerprint "$fingerprint" --arg workdir "$t/sandbox/project" \
+        --arg binary "$t/bin/$agent" --arg sandbox "$t/sandbox" \
+        '.target.tuple = ($adapter[0:3] | ascii_upcase) |
+         .target.adapter = $adapter |
+         .target.agent = $agent |
+         .target.provider = "zai" |
+         .target.model = "glm-5.3" |
+         .credential_sha256 = $fingerprint |
+         .behavior.version.binary = $binary |
+         .behavior.version.exact_output = $version |
+         .behavior.process.comm = $comm |
+         .behavior.prompt.argv[0] = $binary |
+         .behavior.prompt.tool.argv[0] = $binary |
+         .behavior.prompt.tool.kind = $kind |
+         .behavior.prompt.tool.workdir = $workdir |
+         .behavior.credential.classification = "static_key" |
+         .behavior.credential.environment = [{"name":$env_name,"kind":"brokered"}] |
+         .behavior.credential.auth_file.required_state = $auth_state |
+         .behavior.provider.probe_url = $provider_url |
+         .behavior.provider.accepted_status = null |
+         .behavior.provider.accepted_body = null |
+         if $adapter == "t09-omp-zai-v1" then
+             .behavior.credential.auth_file.path = ($sandbox + "/.omp/auth.json") |
+             .behavior.credential.auth_file.fields = [{"name":"/zai/type","kind":{"literal":{"value":"api_key"}}},{"name":"/zai/key","kind":"placeholder"}]
+         elif $adapter == "t14-claude-zai-v1" then
+             .behavior.credential.auth_file.path = ($sandbox + "/.claude/.credentials.json") |
+             .behavior.credential.auth_file.fields = [{"name":"/ANTHROPIC_API_KEY","kind":"placeholder"}]
+         else
+             .behavior.credential.auth_file.path = ($sandbox + "/.codex/auth.json") |
+             .behavior.credential.auth_file.fields = []
+         end' \
+        "$t/spec" >"$t/spec.next" || return 1
+    mv "$t/spec.next" "$t/spec" || return 1
+}
+
+zai_says() {
+    adapter=$1
+    agent=$2
+    cat >"$t/bin/$agent" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        case $adapter in
+            t09-omp-zai-v1)
+                printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+                printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+                ;;
+            t14-claude-zai-v1)
+                printf '%s\n' '{"type":"tool_use","name":"Bash","workdir":"$t/sandbox/project"}'
+                printf '%s\n' '{"type":"tool_result","is_error":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+                ;;
+            *)
+                printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+                printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+                ;;
+        esac
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+    chmod +x "$t/bin/$agent"
 }
 
 codex_says() {
@@ -357,6 +441,13 @@ execute() {
         fixture_setup_failed=1
         return 70
     }
+    if [ -n "${zai_adapter-}" ]; then
+        zai_spec "$zai_adapter" "$zai_agent" "$zai_comm" "$zai_version" "$zai_kind" "$zai_env_name" "$zai_provider_url" "$zai_auth_state" "$zai_fingerprint" || {
+            fixture_setup_failed=1
+            return 70
+        }
+        zai_adapter=
+    fi
     set -- "$@" sh "$t/probe" --only "${step#step_}"
     [ -z "$engine" ] || set -- "$@" --engine "$engine"
     bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
@@ -934,6 +1025,128 @@ for selected_step in J07 J09; do
     expect "$check_name" SKIP 'could not inspect'
     fact '.agent_exec | "\(.attempted) \(.credential) \(.answered)"' 'false none false'
     expect_codex_not_run
+    finish_case
+done
+
+zai_case() {
+    zai_adapter=$1
+    zai_agent=$2
+    zai_comm=$3
+    zai_version=$4
+    zai_kind=$5
+    zai_env_name=$6
+    zai_provider_url=$7
+    zai_auth_state=$8
+    zai_fingerprint=$9
+    zai_says "$zai_adapter" "$zai_agent"
+    with_curl
+    answer "$OUTSIDE" 7 000
+    answer "$METADATA" 7 000
+    answer "$zai_provider_url" 7 000
+}
+
+for tuple in T09 T14 T18; do
+    case $tuple in
+        T09)
+            adapter=t09-omp-zai-v1
+            agent=omp
+            comm=omp
+            version=omp/18.18.3
+            kind=bash
+            env_name=ZAI_API_KEY
+            provider_url=https://api.z.ai/api/anthropic
+            auth_state=present
+            ;;
+        T14)
+            adapter=t14-claude-zai-v1
+            agent=claude
+            comm=claude
+            version='2.1.311 (Claude Code)'
+            kind=Bash
+            env_name=ANTHROPIC_AUTH_TOKEN
+            provider_url=https://api.z.ai/api/anthropic
+            auth_state=present
+            ;;
+        T18)
+            adapter=t18-codex-zai-v1
+            agent=codex
+            comm=codex
+            version='codex-cli 0.167.0'
+            kind=shell
+            env_name=ZAI_API_KEY
+            provider_url=https://api.z.ai/api/v1
+            auth_state=absent
+            ;;
+    esac
+    host_key="synthetic-${tuple}-host-key-0123456789"
+    fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+    mk "${tuple}_brokered_execution_and_policy_closure"
+    zai_case "$adapter" "$agent" "$comm" "$version" "$kind" "$env_name" "$provider_url" "$auth_state" "$fingerprint"
+    begin "${tuple}_brokered_execution_and_policy_closure" step_J09 '' "$env_name=brokered-${tuple}-token"
+    expect agent_reaches_api PASS 'completed the declared tool'
+    expect provider_no_credential PASS 'refused the connection'
+    fact '.agent_exec | "\(.credential) \(.actual_provider) \(.actual_model) \(.tool.attempted) \(.tool.succeeded) \(.tool.kind)"' "static_key zai glm-5.3 true true $kind"
+    expect_sent 'openshell:resolve:env:'
+    finish_case
+
+    mk "${tuple}_raw_key_is_not_executed"
+    zai_case "$adapter" "$agent" "$comm" "$version" "$kind" "$env_name" "$provider_url" "$auth_state" "$fingerprint"
+    begin "${tuple}_raw_key_is_not_executed" step_J09 '' "$env_name=$host_key"
+    expect agent_reaches_api SKIP 'not a full placeholder'
+    expect provider_no_credential SKIP 'no placeholder to send'
+    fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
+    expect_codex_not_run
+    expect_never_sent "$host_key"
+    finish_case
+
+    mk "${tuple}_raw_key_is_not_brokered"
+    zai_case "$adapter" "$agent" "$comm" "$version" "$kind" "$env_name" "$provider_url" "$auth_state" "$fingerprint"
+    begin "${tuple}_raw_key_is_not_brokered" step_J08 '' "$env_name=$host_key"
+    expect environment FAIL 'not a placeholder'
+    fact '.environment[0].kind' other
+    expect_never_sent "$host_key"
+    finish_case
+done
+
+for tuple in T09 T18; do
+    case $tuple in
+        T09)
+            adapter=t09-omp-zai-v1
+            agent=omp
+            comm=omp
+            version=omp/18.18.3
+            kind=bash
+            env_name=ZAI_API_KEY
+            provider_url=https://api.z.ai/api/anthropic
+            auth_state=present
+            auth_dir=.omp
+            auth_name=auth.json
+            ;;
+        T18)
+            adapter=t18-codex-zai-v1
+            agent=codex
+            comm=codex
+            version='codex-cli 0.167.0'
+            kind=shell
+            env_name=ZAI_API_KEY
+            provider_url=https://api.z.ai/api/v1
+            auth_state=absent
+            auth_dir=.codex
+            auth_name=auth.json
+            ;;
+    esac
+    fingerprint=$(printf '%s' "synthetic-${tuple}-host-key-0123456789" | sha256sum | cut -d' ' -f1)
+    mk "${tuple}_malformed_auth_json"
+    zai_case "$adapter" "$agent" "$comm" "$version" "$kind" "$env_name" "$provider_url" "$auth_state" "$fingerprint"
+    mkdir -p "$t/sandbox/$auth_dir"
+    printf '%s\n' 'not-json' >"$t/sandbox/$auth_dir/$auth_name"
+    begin "${tuple}_malformed_auth_json" step_J08 '' "$env_name=brokered-${tuple}-token"
+    if [ "$tuple" = T18 ]; then
+        expect auth_file FAIL 'requires an absent auth file'
+    else
+        expect auth_file FAIL 'not a placeholder'
+    fi
+    fact '.auth_file.state' malformed
     finish_case
 done
 
