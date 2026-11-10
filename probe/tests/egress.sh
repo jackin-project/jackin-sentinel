@@ -1082,7 +1082,7 @@ for tuple in T09 T14 T18; do
     fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
     mk "${tuple}_brokered_execution_and_policy_closure"
     zai_case "$adapter" "$agent" "$comm" "$version" "$kind" "$env_name" "$provider_url" "$auth_state" "$fingerprint"
-    begin "${tuple}_brokered_execution_and_policy_closure" step_J09 '' "$env_name=brokered-${tuple}-token"
+    begin "${tuple}_brokered_execution_and_policy_closure" step_J09 '' "$env_name=openshell:resolve:env:$env_name"
     expect agent_reaches_api PASS 'completed the declared tool'
     expect provider_no_credential PASS 'refused the connection'
     fact '.agent_exec | "\(.credential) \(.actual_provider) \(.actual_model) \(.tool.attempted) \(.tool.succeeded) \(.tool.kind)"' "static_key zai glm-5.3 true true $kind"
@@ -1108,7 +1108,22 @@ for tuple in T09 T14 T18; do
     finish_case
 done
 
-for tuple in T09 T18; do
+mk T14_declared_auth_other_is_not_executed
+host_key=synthetic-T14-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+env_name=ANTHROPIC_AUTH_TOKEN
+zai_case t14-claude-zai-v1 claude claude '2.1.311 (Claude Code)' Bash "$env_name" https://api.z.ai/api/anthropic present "$fingerprint"
+mkdir -p "$t/sandbox/.claude"
+printf '%s\n' "{\"ANTHROPIC_API_KEY\":\"$host_key\"}" >"$t/sandbox/.claude/.credentials.json"
+begin T14_declared_auth_other_is_not_executed step_J09 '' "$env_name=openshell:resolve:env:$env_name"
+expect agent_reaches_api SKIP 'not a full placeholder'
+expect provider_no_credential PASS 'refused the connection'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
+expect_codex_not_run
+expect_never_sent "$host_key"
+finish_case
+
+for tuple in T09 T14 T18; do
     case $tuple in
         T09)
             adapter=t09-omp-zai-v1
@@ -1121,6 +1136,18 @@ for tuple in T09 T18; do
             auth_state=present
             auth_dir=.omp
             auth_name=auth.json
+            ;;
+        T14)
+            adapter=t14-claude-zai-v1
+            agent=claude
+            comm=claude
+            version='2.1.311 (Claude Code)'
+            kind=Bash
+            env_name=ANTHROPIC_AUTH_TOKEN
+            provider_url=https://api.z.ai/api/anthropic
+            auth_state=present
+            auth_dir=.claude
+            auth_name=.credentials.json
             ;;
         T18)
             adapter=t18-codex-zai-v1
@@ -1140,7 +1167,7 @@ for tuple in T09 T18; do
     zai_case "$adapter" "$agent" "$comm" "$version" "$kind" "$env_name" "$provider_url" "$auth_state" "$fingerprint"
     mkdir -p "$t/sandbox/$auth_dir"
     printf '%s\n' 'not-json' >"$t/sandbox/$auth_dir/$auth_name"
-    begin "${tuple}_malformed_auth_json" step_J08 '' "$env_name=brokered-${tuple}-token"
+    begin "${tuple}_malformed_auth_json" step_J08 '' "$env_name=openshell:resolve:env:$env_name"
     if [ "$tuple" = T18 ]; then
         expect auth_file FAIL 'requires an absent auth file'
     else
