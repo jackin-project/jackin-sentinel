@@ -504,6 +504,11 @@ ensure_agent_exec() {
         case $kinds in
             *other*) unsafe=1 ;;
         esac
+        if ! declared_fields=$(auth_file_fields "$cred_path"); then
+            unsafe=1
+        elif [ "$(printf '%s' "$declared_fields" | jq -r 'any(.[]; .kind == "other")')" = true ]; then
+            unsafe=1
+        fi
     fi
     login_ready=0
     api_ready=0
@@ -940,6 +945,24 @@ token_kinds() {
         [([kind(.tokens.access_token; false), kind(.OPENAI_API_KEY; false)] | worst),
          kind(.tokens.refresh_token; false),
          kind(.tokens.id_token; true)] | @tsv' "$1"
+}
+
+auth_file_fields() {
+    jq -cn --slurpfile parsed "$1" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+        def pointer($name): $name | split("/") | map(select(length > 0));
+        def kind($value; $jwt):
+            if $value == null then "absent"
+            elif $value == "" then "empty"
+            elif $jwt and $value == $id_token then "placeholder"
+            elif ($value | type == "string" and (test($re + "\\z") or . == "placeholder")) then "placeholder"
+            else "other" end;
+        [$selected[0].behavior.credential.auth_file.fields[] as $field |
+            ($parsed[0] | getpath(pointer($field.name))) as $value |
+            if ($field.kind | type) == "object" and $field.kind.literal.value != null then
+                {name: $field.name, kind: (if $value == $field.kind.literal.value then "literal:" + $value else "other" end)}
+            else
+                {name: $field.name, kind: kind($value; $field.name == "/tokens/id_token")}
+            end]'
 }
 
 credential_variables() {
@@ -1526,21 +1549,7 @@ EOF
             auth_state=malformed
             auth_problem=1
         else
-            fields=$(jq -cn --slurpfile parsed "$auth" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
-            def pointer($name): $name | split("/") | map(select(length > 0));
-            def kind($value; $jwt):
-                if $value == null then "absent"
-                elif $value == "" then "empty"
-                elif $jwt and $value == $id_token then "placeholder"
-                elif ($value | type == "string" and (test($re + "\\z") or . == "placeholder")) then "placeholder"
-                else "other" end;
-            [$selected[0].behavior.credential.auth_file.fields[] as $field |
-                ($parsed[0] | getpath(pointer($field.name))) as $value |
-                if ($field.kind | type) == "object" and $field.kind.literal.value != null then
-                    {name: $field.name, kind: (if $value == $field.kind.literal.value then "literal:" + $value else "other" end)}
-                else
-                    {name: $field.name, kind: kind($value; $field.name == "/tokens/id_token")}
-                end]') || fields='[]'
+            fields=$(auth_file_fields "$auth") || fields='[]'
         fi
         auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
             '{state: $state, path: $path, mode: $mode, fields: $fields}')
