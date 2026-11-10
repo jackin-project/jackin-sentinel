@@ -9,6 +9,9 @@ scratch=$(mktemp -d) || exit 70
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
+fixture_spec=
+fixture_comm=
+fixture_fingerprint=
 
 mkdir -p "$scratch/tools" "$scratch/shim"
 for tool in awk basename base64 cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
@@ -49,32 +52,52 @@ prepare_probe() {
             return 1
         fi
     fi
-    cat >"$t/spec" <<EOF
+    if [ -n "$fixture_spec" ]; then
+        fixture_case_spec || return 1
+    else
+        cat >"$t/spec" <<EOF
 {"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
 EOF
-    # shellcheck disable=SC2016
-    "$scratch/tools/jq" \
-        --arg binary "$t/bin/codex" --arg workdir "$t/sandbox/project" \
-        '.behavior.credential.classification = "oauth_login" |
-         .behavior.credential.environment = [{"name":"CODEX_AUTH_ACCESS_TOKEN","kind":"placeholder"}] |
-         .behavior.credential.auth_file.required_state = "present" |
-         .behavior.credential.auth_file.fields = [
-             {"name":"/tokens/access_token","kind":"placeholder"},
-             {"name":"/tokens/refresh_token","kind":"empty"},
-             {"name":"/tokens/id_token","kind":"empty"}
-         ] |
-         .behavior.prompt.tool = {
-             argv: [$binary, "exec", "--skip-git-repo-check", "Use one shell tool to run ls -A, then reply with exactly ready"],
-             answer: {"word_case_insensitive":{"word":"ready"}},
-             kind: "shell", workdir: $workdir,
-             observation: {directory_contains: {entries: ["AGENTS.md","Dockerfile","instructions","jackin.role.toml","probe","tests"]}}
-         }' "$t/spec" >"$t/spec.next" || return 1
-    mv "$t/spec.next" "$t/spec" || return 1
+        # shellcheck disable=SC2016
+        "$scratch/tools/jq" \
+            --arg binary "$t/bin/codex" --arg workdir "$t/sandbox/project" \
+            '.behavior.credential.classification = "oauth_login" |
+             .behavior.credential.environment = [{"name":"CODEX_AUTH_ACCESS_TOKEN","kind":"placeholder"}] |
+             .behavior.credential.auth_file.required_state = "present" |
+             .behavior.credential.auth_file.fields = [
+                 {"name":"/tokens/access_token","kind":"placeholder"},
+                 {"name":"/tokens/refresh_token","kind":"empty"},
+                 {"name":"/tokens/id_token","kind":"empty"}
+             ] |
+             .behavior.prompt.tool = {
+                 argv: [$binary, "exec", "--skip-git-repo-check", "Use one shell tool to run ls -A, then reply with exactly ready"],
+                 answer: {"word_case_insensitive":{"word":"ready"}},
+                 kind: "shell", workdir: $workdir,
+                 observation: {directory_contains: {entries: ["AGENTS.md","Dockerfile","instructions","jackin.role.toml","probe","tests"]}}
+             }' "$t/spec" >"$t/spec.next" || return 1
+        mv "$t/spec.next" "$t/spec" || return 1
+    fi
     cat >"$t/probe" <<EOF
 #!/bin/sh
 exec "$t/probe.impl" --spec "$t/spec" "\$@"
 EOF
     chmod +x "$t/probe" "$t/probe.impl"
+}
+
+fixture_case_spec() {
+    fixture=$here/fixtures/$fixture_spec.json
+    [ -f "$fixture" ] || return 1
+    # shellcheck disable=SC2016
+    "$scratch/tools/jq" \
+        --arg sandbox "$t/sandbox" --arg binary "$t/bin/$fixture_comm" \
+        --arg workdir "$t/sandbox/project" --arg fingerprint "$fixture_fingerprint" \
+        'walk(if type == "string" then gsub("/sandbox"; $sandbox) else . end)
+         | .credential_sha256 = $fingerprint
+         | .behavior.version.binary = $binary
+         | .behavior.prompt.argv[0] = $binary
+         | .behavior.prompt.tool.argv[0] = $binary
+         | .behavior.prompt.tool.workdir = $workdir' "$fixture" >"$t/spec.next" || return 1
+    mv "$t/spec.next" "$t/spec" || return 1
 }
 
 state() {
@@ -95,6 +118,12 @@ proc_codex() {
     mkdir -p "$t/proc/101"
     printf 'codex\0--sandbox\0' >"$t/proc/101/cmdline"
     printf '101 (codex) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0 0\n' >"$t/proc/101/stat"
+}
+
+proc_agent() {
+    mkdir -p "$t/proc/101"
+    printf '%s\0--sandbox\0' "$1" >"$t/proc/101/cmdline"
+    printf '101 (%s) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0 0\n' "$1" >"$t/proc/101/stat"
 }
 
 environ() {
@@ -3404,6 +3433,144 @@ if git_project; then
 else
     setup_failed sandbox_git_shadow
 fi
+
+export_setup() {
+    fixture_spec=$1
+    fixture_comm=$2
+    fixture_fingerprint=$3
+}
+
+export_agent_kind() {
+    filter='.environment | map(select(.name == "'"$export_name"'" and .source == "agent")) | map(.kind) | join(",")'
+    fact "$filter" "$1"
+}
+
+export_case() {
+    begin "$1" sh "$t/probe" --only J08
+    expect_rc 0
+    expect_report J08 sandbox
+    expect environment "$2" "$3"
+    fact '.start_record.state' "$4"
+    export_agent_kind "$5"
+    expect credential "$6" "$7"
+    finish_case
+}
+
+export_state() {
+    state 'exited 1 0'
+    proc_main
+    proc_agent "$export_comm"
+    environ 100 'GITHUB_TOKEN='
+    environ 101 "$export_name=$1"
+    record "jackin-env-kinds 2\nattempt 1\nmain GITHUB_TOKEN empty\nagent $export_name $2\n"
+}
+
+export_record_state() {
+    export_state "$2" "$1"
+    cat_fail_for_proc "$t/proc/101/environ" 0
+}
+
+for tuple in T09 T14 T18; do
+    case $tuple in
+        T09) export_comm=omp ;;
+        T14) export_comm=claude ;;
+        T18) export_comm=codex ;;
+    esac
+    export_name=$("$scratch/tools/jq" -r '.behavior.credential.environment[0].name' "$here/fixtures/$tuple.json")
+    export_key="synthetic-${tuple}-host-key-0123456789"
+    export_fingerprint=$(printf '%s' "$export_key" | sha256sum | cut -d' ' -f1)
+    lower=$(printf '%s' "$tuple" | tr '[:upper:]' '[:lower:]')
+
+    mk "export_${lower}_canonical_reference"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state "openshell:resolve:env:$export_name" placeholder
+    export_case "export_${lower}_canonical_reference" PASS 'the agent environment (/proc)' read placeholder PASS '1 placeholder variables'
+
+    mk "export_${lower}_alternate_value"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state "v2_$export_name" other
+    export_case "export_${lower}_alternate_value" PASS 'the agent environment (/proc)' read brokered PASS '1 placeholder variables'
+
+    mk "export_${lower}_arbitrary_value"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state 'arbitrary-other-value' other
+    export_case "export_${lower}_arbitrary_value" PASS 'the agent environment (/proc)' read brokered PASS '1 placeholder variables'
+
+    mk "export_${lower}_wrong_identity"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state 'openshell:resolve:env:WRONG_NAME' placeholder
+    export_case "export_${lower}_wrong_identity" PASS 'the agent environment (/proc)' read placeholder PASS '1 placeholder variables'
+
+    mk "export_${lower}_empty_value"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state '' empty
+    export_case "export_${lower}_empty_value" PASS 'the agent environment (/proc)' read empty SKIP 'no credential placeholder'
+
+    mk "export_${lower}_raw_key_value"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state "$export_key" other
+    export_case "export_${lower}_raw_key_value" PASS 'the agent environment (/proc)' read brokered PASS '1 placeholder variables'
+
+    mk "export_${lower}_truncated_reference"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state 'openshell:resolve:env:' other
+    export_case "export_${lower}_truncated_reference" PASS 'the agent environment (/proc)' read brokered PASS '1 placeholder variables'
+
+    mk "export_${lower}_record_placeholder"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_record_state placeholder "openshell:resolve:env:$export_name"
+    export_case "export_${lower}_record_placeholder" PASS 'the agent environment (record)' read placeholder PASS '1 placeholder variables'
+
+    mk "export_${lower}_record_other"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_record_state other "openshell:resolve:env:$export_name"
+    export_case "export_${lower}_record_other" PASS 'the agent environment (record)' read brokered PASS '1 placeholder variables'
+
+    mk "export_${lower}_record_empty"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_record_state empty "openshell:resolve:env:$export_name"
+    export_case "export_${lower}_record_empty" PASS 'the agent environment (record)' read empty SKIP 'no credential placeholder'
+
+    mk "export_${lower}_record_without_the_agent_section"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    state waiting
+    proc_main
+    proc_agent "$export_comm"
+    environ 100 'GITHUB_TOKEN='
+    environ 101 "$export_name=openshell:resolve:env:$export_name"
+    record "jackin-env-kinds 2\nattempt 0\nmain GITHUB_TOKEN empty\n"
+    export_case "export_${lower}_record_without_the_agent_section" SKIP 'the Codex environment is not known' read placeholder PASS '1 placeholder variables'
+
+    mk "export_${lower}_record_other_with_the_raw_key"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_record_state other "openshell:resolve:env:$export_name"
+    begin "export_${lower}_record_other_with_the_raw_key" env "PATH=$t/bin:$scratch/shim:$scratch/tools" "$export_name=$export_key" sh "$t/probe" --only J08
+    expect_rc 0
+    expect_report J08 sandbox
+    expect environment FAIL "not a placeholder: $export_name"
+    fact '.start_record.state' read
+    export_agent_kind other
+    expect credential SKIP 'no credential placeholder'
+    not_disclosed "$export_key"
+    finish_case
+
+    mk "export_${lower}_arbitrary_value_with_the_raw_key"
+    export_setup "$tuple" "$export_comm" "$export_fingerprint"
+    export_state 'arbitrary-other-value' other
+    begin "export_${lower}_arbitrary_value_with_the_raw_key" env "PATH=$t/bin:$scratch/shim:$scratch/tools" "$export_name=$export_key" sh "$t/probe" --only J08
+    expect_rc 0
+    expect_report J08 sandbox
+    expect environment FAIL "not a placeholder: $export_name"
+    fact '.start_record.state' read
+    export_agent_kind other
+    expect credential SKIP 'no credential placeholder'
+    not_disclosed "$export_key"
+    finish_case
+done
+
+fixture_spec=
+fixture_comm=
+fixture_fingerprint=
 
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

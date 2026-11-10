@@ -1,0 +1,142 @@
+{
+  "target": {
+    "tuple": "T18",
+    "agent": "codex",
+    "provider": "zai",
+    "model": "glm-5.3",
+    "adapter": "t18-codex-zai-v1",
+    "spec_sha256": "11b51630fe36e5e6fe8aef60298503a85ae2de5f1228fb6bdbd6c062c5d6069d"
+  },
+  "behavior": {
+    "version": {
+      "binary": "/usr/local/bin/codex",
+      "exact_output": "codex-cli 0.167.0"
+    },
+    "process": {
+      "comm": "codex",
+      "minimum_age_seconds": 15
+    },
+    "prompt": {
+      "argv": [
+        "/usr/local/bin/codex",
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "danger-full-access",
+        "-c",
+        "check_for_update_on_startup=false",
+        "Reply with exactly ready"
+      ],
+      "answer": {
+        "word_case_insensitive": {
+          "word": "ready"
+        }
+      },
+      "tool": {
+        "argv": [
+          "/usr/local/bin/codex",
+          "exec",
+          "--json",
+          "--skip-git-repo-check",
+          "--sandbox",
+          "danger-full-access",
+          "-c",
+          "check_for_update_on_startup=false",
+          "Use one shell tool to run ls -A in /sandbox/project with provider zai and model glm-5.3, then reply with exactly ready"
+        ],
+        "answer": {
+          "word_case_insensitive": {
+            "word": "ready"
+          }
+        },
+        "kind": "shell",
+        "workdir": "/sandbox/project",
+        "observation": {
+          "directory_contains": {
+            "entries": [
+              "AGENTS.md",
+              "Dockerfile",
+              "instructions",
+              "jackin.role.toml",
+              "probe",
+              "tests"
+            ]
+          }
+        }
+      }
+    },
+    "terminal": {
+      "ready_text": "OpenAI Codex (v0.167.0)",
+      "interrupt": 3,
+      "quit_interrupts": 2,
+      "exit_notice": "codex exited with code"
+    },
+    "credential": {
+      "classification": "static_key",
+      "environment": [
+        {
+          "name": "ZAI_API_KEY",
+          "kind": "brokered"
+        }
+      ],
+      "absent_environment": [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY"
+      ],
+      "auth_file": {
+        "required_state": "absent",
+        "path": "/sandbox/.codex/auth.json",
+        "mode": null,
+        "fields": []
+      },
+      "config_files": [
+        {
+          "path": "/sandbox/.codex/config.toml",
+          "required_state": "present",
+          "mode": "600",
+          "required_text": [
+            "model = \"glm-5.3\"",
+            "model_provider = \"zai\"",
+            "name = \"Z.AI\"",
+            "base_url = \"https://api.z.ai/api/v1\"",
+            "env_key = \"ZAI_API_KEY\"",
+            "wire_api = \"responses\""
+          ],
+          "forbidden_text": [
+            "ANTHROPIC_AUTH_TOKEN"
+          ]
+        }
+      ]
+    },
+    "reflection": {
+      "url": "https://api.z.ai/api/v1",
+      "descendant_comm": "codex"
+    },
+    "provider": {
+      "probe_url": "https://api.z.ai/api/v1",
+      "accepted_status": null,
+      "accepted_body": null,
+      "policy_hosts": [
+        "api.z.ai",
+        "*.api.z.ai"
+      ]
+    },
+    "usage": {
+      "windows": {
+        "required": [
+          "five_hour",
+          "weekly"
+        ],
+        "optional": [
+          "monthly"
+        ]
+      }
+    }
+  },
+  "provider_hosts": [
+    "api.z.ai"
+  ],
+  "credential_sha256": null
+}
