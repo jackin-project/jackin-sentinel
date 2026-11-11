@@ -27,6 +27,12 @@ for tool in awk basename base64 cat chmod cp cut date dirname env find grep head
 done
 real_id=$(command -v id) || exit 70
 real_uname=$(command -v uname) || exit 70
+real_find=$(command -v find) || exit 70
+real_timeout=$(command -v timeout) || exit 70
+real_ln=$(command -v ln) || exit 70
+real_stat=$(command -v stat) || exit 70
+real_python3=$(command -v python3) || exit 70
+real_dd=$(command -v dd) || exit 70
 
 R_OK1='jackin-env-kinds 2\nattempt 1\nmain GITHUB_TOKEN empty\nmain OPENAI_API_KEY placeholder\nagent GITHUB_TOKEN empty\nagent OPENAI_API_KEY placeholder\n'
 R_W0='jackin-env-kinds 2\nattempt 0\nmain OPENAI_API_KEY placeholder\n'
@@ -183,6 +189,94 @@ EOF
     chmod +x "$t/bin/$1"
 }
 
+swap_shim() {
+    mkdir -p "$t/bin"
+    cat >"$t/bin/timeout" <<EOF
+#!/bin/sh
+swapped=false
+for argument; do
+    if [ "\$argument" = "\$SENTINEL_SWAP_PATH" ] || [ "\$argument" = "if=\$SENTINEL_SWAP_PATH" ]; then
+        swapped=true
+    fi
+done
+if [ "\$swapped" = true ]; then
+    rm -f "\$SENTINEL_SWAP_PATH"
+    if [ -n "\${SENTINEL_SWAP_TARGET-}" ]; then
+        $real_ln -s "\$SENTINEL_SWAP_TARGET" "\$SENTINEL_SWAP_PATH"
+    else
+        mkfifo "\$SENTINEL_SWAP_PATH"
+    fi
+fi
+exec $real_timeout "\$@"
+EOF
+    chmod +x "$t/bin/timeout"
+}
+
+find_fail_shim() {
+    mkdir -p "$t/bin"
+    cat >"$t/bin/find" <<EOF
+#!/bin/sh
+$real_find "\$@"
+echo 'find: ./plain.txt: Permission denied' >&2
+exit 1
+EOF
+    chmod +x "$t/bin/find"
+}
+
+late_date_shim() {
+    mkdir -p "$t/bin"
+    cat >"$t/bin/date" <<EOF
+#!/bin/sh
+count=\$(cat "\$SENTINEL_DATE_TICKS" 2>/dev/null)
+case \$count in
+    '' | *[!0-9]*) count=0 ;;
+esac
+count=\$((count + 1))
+printf '%s\n' "\$count" >"\$SENTINEL_DATE_TICKS"
+case \$count in
+    1) printf '$1\n' ;;
+    2) printf '$2\n' ;;
+    3) printf '$3\n' ;;
+    4) printf '$4\n' ;;
+    *) printf '$5\n' ;;
+esac
+EOF
+    chmod +x "$t/bin/date"
+}
+
+virtual_timeout_shim() {
+    mkdir -p "$t/bin"
+    cat >"$t/bin/timeout" <<'EOF'
+#!/bin/sh
+shift
+exec "$@"
+EOF
+    chmod +x "$t/bin/timeout"
+}
+
+sha_fail_shim() {
+    real_sum=$(command -v sha256sum) || return 1
+    mkdir -p "$t/bin"
+    cat >"$t/bin/sha256sum" <<EOF
+#!/bin/sh
+if [ \$# -eq 0 ] && [ -n "\${SENTINEL_SHA256_FAIL_MARKER-}" ]; then
+    tmp=\$(mktemp "\${TMPDIR:-/tmp}/sentinel-sha.XXXXXX") || exit 70
+    cat >"\$tmp"
+    if [ "\$(cat "\$tmp")" = "\$SENTINEL_SHA256_FAIL_MARKER" ]; then
+        rm -f "\$tmp"
+        echo 'sha256sum: ./unreadable.txt: Permission denied' >&2
+        exit 1
+    fi
+    $real_sum <"\$tmp"
+    status=\$?
+    rm -f "\$tmp"
+    exit \$status
+fi
+exec $real_sum "\$@"
+EOF
+    chmod +x "$t/bin/sha256sum"
+}
+
 setup_failed() {
     total=$((total + 1))
     failures=$((failures + 1))
@@ -217,30 +311,198 @@ import sys
 arguments = dict(argument.split("=", 1) for argument in sys.argv[1:] if "=" in argument)
 source = arguments.get("if")
 destination = arguments.get("of")
-if arguments.get("bs") != "65" or arguments.get("count") != "1" or arguments.get("iflag") != "nonblock,nofollow":
+block_size = arguments.get("bs")
+count = arguments.get("count")
+flags = arguments.get("iflag", "").split(",")
+state_read = block_size == "65" and count == "1" and arguments.get("iflag") == "nonblock,nofollow"
+bounded_copy = "count_bytes" in flags and "nonblock" in flags
+if not state_read and not bounded_copy:
     raise SystemExit(64)
-if not source or not destination:
+if not source or not destination or not block_size:
     raise SystemExit(64)
-if os.environ.get("SENTINEL_DD_SWAP_PATH") == source:
-    os.unlink(source)
-    os.symlink(os.environ["SENTINEL_DD_SWAP_TARGET"], source)
+size = int(block_size)
+limit = None
+if count is not None:
+    limit = int(count) if "count_bytes" in flags else int(count) * size
 try:
-    descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    if state_read:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    else:
+        descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK)
 except OSError:
     raise SystemExit(1)
 try:
-    data = os.read(descriptor, 65)
-finally:
-    os.close(descriptor)
-descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-try:
-    offset = 0
-    while offset < len(data):
-        offset += os.write(descriptor, data[offset:])
+    if state_read:
+        output = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            while limit is None or limit > 0:
+                want = size if limit is None else min(size, limit)
+                data = os.read(descriptor, want)
+                if not data:
+                    break
+                offset = 0
+                while offset < len(data):
+                    offset += os.write(output, data[offset:])
+                if limit is not None:
+                    limit -= len(data)
+        finally:
+            os.close(output)
+    else:
+        data = bytearray()
+        while limit is None or limit > 0:
+            want = size if limit is None else min(size, limit)
+            chunk = os.read(descriptor, want)
+            if not chunk:
+                break
+            data += chunk
+            if limit is not None:
+                limit -= len(chunk)
+        marker = os.environ.get("SENTINEL_DD_FAIL_MARKER")
+        if marker is not None and bytes(data) == marker.encode():
+            sys.stderr.write("dd: failed to read 'sentinel marker': Permission denied\n")
+            raise SystemExit(1)
+        output = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            buffer = bytes(data)
+            offset = 0
+            while offset < len(buffer):
+                offset += os.write(output, buffer[offset:])
+        finally:
+            os.close(output)
 finally:
     os.close(descriptor)
 EOF
+cat >"$scratch/shim/stat" <<EOF
+#!/bin/sh
+if [ "\$#" -eq 3 ] && [ "\$2" = "%d %i" ]; then
+    case \$1 in
+        -c | -Lc)
+            exec $real_python3 -S -E -c 'import os,sys
+path = sys.argv[1]
+follow = sys.argv[2] == "-Lc"
+if follow and path.startswith("/dev/fd/") and path[8:].isdigit():
+    status = os.fstat(int(path[8:]))
+elif follow:
+    status = os.stat(path)
+else:
+    status = os.lstat(path)
+sys.stdout.write("%d %d\n" % (status.st_dev, status.st_ino))' "\$3" "\$1"
+            ;;
+    esac
+fi
+exec $real_stat "\$@"
+EOF
+stat_dialect=gnu
+if ! "$real_stat" -c '%d %i' /dev/null >/dev/null 2>&1; then
+    stat_dialect=bsd
+fi
+if [ "$stat_dialect" = bsd ]; then
+    chmod +x "$scratch/shim/stat"
+else
+    rm -f "$scratch/shim/stat"
+fi
 chmod +x "$scratch/shim/uname" "$scratch/shim/id" "$scratch/shim/dd"
+mkdir -p "$scratch/shim-nostat"
+cp "$scratch/shim/uname" "$scratch/shim/id" "$scratch/shim/dd" "$scratch/shim-nostat/"
+
+dd_iflags_capable() {
+    dd_bin=$1
+    dd_cap_in=$scratch/dd-cap.in
+    dd_cap_out=$scratch/dd-cap.out
+    printf cap >"$dd_cap_in"
+    dd_cap_rc=1
+    {
+        exec 8<"$dd_cap_in"
+        "$dd_bin" if=/dev/fd/8 of="$dd_cap_out" bs=1048576 count=2 iflag=count_bytes,nonblock status=none >/dev/null 2>&1
+        dd_cap_rc=$?
+        exec 8<&-
+    }
+    [ "$dd_cap_rc" -eq 0 ] && [ "$(cat "$dd_cap_out" 2>/dev/null)" = ca ]
+}
+if ! dd_iflags_capable "$real_dd"; then
+    echo "j08: $real_dd lacks iflag=count_bytes,nonblock; the GNU dd double stands in for the probe"
+fi
+if ! dd_iflags_capable "$scratch/shim/dd"; then
+    echo "FAIL setup: the GNU dd double does not provide iflag=count_bytes,nonblock"
+    exit 70
+fi
+
+stat_boundary() {
+    if [ "$stat_dialect" = bsd ]; then
+        "$scratch/shim/stat" "$@"
+    else
+        "$real_stat" "$@"
+    fi
+}
+
+contract_result() {
+    total=$((total + 1))
+    if [ -n "$problems" ]; then
+        failures=$((failures + 1))
+        echo "FAIL $name:$problems"
+    else
+        echo "ok   $name"
+    fi
+}
+
+name=stat_boundary_follows_and_does_not_follow_like_the_host_dialect
+problems=
+stat_contract_file=$scratch/stat-contract.file
+printf contract >"$stat_contract_file"
+ln -sf stat-contract.file "$scratch/stat-contract.link"
+stat_follow_link=$(stat_boundary -Lc '%d %i' "$scratch/stat-contract.link")
+stat_nofollow_link=$(stat_boundary -c '%d %i' "$scratch/stat-contract.link")
+stat_file_id=$(stat_boundary -c '%d %i' "$stat_contract_file")
+[ "$stat_follow_link" = "$stat_file_id" ] || problems="$problems follow-target"
+[ "$stat_nofollow_link" != "$stat_follow_link" ] || problems="$problems no-follow"
+if [ "$stat_dialect" = bsd ]; then
+    [ "$stat_nofollow_link" = "$($real_stat -f '%d %i' "$scratch/stat-contract.link")" ] || problems="$problems link-host-value"
+    [ "$stat_follow_link" = "$($real_stat -Lf '%d %i' "$scratch/stat-contract.link")" ] || problems="$problems follow-host-value"
+else
+    [ "$stat_nofollow_link" = "$($real_stat -c '%d %i' "$scratch/stat-contract.link")" ] || problems="$problems link-host-value"
+    [ "$stat_follow_link" = "$($real_stat -Lc '%d %i' "$scratch/stat-contract.link")" ] || problems="$problems follow-host-value"
+fi
+contract_result
+
+name=stat_descriptor_paths_keep_no_follow_and_real_devices
+problems=
+exec 7<"$stat_contract_file"
+stat_fd_follow=$(stat_boundary -Lc '%d %i' /dev/fd/7)
+stat_fd_nofollow=$(stat_boundary -c '%d %i' /dev/fd/7)
+if [ "$stat_dialect" = bsd ]; then
+    stat_fd_host=$($real_stat -f '%d %i' /dev/fd/7)
+    stat_fd_host_follow=$($real_stat -Lf '%d %i' /dev/fd/7)
+else
+    stat_fd_host=$($real_stat -c '%d %i' /dev/fd/7)
+    stat_fd_host_follow=$($real_stat -Lc '%d %i' /dev/fd/7)
+fi
+exec 7<&-
+[ "$stat_fd_follow" = "$stat_file_id" ] || problems="$problems follow-target"
+[ "$stat_fd_nofollow" != "$stat_fd_follow" ] || problems="$problems descriptor-no-follow"
+[ "$stat_fd_nofollow" = "$stat_fd_host" ] || problems="$problems descriptor-entry-value"
+if [ "$stat_dialect" = bsd ]; then
+    [ "${stat_fd_nofollow%% *}" != "${stat_fd_follow%% *}" ] || problems="$problems descriptor-device"
+    [ "${stat_fd_host_follow##* }" = "${stat_fd_follow##* }" ] || problems="$problems host-follow-inode"
+    [ "${stat_fd_host_follow%% *}" = "${stat_fd_nofollow%% *}" ] || problems="$problems host-follow-device"
+else
+    [ "$stat_fd_host_follow" = "$stat_fd_follow" ] || problems="$problems host-follow"
+fi
+contract_result
+
+name=stat_descriptor_of_a_real_device_keeps_its_device
+problems=
+exec 7</dev/null
+stat_device_fd=$(stat_boundary -Lc '%d %i' /dev/fd/7)
+stat_device_path=$(stat_boundary -c '%d %i' /dev/null)
+if [ "$stat_dialect" = bsd ]; then
+    stat_device_host=$($real_stat -Lf '%d %i' /dev/fd/7)
+else
+    stat_device_host=$($real_stat -Lc '%d %i' /dev/fd/7)
+fi
+exec 7<&-
+[ "$stat_device_fd" = "$stat_device_path" ] || problems="$problems device-identity"
+[ "$stat_device_fd" = "$stat_device_host" ] || problems="$problems device-host-value"
+contract_result
 
 begin() {
     total=$((total + 1))
@@ -555,8 +817,9 @@ mk skip_swapped_symlink_run_state_with_matching_start_record
 state 'exited 1 0'
 printf 'exited 1 0\n' >"$t/valid-state"
 record "$R_OK1"
+swap_shim
 begin skip_swapped_symlink_run_state_with_matching_start_record \
-    env SENTINEL_DD_SWAP_PATH="$t/sandbox/.jackin/run/state" SENTINEL_DD_SWAP_TARGET="$t/valid-state" sh "$t/probe" --only J08
+    env SENTINEL_SWAP_PATH="$t/sandbox/.jackin/run/state" SENTINEL_SWAP_TARGET="$t/valid-state" sh "$t/probe" --only J08
 expect_rc 0
 expect_report J08 sandbox
 expect environment SKIP 'stale'
@@ -586,6 +849,85 @@ proc_main
 environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY other\nagent OPENAI_API_KEY placeholder\n'
 verify pass_proc_wins_and_notes_disagreement PASS 'disagree' read
+
+mk launch_env_symlink_fails_the_launch_env_check
+state 'exited 1 0'
+record "$R_OK1"
+printf 'export OPENAI_API_KEY="openshell:resolve:env:OPENAI_API_KEY"\n' >"$t/launch-env"
+ln -s "$t/launch-env" "$t/sandbox/.jackin/env-main"
+begin launch_env_symlink_fails_the_launch_env_check sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect launch_env FAIL 'env-main'
+expect environment FAIL 'could not be read'
+finish_case
+
+mk launch_env_file_over_the_byte_cap_fails_the_launch_env_check
+state 'exited 1 0'
+record "$R_OK1"
+head -c 1048577 /dev/zero | tr '\0' 'a' >"$t/sandbox/.jackin/env-main"
+begin launch_env_file_over_the_byte_cap_fails_the_launch_env_check sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect launch_env FAIL 'env-main'
+expect environment FAIL 'could not be read'
+finish_case
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk launch_env_enumeration_failure_fails_the_launch_env_check
+    state 'exited 1 0'
+    record "$R_OK1"
+    chmod 111 "$t/sandbox/.jackin"
+    begin launch_env_enumeration_failure_fails_the_launch_env_check sh "$t/probe" --only J08
+    chmod 755 "$t/sandbox/.jackin"
+    expect_rc 0
+    expect_report J08 sandbox
+    expect launch_env FAIL 'could not be enumerated'
+    expect environment FAIL 'could not be read'
+    finish_case
+else
+    echo "skip launch_env_enumeration_failure_fails_the_launch_env_check: running as root"
+fi
+
+mk launch_env_file_named_like_the_pattern_is_not_absence
+state 'exited 1 0'
+record "$R_OK1"
+printf "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'\n" >"$t/sandbox/.jackin/env-*"
+begin launch_env_file_named_like_the_pattern_is_not_absence sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect launch_env PASS '1 launch environment file'
+expect environment PASS 'via record'
+finish_case
+
+if [ "$(id -u)" -ne 0 ]; then
+    mk launch_env_inaccessible_ancestor_is_an_enumeration_failure
+    state 'exited 1 0'
+    record "$R_OK1"
+    chmod 000 "$t/sandbox"
+    begin launch_env_inaccessible_ancestor_is_an_enumeration_failure sh "$t/probe" --only J08
+    chmod 755 "$t/sandbox"
+    expect_rc 0
+    expect_report J08 sandbox
+    expect launch_env FAIL 'could not be enumerated'
+    finish_case
+
+    mk launch_env_symlink_with_inaccessible_target_is_an_enumeration_failure
+    state 'exited 1 0'
+    record "$R_OK1"
+    mkdir -p "$t/launch-private/launch-target"
+    chmod 000 "$t/launch-private"
+    rm -rf "$t/sandbox/.jackin"
+    ln -s "$t/launch-private/launch-target" "$t/sandbox/.jackin"
+    begin launch_env_symlink_with_inaccessible_target_is_an_enumeration_failure sh "$t/probe" --only J08
+    chmod 755 "$t/launch-private"
+    expect_rc 0
+    expect_report J08 sandbox
+    expect launch_env FAIL 'could not be enumerated'
+    finish_case
+else
+    echo "skip launch_env_inaccessible_ancestor_is_an_enumeration_failure: running as root"
+fi
 
 mk malformed_symlink_to_dev_zero
 state waiting
@@ -1900,15 +2242,6 @@ expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/slow.dat" | sha256sum | cu
 finish_case
 
 if [ "$(id -u)" -ne 0 ]; then
-    mk file_scan_skips_an_unreadable_file
-    state waiting
-    record "$R_W0"
-    printf 'plain\n' >"$t/sandbox/locked.txt"
-    chmod 000 "$t/sandbox/locked.txt"
-    report file_scan_skips_an_unreadable_file
-    expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/locked.txt" | sha256sum | cut -c1-12) (unreadable)"
-    finish_case
-
     mk file_scan_skips_an_unreadable_directory
     state waiting
     record "$R_W0"
@@ -1919,9 +2252,87 @@ if [ "$(id -u)" -ne 0 ]; then
     chmod 755 "$t/sandbox/locked"
     expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/locked" | sha256sum | cut -c1-12)"
     finish_case
+    mk file_scan_skips_an_unreadable_file
+    state waiting
+    record "$R_W0"
+    printf 'plain\n' >"$t/sandbox/locked.txt"
+    chmod 000 "$t/sandbox/locked.txt"
+    report file_scan_skips_an_unreadable_file
+    expect file_scan SKIP "leak-$(printf '%s' "$t/sandbox/locked.txt" | sha256sum | cut -c1-12) (unreadable)"
+    finish_case
 else
     echo "skip file_scan_skips_an_unreadable_file and directory: running as root"
 fi
+
+mk file_scan_budget_exhaustion_fails_the_scan_check
+state waiting
+record "$R_W0"
+seam SCAN_MAX_FILES 3
+i=1
+while [ "$i" -le 12 ]; do
+    printf 'plain\n' >"$t/sandbox/plain-$i.txt"
+    i=$((i + 1))
+done
+report file_scan_budget_exhaustion_fails_the_scan_check
+expect file_scan FAIL 'the scan budget of 3 entries is exhausted'
+fact '.leak_count' 0
+finish_case
+
+mk file_scan_a_completion_after_the_deadline_is_rejected
+state waiting
+record "$R_W0"
+seam SCAN_DEADLINE_SECONDS 5
+late_date_shim 1000000000 1000000000 1000000001 1000000001 1000000009
+virtual_timeout_shim
+begin file_scan_a_completion_after_the_deadline_is_rejected \
+    env SENTINEL_DATE_TICKS="$t/date.ticks" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan FAIL 'the scan did not finish: the scan deadline of 5 seconds expired'
+fact '.leak_count' 0
+finish_case
+
+mk file_scan_an_expired_scan_window_is_not_extended_by_a_second
+state waiting
+record "$R_W0"
+seam SCAN_DEADLINE_SECONDS 5
+late_date_shim 1000000000 1000000009 1000000003 1000000003 1000000003
+virtual_timeout_shim
+begin file_scan_an_expired_scan_window_is_not_extended_by_a_second \
+    env SENTINEL_DATE_TICKS="$t/date.ticks" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan FAIL 'the scan did not finish: the scan deadline of 5 seconds expired'
+fact '.leak_count' 0
+finish_case
+
+mk file_scan_a_completion_before_the_deadline_is_accepted
+state waiting
+record "$R_W0"
+seam SCAN_DEADLINE_SECONDS 5
+late_date_shim 1000000000 1000000000 1000000001 1000000001 1000000002
+virtual_timeout_shim
+begin file_scan_a_completion_before_the_deadline_is_accepted \
+    env SENTINEL_DATE_TICKS="$t/date.ticks" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan PASS 'no token-shaped string outside the project'
+fact '.leak_count' 0
+finish_case
+
+mk file_scan_a_completion_exactly_at_the_deadline_is_rejected
+state waiting
+record "$R_W0"
+seam SCAN_DEADLINE_SECONDS 5
+late_date_shim 1000000000 1000000000 1000000001 1000000001 1000000005
+virtual_timeout_shim
+begin file_scan_a_completion_exactly_at_the_deadline_is_rejected \
+    env SENTINEL_DATE_TICKS="$t/date.ticks" sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect file_scan FAIL 'the scan did not finish: the scan deadline of 5 seconds expired'
+fact '.leak_count' 0
+finish_case
 
 git_in_project() {
     git_fixture -C "$t/sandbox/project" "$@"
@@ -2677,38 +3088,137 @@ else
 fi
 
 mk j05_a_file_that_cannot_be_hashed_fails_the_files_check
-if git_project; then
+if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
     printf a >"$t/sandbox/project/plain.txt"
     printf u >"$t/sandbox/project/unreadable.txt"
-    mkdir -p "$t/bin"
-    real_sum=$(command -v sha256sum)
-    cat >"$t/bin/sha256sum" <<EOF
-#!/bin/sh
-rc=0
-n=\$#
-while [ \$n -gt 0 ]; do
-    arg=\$1
-    shift
-    n=\$((n - 1))
-    case \$arg in
-        *unreadable.txt)
-            echo "sha256sum: \$arg: Permission denied" >&2
-            rc=1
-            ;;
-        *) set -- "\$@" "\$arg" ;;
-    esac
-done
-$real_sum "\$@"
-[ \$rc -eq 0 ] || exit 1
-EOF
-    chmod +x "$t/bin/sha256sum"
-    begin j05_a_file_that_cannot_be_hashed_fails_the_files_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J05
+    sha_fail_shim
+    begin j05_a_file_that_cannot_be_hashed_fails_the_files_check \
+        env SENTINEL_SHA256_FAIL_MARKER=u sh "$t/probe" --only J05
     expect_rc 0
     expect_report J05 sandbox
     expect files FAIL 'unreadable.txt: Permission denied'
     finish_case
 else
     setup_failed j05_a_file_that_cannot_be_hashed_fails_the_files_check
+fi
+
+mk j05_a_file_that_cannot_be_copied_fails_the_files_check
+if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+    printf a >"$t/sandbox/project/plain.txt"
+    printf u >"$t/sandbox/project/unreadable.txt"
+    begin j05_a_file_that_cannot_be_copied_fails_the_files_check \
+        env SENTINEL_DD_FAIL_MARKER=u sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'unreadable.txt: Permission denied'
+    finish_case
+else
+    setup_failed j05_a_file_that_cannot_be_copied_fails_the_files_check
+fi
+
+mk j05_an_inventory_failure_fails_the_files_check
+if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+    printf a >"$t/sandbox/project/plain.txt"
+    find_fail_shim
+    begin j05_an_inventory_failure_fails_the_files_check sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'the project inventory failed with status 1: find: ./plain.txt: Permission denied'
+    fact '[.files[].path] | join(",")' 'plain.txt'
+    finish_case
+else
+    setup_failed j05_an_inventory_failure_fails_the_files_check
+fi
+
+mk j05_the_total_budget_stops_the_hashing_before_an_over_budget_file
+if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+    seam PROJECT_FILE_MAX_BYTES 100
+    seam PROJECT_TOTAL_MAX_BYTES 30
+    printf '%020d' 0 >"$t/sandbox/project/first.txt"
+    printf '%020d' 0 >"$t/sandbox/project/second.txt"
+    begin j05_the_total_budget_stops_the_hashing_before_an_over_budget_file sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'over the 30 byte hashing budget'
+    fact '.files | length' 1
+    finish_case
+else
+    setup_failed j05_the_total_budget_stops_the_hashing_before_an_over_budget_file
+fi
+
+mk j05_a_file_swapped_for_a_symlink_is_not_read
+if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+    printf a >"$t/sandbox/project/plain.txt"
+    printf outside >"$t/outside.txt"
+    swap_shim
+    begin j05_a_file_swapped_for_a_symlink_is_not_read \
+        env SENTINEL_SWAP_PATH=./plain.txt SENTINEL_SWAP_TARGET="$t/outside.txt" sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'plain.txt'
+    fact '[.files[].path] | join(",")' ''
+    finish_case
+else
+    setup_failed j05_a_file_swapped_for_a_symlink_is_not_read
+fi
+
+mk j05_a_file_swapped_for_a_fifo_is_not_read
+if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+    printf a >"$t/sandbox/project/plain.txt"
+    swap_shim
+    begin j05_a_file_swapped_for_a_fifo_is_not_read \
+        env SENTINEL_SWAP_PATH=./plain.txt sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'plain.txt: not a regular file'
+    fact '[.files[].path] | join(",")' ''
+    finish_case
+else
+    setup_failed j05_a_file_swapped_for_a_fifo_is_not_read
+fi
+
+if [ "$stat_dialect" = bsd ]; then
+    mk j05_a_file_on_another_device_is_not_read
+    if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+        printf a >"$t/sandbox/project/plain.txt"
+        seam SANDBOX_PATH "$t/bin:$scratch/shim-nostat:$scratch/tools"
+        begin j05_a_file_on_another_device_is_not_read sh "$t/probe" --only J05
+        expect_rc 0
+        expect_report J05 sandbox
+        expect files FAIL 'plain.txt: the file changed while it was opened'
+        fact '[.files[].path] | join(",")' ''
+        finish_case
+    else
+        setup_failed j05_a_file_on_another_device_is_not_read
+    fi
+else
+    mk j05_a_file_on_another_device_is_not_read
+    if git_project && [ "$(git_in_project rev-parse --is-inside-work-tree)" = true ]; then
+        printf a >"$t/sandbox/project/plain.txt"
+        seam SANDBOX_PATH "$t/bin:$scratch/shim-nostat:$scratch/tools"
+        begin j05_a_file_on_another_device_is_not_read sh "$t/probe" --only J05
+        expect_rc 0
+        expect_report J05 sandbox
+        expect files PASS '1 files'
+        fact '[.files[].path] | join(",")' 'plain.txt'
+        finish_case
+    else
+        setup_failed j05_a_file_on_another_device_is_not_read
+    fi
+fi
+
+mk j05_a_file_over_the_byte_cap_fails_the_files_check
+if git_project; then
+    printf a >"$t/sandbox/project/plain.txt"
+    dd if=/dev/zero of="$t/sandbox/project/big.bin" bs=1 count=0 seek=67108865 2>/dev/null
+    begin j05_a_file_over_the_byte_cap_fails_the_files_check sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'over the 67108864 byte cap'
+    fact '[.files[].path] | join(",")' 'plain.txt'
+    finish_case
+else
+    setup_failed j05_a_file_over_the_byte_cap_fails_the_files_check
 fi
 
 mk j15_runs_the_hello_world_image_by_digest

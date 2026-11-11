@@ -39,10 +39,16 @@ RUN_STATE_FILE=$JACKIN_DIR/run/state
 RECORD_MAX=65536
 SCAN_ROOT=/sandbox
 SCAN_MAX_KIB=262144
+SCAN_MAX_FILES=20000
+SCAN_DEADLINE_SECONDS=300
+SCAN_ERR_MAX=65536
 AGENT_HOME_MAX_BYTES=1048576
 SCAN_GREP_SECONDS=20
 LOG_BYTE_CAP=1048576
 LOG_READ_SECONDS=10
+PROJECT_FILE_MAX_BYTES=67108864
+PROJECT_TOTAL_MAX_BYTES=536870912
+PROJECT_HASH_SECONDS=300
 LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
 LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
 ID_TOKEN_HEADER=$(printf '%s' 'eyJhbGci' 'OiJub25l' 'IiwidHlw' 'IjoiSldU' 'In0')
@@ -125,6 +131,19 @@ require_sandbox() {
     exit 66
 }
 
+bounded_read() {
+    bounded_source=$1
+    bounded_target=$2
+    bounded_cap=$3
+    bounded_seconds=$4
+    rm -f "$bounded_target"
+    if ! timeout "$bounded_seconds" sh "$work/bounded-copy.sh" "$bounded_source" "$bounded_target" "$bounded_cap" "$work/bounded.err" >/dev/null 2>&1; then
+        rm -f "$bounded_target"
+        return 1
+    fi
+    return 0
+}
+
 log_snapshot() {
     log_source=$1
     log_target=$2
@@ -139,22 +158,7 @@ log_snapshot() {
     if [ ! -f "$log_source" ]; then
         return 1
     fi
-    if ! timeout "$LOG_READ_SECONDS" head -c $((LOG_BYTE_CAP + 1)) -- "$log_source" >"$log_target" 2>/dev/null; then
-        rm -f "$log_target"
-        return 1
-    fi
-    log_bytes=$(wc -c <"$log_target" 2>/dev/null | tr -d '[:space:]') || log_bytes=
-    case $log_bytes in
-        '' | *[!0-9]*)
-            rm -f "$log_target"
-            return 1
-            ;;
-    esac
-    if [ "$log_bytes" -gt "$LOG_BYTE_CAP" ]; then
-        rm -f "$log_target"
-        return 1
-    fi
-    return 0
+    bounded_read "$log_source" "$log_target" "$LOG_BYTE_CAP" "$LOG_READ_SECONDS"
 }
 
 count_lines() {
@@ -1143,45 +1147,80 @@ jwt_listed() {
             reduce (inputs | verdict) as $v ("none";
                 if . == "error" or $v == "error" then "error" elif . == "hit" or $v == "hit" then "hit" else "none" end)'
 }
-mode=$1
-shift
+scan_count=$(cat "$SCAN_COUNT" 2>/dev/null) || scan_count=0
+case $scan_count in
+    '' | *[!0-9]*) scan_count=0 ;;
+esac
+scan_now=$(date +%s) || scan_now=0
+if [ "$scan_now" -ge $((SCAN_START + SCAN_DEADLINE_SECONDS)) ]; then
+    emit exhausted "$SCAN_ROOT" "the scan deadline of $SCAN_DEADLINE_SECONDS seconds expired"
+    kill -TERM "$PPID" 2>/dev/null
+    exit 0
+fi
 for file; do
-    if [ "$mode" = oversize ]; then
-        emit unscanned "$file" "over the size cap"
-        continue
+    if [ "$scan_count" -ge "$SCAN_MAX_FILES" ]; then
+        emit exhausted "$SCAN_ROOT" "the scan budget of $SCAN_MAX_FILES entries is exhausted"
+        kill -TERM "$PPID" 2>/dev/null
+        exit 0
     fi
+    scan_count=$((scan_count + 1))
+    printf '%s\n' "$scan_count" >"$SCAN_COUNT"
     if [ ! -r "$file" ]; then
         emit unscanned "$file" unreadable
         continue
     fi
-    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" -e "$LEAK_JWT" -e "$LEAK_RT" "$file"
+    if [ -L "$file" ] || [ ! -f "$file" ]; then
+        emit unscanned "$file" "not a regular file"
+        continue
+    fi
+    scan_name=${file##*/}
+    snapshot=$SCAN_WORK/scan/$scan_name
+    rm -f "$snapshot"
+    timeout "$SCAN_GREP_SECONDS" sh "$SCAN_WORK/bounded-copy.sh" "$file" "$snapshot" "$SCAN_CAP" "$SCAN_WORK/scan/copy.err" \
+        >"$SCAN_WORK/scan/copy.bytes" 2>/dev/null
+    copy_rc=$?
+    if [ "$copy_rc" -eq 2 ]; then
+        rm -f "$snapshot"
+        emit unscanned "$file" "over the size cap"
+        continue
+    fi
+    if [ "$copy_rc" -ne 0 ]; then
+        rm -f "$snapshot"
+        emit unscanned "$file" unreadable
+        continue
+    fi
+    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" -e "$LEAK_JWT" -e "$LEAK_RT" "$snapshot"
     candidate=$?
     if [ "$candidate" -eq 1 ]; then
-        timeout "$SCAN_GREP_SECONDS" grep -azqE -e "$LEAK_RT" "$file"
+        timeout "$SCAN_GREP_SECONDS" grep -azqE -e "$LEAK_RT" "$snapshot"
         candidate=$?
         if [ "$candidate" -eq 1 ]; then
+            rm -f "$snapshot"
             continue
         fi
     fi
     case $candidate in
         0) ;;
         124)
+            rm -f "$snapshot"
             emit unscanned "$file" "grep timed out"
             continue
             ;;
         *)
+            rm -f "$snapshot"
             emit unscanned "$file" "grep failed"
             continue
             ;;
     esac
-    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" "$file"
+    timeout "$SCAN_GREP_SECONDS" grep -aqE -e "$LEAK_SK" "$snapshot"
     sk=$?
-    jwt=$(jwt_listed "$LEAK_JWT" "$LEAK_JWT_SAFE" "$file")
+    jwt=$(jwt_listed "$LEAK_JWT" "$LEAK_JWT_SAFE" "$snapshot")
     case $jwt in
         none | hit) ;;
         *) jwt=error ;;
     esac
-    rt=$(listed "$LEAK_RT" "$LEAK_RT_SAFE" "$file")
+    rt=$(listed "$LEAK_RT" "$LEAK_RT_SAFE" "$snapshot")
+    rm -f "$snapshot"
     if [ "$sk" -eq 0 ] || [ "$jwt" = hit ] || [ "$rt" = hit ]; then
         emit leak "$file" "token-shaped string"
     elif [ "$sk" -ge 2 ] || [ "$jwt" = error ] || [ "$rt" = error ]; then
@@ -1190,59 +1229,160 @@ for file; do
 done
 exit 0
 EOF
-    env "SCAN_GREP_SECONDS=$SCAN_GREP_SECONDS" "LEAK_SK=$LEAK_SK" "LEAK_JWT=$LEAK_JWT" "LEAK_JWT_SAFE=$LEAK_JWT_SAFE" \
-        "LEAK_RT=$LEAK_RT" "LEAK_RT_SAFE=$LEAK_RT_SAFE" \
-        find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f \
-        \( -size +"${SCAN_MAX_KIB}k" -exec sh "$work/scan-file.sh" oversize {} + \
-        -o -exec sh "$work/scan-file.sh" scan {} + \) >"$work/scan.ndjson" 2>"$work/scan.err"
-    find_rc=$?
-    if prepared=$(jq -s '
+    mkdir -p "$work/scan"
+    : >"$work/scan.count"
+    scan_start=$(date +%s) || scan_start=0
+    case $scan_start in
+        '' | *[!0-9]*) scan_start=0 ;;
+    esac
+    scan_deadline=$((scan_start + SCAN_DEADLINE_SECONDS))
+    scan_now=$(date +%s) || scan_now=0
+    case $scan_now in
+        '' | *[!0-9]*) scan_now=0 ;;
+    esac
+    scan_remaining=$((scan_deadline - scan_now))
+    if [ "$scan_remaining" -lt 1 ]; then
+        : >"$work/scan.ndjson"
+        : >"$work/scan.err"
+        printf '124\n' >"$work/find.rc"
+    else
+        {
+            timeout "$scan_remaining" env "SCAN_GREP_SECONDS=$SCAN_GREP_SECONDS" "LEAK_SK=$LEAK_SK" "LEAK_JWT=$LEAK_JWT" "LEAK_JWT_SAFE=$LEAK_JWT_SAFE" \
+                "LEAK_RT=$LEAK_RT" "LEAK_RT_SAFE=$LEAK_RT_SAFE" \
+                "SCAN_MAX_FILES=$SCAN_MAX_FILES" "SCAN_DEADLINE_SECONDS=$SCAN_DEADLINE_SECONDS" \
+                "SCAN_CAP=$((SCAN_MAX_KIB * 1024))" \
+                "SCAN_WORK=$work" \
+                "SCAN_START=$scan_start" "SCAN_COUNT=$work/scan.count" \
+                find "$SCAN_ROOT" -path "$PROJECT" -prune -o -type f \
+                -exec sh "$work/scan-file.sh" {} +
+            printf '%s\n' "$?" >"$work/find.rc"
+        } 3>&1 >"$work/scan.ndjson" 2>&3 3>&- | {
+            head -c "$SCAN_ERR_MAX" >"$work/scan.err"
+            cat >/dev/null
+        }
+    fi
+    find_rc=$(cat "$work/find.rc" 2>/dev/null) || find_rc=
+    case $find_rc in
+        '' | *[!0-9]*) find_rc=0 ;;
+    esac
+    cat >"$work/scan-postprocess.sh" <<'EOF'
+work=$1
+find_rc=$2
+scan_deadline=$3
+leak_id() {
+    printf '%s' "$1" | sha256sum | cut -c1-12 | sed 's/^/leak-/'
+}
+sanitize_find_error() {
+    error_line=$1
+    if [ "$error_line" = "find error output truncated" ]; then
+        printf '%s\n' "$error_line"
+        return
+    fi
+    error_path=$(printf '%s\n' "$error_line" | sed -nE "s#^find: ['‘](/[^:]*)['’]: .*#\\1#p")
+    if [ -z "$error_path" ]; then
+        error_path=$(printf '%s\n' "$error_line" | sed -nE 's#^find: (/[^:]*): .*#\1#p')
+    fi
+    if [ -n "$error_path" ]; then
+        leak_id "$error_path"
+    else
+        printf 'find error\n'
+    fi
+}
+exhausted_reasons=$(jq -s '[.[] | select(.kind == "exhausted") | .why] | unique' "$work/scan.ndjson" 2>/dev/null) || exhausted_reasons='[]'
+if [ "$find_rc" -eq 124 ]; then
+    exhausted_reasons=$(printf '%s' "$exhausted_reasons" | jq -c --arg why "the scan deadline of $scan_deadline seconds expired" '. + [$why] | unique')
+fi
+head -n 101 "$work/scan.err" >"$work/scan.err.head"
+truncated=false
+if awk 'NR == 101 { found = 1 } END { exit(found ? 0 : 1) }' "$work/scan.err.head"; then
+    truncated=true
+fi
+head -n 100 "$work/scan.err.head" >"$work/scan.err.processed"
+if [ "$truncated" = true ]; then
+    printf '%s\n' 'find error output truncated' >>"$work/scan.err.processed"
+fi
+if prepared=$(jq -s '
             {leak_paths: [.[] | select(.kind == "leak") | .path],
              unscanned: [.[] | select(.kind == "unscanned") | {path: (.path | @base64), why: .why}],
              unscanned_reasons: [.[] | select(.kind == "unscanned") | .why]}
         ' "$work/scan.ndjson") &&
-        leak_count=$(printf '%s' "$prepared" | jq '.leak_paths | length') &&
-        leak_ids=$(
-            printf '%s' "$prepared" | jq -r '.leak_paths[] | @base64' |
-                while IFS= read -r encoded_path; do
-                    path=$(printf '%s' "$encoded_path" | base64 -d) || exit 1
-                    leak_id "$path"
-                done | jq -Rn '[inputs]'
-        ) &&
-        unscanned_entries=$(
-            printf '%s' "$prepared" | jq -c '.unscanned[]' |
-                while IFS= read -r unscanned_record; do
-                    encoded_path=$(printf '%s' "$unscanned_record" | jq -r '.path')
-                    why=$(printf '%s' "$unscanned_record" | jq -r '.why')
-                    path=$(printf '%s' "$encoded_path" | base64 -d) || exit 1
-                    printf '%s (%s)\n' "$(leak_id "$path")" "$why"
-                done | jq -Rn '[inputs]'
-        ) &&
-        unscanned_reasons=$(printf '%s' "$prepared" | jq -c '.unscanned_reasons') &&
-        find_errors=$(
-            while IFS= read -r error_line || [ -n "$error_line" ]; do
-                [ -n "$error_line" ] || continue
-                sanitize_find_error "$error_line"
-            done <"$work/scan.err" | jq -Rn '[inputs]'
-        ) &&
-        scan_result=$(jq -n \
-            --argjson leaks "$leak_ids" \
-            --argjson leak_count "$leak_count" \
-            --argjson unscanned "$unscanned_entries" \
-            --argjson unscanned_reasons "$unscanned_reasons" \
-            --argjson find_errors "$find_errors" \
-            --argjson rc "$find_rc" '
-            {leaks: ($leaks[0:50]),
-             leak_count: $leak_count,
-             unscanned: ($unscanned + $find_errors
-                         + (if $rc != 0 and ($find_errors | length) == 0 then ["find exited \($rc)"] else [] end)),
-             reasons: (($unscanned_reasons
-                        + (if ($find_errors | length) > 0 then ["find error"] else [] end)
-                        + (if $rc != 0 and ($find_errors | length) == 0 then ["find exited \($rc)"] else [] end))
-                       | unique | join(", "))}'); then
-        :
+    leak_count=$(printf '%s' "$prepared" | jq '.leak_paths | length') &&
+    leak_ids=$(
+        printf '%s' "$prepared" | jq -r '.leak_paths[] | @base64' |
+            while IFS= read -r encoded_path; do
+                path=$(printf '%s' "$encoded_path" | base64 -d) || exit 1
+                leak_id "$path"
+            done | jq -Rn '[inputs]'
+    ) &&
+    unscanned_entries=$(
+        printf '%s' "$prepared" | jq -c '.unscanned[]' |
+            while IFS= read -r unscanned_record; do
+                encoded_path=$(printf '%s' "$unscanned_record" | jq -r '.path')
+                why=$(printf '%s' "$unscanned_record" | jq -r '.why')
+                path=$(printf '%s' "$encoded_path" | base64 -d) || exit 1
+                printf '%s (%s)\n' "$(leak_id "$path")" "$why"
+            done | jq -Rn '[inputs]'
+    ) &&
+    unscanned_reasons=$(printf '%s' "$prepared" | jq -c '.unscanned_reasons') &&
+    find_errors=$(
+        while IFS= read -r error_line || [ -n "$error_line" ]; do
+            [ -n "$error_line" ] || continue
+            sanitize_find_error "$error_line"
+        done <"$work/scan.err.processed" | jq -Rn '[inputs]'
+    ) &&
+    scan_result=$(jq -n \
+        --argjson leaks "$leak_ids" \
+        --argjson leak_count "$leak_count" \
+        --argjson unscanned "$unscanned_entries" \
+        --argjson unscanned_reasons "$unscanned_reasons" \
+        --argjson exhausted "$exhausted_reasons" \
+        --argjson find_errors "$find_errors" \
+        --argjson rc "$find_rc" '
+        {leaks: ($leaks[0:50]),
+         leak_count: $leak_count,
+         unscanned: ($unscanned + $exhausted + $find_errors
+                     + (if $rc != 0 and ($find_errors | length) == 0 then ["find exited \($rc)"] else [] end)),
+         reasons: (($unscanned_reasons + $exhausted
+                    + (if ($find_errors | length) > 0 then ["find error"] else [] end)
+                    + (if $rc != 0 and ($find_errors | length) == 0 then ["find exited \($rc)"] else [] end))
+                   | unique | join(", ")),
+         exhausted: ($exhausted | length) > 0,
+         exhausted_reasons: $exhausted}'); then
+    printf '%s\n' "$scan_result" >"$work/scan.result"
+else
+    scan_result=$(jq -n --argjson exhausted "$exhausted_reasons" '
+        {leaks: [], leak_count: 0, unscanned: ["the scan output could not be read"],
+         reasons: "the scan output could not be read",
+         exhausted: ($exhausted | length) > 0, exhausted_reasons: $exhausted}')
+    printf '%s\n' "$scan_result" >"$work/scan.result"
+fi
+EOF
+    postprocess_rc=0
+    scan_now=$(date +%s) || scan_now=0
+    case $scan_now in
+        '' | *[!0-9]*) scan_now=0 ;;
+    esac
+    scan_remaining=$((scan_deadline - scan_now))
+    if [ "$scan_remaining" -lt 1 ]; then
+        postprocess_rc=124
     else
-        scan_result='{"leaks": [], "leak_count": 0, "unscanned": ["the scan output could not be read"], "reasons": "the scan output could not be read"}'
+        timeout "$scan_remaining" sh "$work/scan-postprocess.sh" "$work" "$find_rc" "$SCAN_DEADLINE_SECONDS" >"$work/postprocess.out" 2>"$work/postprocess.err" || postprocess_rc=$?
+        scan_late=$(date +%s) || scan_late=0
+        case $scan_late in
+            '' | *[!0-9]*) scan_late=0 ;;
+        esac
+        if [ "$scan_late" -ge "$scan_deadline" ]; then
+            postprocess_rc=124
+        fi
+    fi
+    if [ "$postprocess_rc" -eq 124 ]; then
+        scan_result=$(jq -n --arg why "the scan deadline of $SCAN_DEADLINE_SECONDS seconds expired" '
+            {leaks: [], leak_count: 0, unscanned: [$why], reasons: $why,
+             exhausted: true, exhausted_reasons: [$why]}')
+    elif [ -s "$work/scan.result" ]; then
+        scan_result=$(cat "$work/scan.result")
+    else
+        scan_result='{"leaks": [], "leak_count": 0, "unscanned": ["the scan output could not be read"], "reasons": "the scan output could not be read", "exhausted": false, "exhausted_reasons": []}'
     fi
 }
 
@@ -1331,9 +1471,153 @@ step_J05() (
         if in_work_tree; then
             git_work_tree=true
         fi
-        (cd "$PROJECT" && find . -path ./.git -prune -o -type f -exec sha256sum --zero {} +) >"$work/sums" 2>"$work/sums.err"
+        cat >"$work/read-error.sh" <<'EOF'
+read_reason() {
+    reason=$(printf '%s\n' "$1" | sed -e '/^[[:space:]]*$/d' | tail -n 1)
+    case $reason in
+        *:*) reason=${reason##*: } ;;
+    esac
+    reason=$(printf '%s\n' "$reason" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    case $reason in
+        '') reason='cannot be read' ;;
+    esac
+    printf '%s\n' "$reason"
+}
+note_read_error() {
+    printf '%s: %s\n' "${1#./}" "$(read_reason "$2")" >>"$3"
+}
+EOF
+        cat >"$work/hash-project.sh" <<'EOF'
+project=$1
+work=$2
+file_max=$3
+total_max=$4
+hash_seconds=$5
+cd "$project" || exit 1
+: >"$work/sums"
+: >"$work/hash.rc"
+printf '0\n' >"$work/total"
+: >"$work/oversized"
+: >"$work/errors"
+: >"$work/inventory.err"
+cat >"$work/hash-file.sh" <<'HASH_FILE'
+work=$1
+file_max=$2
+total_max=$3
+hash_seconds=$4
+shift 4
+. "$work/read-error.sh"
+snapshot=$work/hash.snapshot
+abort() {
+    printf '%s\n' "$1" >"$work/hash.rc"
+    exit "$1"
+}
+if [ -s "$work/hash.rc" ]; then
+    exit 1
+fi
+total=$(cat "$work/total" 2>/dev/null) || abort 1
+case $total in
+    '' | *[!0-9]*) abort 1 ;;
+esac
+for f; do
+    if [ -L "$f" ] || [ ! -f "$f" ]; then
+        note_read_error "$f" "not a regular file" "$work/errors"
+        continue
+    fi
+    remaining=$((total_max - total))
+    if [ "$remaining" -lt 0 ]; then
+        abort 3
+    fi
+    cap=$file_max
+    if [ "$remaining" -lt "$cap" ]; then
+        cap=$remaining
+    fi
+    rm -f "$snapshot"
+    timeout "$hash_seconds" sh "$work/bounded-copy.sh" "$f" "$snapshot" "$cap" "$work/copy.err" \
+        >"$work/copy.bytes" 2>/dev/null
+    copy_rc=$?
+    bytes=$(cat "$work/copy.bytes" 2>/dev/null | tr -d '[:space:]') || bytes=
+    case $bytes in
+        '' | *[!0-9]*) bytes=0 ;;
+    esac
+    if [ "$copy_rc" -eq 124 ]; then
+        rm -f "$snapshot"
+        abort 124
+    fi
+    if [ "$copy_rc" -eq 0 ] || [ "$copy_rc" -eq 2 ]; then
+        total=$((total + bytes))
+        printf '%s\n' "$total" >"$work/total" || abort 1
+        if [ "$total" -gt "$total_max" ]; then
+            rm -f "$snapshot"
+            abort 3
+        fi
+    fi
+    if [ "$copy_rc" -eq 2 ]; then
+        rm -f "$snapshot"
+        if [ "$cap" -lt "$file_max" ]; then
+            abort 3
+        fi
+        printf '%s\n' "${f#./}" >>"$work/oversized"
+        continue
+    fi
+    if [ "$copy_rc" -ne 0 ]; then
+        note_read_error "$f" "$(cat "$work/copy.err" 2>/dev/null)" "$work/errors"
+        rm -f "$snapshot"
+        continue
+    fi
+    if ! line=$(timeout "$hash_seconds" sha256sum <"$snapshot" 2>>"$work/hash.err"); then
+        note_read_error "$f" "$(cat "$work/hash.err" 2>/dev/null)" "$work/errors"
+        rm -f "$snapshot"
+        continue
+    fi
+    hash=${line%% *}
+    if [ "${#hash}" -ne 64 ]; then
+        note_read_error "$f" "the checksum could not be read" "$work/errors"
+        rm -f "$snapshot"
+        continue
+    fi
+    case $hash in
+        *[!0-9a-f]*)
+            note_read_error "$f" "the checksum could not be read" "$work/errors"
+            rm -f "$snapshot"
+            continue
+            ;;
+    esac
+    printf '%s  %s\0' "$hash" "$f" >>"$work/sums" || abort 1
+done
+rm -f "$snapshot"
+exit 0
+HASH_FILE
+find_status=0
+{
+    find . -path ./.git -prune -o -type f -exec sh "$work/hash-file.sh" "$work" "$file_max" "$total_max" "$hash_seconds" {} +
+    printf '%s\n' "$?" >"$work/find.status"
+} 3>&1 >/dev/null 2>&3 3>&- | {
+    head -c 65536 >"$work/inventory.err"
+    cat >/dev/null
+}
+find_status=$(cat "$work/find.status" 2>/dev/null) || find_status=0
+case $find_status in
+    '' | *[!0-9]*) find_status=0 ;;
+esac
+hash_rc=$(cat "$work/hash.rc" 2>/dev/null) || hash_rc=
+if [ "$find_status" -ne 0 ]; then
+    case "$hash_rc" in
+        3) exit 3 ;;
+        124) exit 124 ;;
+        *) exit 1 ;;
+    esac
+fi
+if [ -n "$hash_rc" ]; then
+    exit "$hash_rc"
+fi
+exit 0
+EOF
+        rm -f "$work/sums" "$work/total" "$work/oversized" "$work/errors" "$work/inventory.err" "$work/hash.err" "$work/hash.rc" "$work/hash.snapshot" "$work/copy.err" "$work/copy.bytes" "$work/find.status"
+        timeout "$PROJECT_HASH_SECONDS" sh "$work/hash-project.sh" "$PROJECT" "$work" \
+            "$PROJECT_FILE_MAX_BYTES" "$PROJECT_TOTAL_MAX_BYTES" "$PROJECT_HASH_SECONDS" >/dev/null 2>"$work/hash.err"
         sums_rc=$?
-        files=$(jq -Rs '[split("\u0000")[] | select(. != "") | {sha256: .[0:64], path: (.[66:] | ltrimstr("./"))}] | sort_by(.path)' "$work/sums") || files='[]'
+        files=$(jq -Rs '[split("\u0000")[] | select(. != "") | {sha256: .[0:64], path: (.[66:] | ltrimstr("./"))}] | sort_by(.path)' "$work/sums" 2>/dev/null) || files='[]'
     else
         fail project_dir "$PROJECT is missing"
     fi
@@ -1343,8 +1627,16 @@ step_J05() (
         fail git_work_tree "$PROJECT is not a git work tree"
     fi
     total=$(printf '%s' "$files" | jq 'length')
-    if [ "$sums_rc" -ne 0 ]; then
-        fail files "$total files hashed, but some could not be read: $(head -n 3 "$work/sums.err" | tr '\n' ';')"
+    if [ "$sums_rc" -eq 3 ]; then
+        fail files "the project holds $(cat "$work/total" 2>/dev/null) bytes, over the $PROJECT_TOTAL_MAX_BYTES byte hashing budget"
+    elif [ "$sums_rc" -eq 124 ]; then
+        fail files "the hashing did not finish within $PROJECT_HASH_SECONDS seconds"
+    elif [ "$sums_rc" -ne 0 ]; then
+        fail files "the project inventory failed with status $sums_rc: $(head -c 512 "$work/inventory.err" 2>/dev/null | head -n 3 | tr '\n' ';')"
+    elif [ -s "$work/oversized" ]; then
+        fail files "a file is over the $PROJECT_FILE_MAX_BYTES byte cap: $(head -n 3 "$work/oversized" | tr '\n' ' ')"
+    elif [ -s "$work/errors" ]; then
+        fail files "$total files hashed, but some could not be read: $(head -n 3 "$work/errors" | tr '\n' ';')"
     elif [ "$total" -gt 0 ]; then
         pass files "$total files"
     else
@@ -1600,18 +1892,42 @@ step_J08() (
     fi
     env -0 | credential_variables probe >>"$work/variables.tsv"
     launch_files=0
-    for file in "$JACKIN_DIR"/env-*; do
-        [ -f "$file" ] || continue
-        launch_files=$((launch_files + 1))
-        sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$file" 2>/dev/null |
-            awk '{ printf "%s%c", $0, 0 }' | credential_variables launch_env >>"$work/variables.tsv"
-    done
+    launch_bad=
+    launch_problem=
+    if [ -d "$JACKIN_DIR" ] && LC_ALL=C ls -1 "$JACKIN_DIR" >"$work/launch.ls" 2>"$work/launch.ls.err"; then
+        for file in "$JACKIN_DIR"/env-*; do
+            if [ "$file" = "$JACKIN_DIR/env-*" ] && ! grep -Fxq -- 'env-*' "$work/launch.ls"; then
+                continue
+            fi
+            if [ -L "$file" ] || [ ! -f "$file" ]; then
+                launch_bad="$launch_bad ${file##*/}"
+                continue
+            fi
+            if ! bounded_read "$file" "$work/launch.env" "$LOG_BYTE_CAP" "$LOG_READ_SECONDS"; then
+                launch_bad="$launch_bad ${file##*/}"
+                continue
+            fi
+            launch_files=$((launch_files + 1))
+            sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$work/launch.env" |
+                awk '{ printf "%s%c", $0, 0 }' | credential_variables launch_env >>"$work/variables.tsv"
+        done
+    elif [ -d "$JACKIN_DIR" ] || [ -e "$JACKIN_DIR" ] || [ -L "$JACKIN_DIR" ] || ! [ -x "${JACKIN_DIR%/*}" ]; then
+        launch_problem="the launch environment directory $JACKIN_DIR could not be enumerated"
+    fi
+    if [ -n "$launch_bad" ]; then
+        launch_problem="${launch_problem:+$launch_problem; }the launch environment file(s)$launch_bad are not regular files readable within $LOG_BYTE_CAP bytes"
+    fi
     read_from="the probe environment, $launch_files launch env file(s)"
     unread_from=
+    if [ -n "$launch_problem" ]; then
+        unread_from="${unread_from:+$unread_from; }the launch environment could not be read: $launch_problem"
+    fi
     scan_leaks
     leaks=$(printf '%s' "$scan_result" | jq -c '.leaks')
     leak_count=$(printf '%s' "$scan_result" | jq -r '.leak_count')
     unscanned=$(printf '%s' "$scan_result" | jq -r '.unscanned | length')
+    exhausted=$(printf '%s' "$scan_result" | jq -r '.exhausted')
+    exhausted_text=$(printf '%s' "$scan_result" | jq -r '.exhausted_reasons | join(", ")')
     if [ "$unscanned" -gt 0 ]; then
         unscanned_text="$unscanned paths under $SCAN_ROOT not scanned ($(printf '%s' "$scan_result" | jq -r '.reasons')): $(printf '%s' "$scan_result" | jq -r '.unscanned[0:3] | join(", ")')"
         unread_from="${unread_from:+$unread_from; }$unscanned_text"
@@ -1717,6 +2033,11 @@ EOF
     elif [ "$AUTH_REQUIRED" = present ]; then
         auth_problem=1
     fi
+    if [ -n "$launch_problem" ]; then
+        fail launch_env "$launch_problem"
+    else
+        pass launch_env "$launch_files launch environment file(s) read within $LOG_BYTE_CAP bytes"
+    fi
     if [ "$placeholders" -eq 0 ] && [ "$auth_placeholders" -eq 0 ]; then
         skip credential "the sandbox holds no credential placeholder ($scope)"
     else
@@ -1754,6 +2075,8 @@ EOF
         esac
     elif [ "$agent_known" -ne 1 ]; then
         skip environment "the Codex environment is not known: the record at attempt $record_attempt holds no Codex environment"
+    elif [ -n "$launch_problem" ]; then
+        fail environment "the launch environment could not be read, so the credentials are unknown: $launch_problem"
     else
         pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
     fi
@@ -1772,7 +2095,9 @@ EOF
     else
         pass auth_file "the selected target auth file is absent"
     fi
-    if [ "$leaks" != '[]' ]; then
+    if [ "$exhausted" = true ]; then
+        fail file_scan "the scan did not finish: $exhausted_text"
+    elif [ "$leaks" != '[]' ]; then
         fail file_scan "token-shaped strings in $(printf '%s' "$leaks" | jq -r 'join(" ")')"
     elif [ "$unscanned" -gt 0 ]; then
         skip file_scan "$unscanned_text"
@@ -2611,6 +2936,45 @@ main() {
     work=$(mktemp -d) || exit 70
     trap 'rm -rf "$work"' EXIT
     trap 'exit 70' INT TERM HUP
+    cat >"$work/bounded-copy.sh" <<'EOF'
+copy_source=$1
+copy_target=$2
+copy_cap=$3
+copy_error=$4
+rm -f "$copy_target"
+if [ -L "$copy_source" ] || [ ! -f "$copy_source" ]; then
+    printf "dd: failed to read '%s': not a regular file\n" "$copy_source" >"$copy_error"
+    exit 1
+fi
+exec 9<"$copy_source" 2>>"$copy_error" || exit 1
+if ! [ -f /dev/fd/9 ]; then
+    printf "dd: failed to read '%s': not a regular file\n" "$copy_source" >"$copy_error"
+    exec 9<&-
+    exit 1
+fi
+copy_open=$(stat -Lc '%d %i' /dev/fd/9 2>/dev/null) || copy_open=
+copy_path=$(stat -c '%d %i' "$copy_source" 2>/dev/null) || copy_path=
+if [ -z "$copy_open" ] || [ -z "$copy_path" ] || [ "$copy_open" != "$copy_path" ]; then
+    printf "dd: failed to read '%s': the file changed while it was opened\n" "$copy_source" >"$copy_error"
+    exec 9<&-
+    exit 1
+fi
+if ! dd if=/dev/fd/9 of="$copy_target" bs=1048576 count=$((copy_cap + 1)) \
+    iflag=count_bytes,nonblock status=none 2>"$copy_error"; then
+    exec 9<&-
+    exit 1
+fi
+exec 9<&-
+copy_bytes=$(wc -c <"$copy_target" 2>/dev/null | tr -d '[:space:]') || exit 1
+case $copy_bytes in
+    '' | *[!0-9]*) exit 1 ;;
+esac
+printf '%s\n' "$copy_bytes"
+if [ "$copy_bytes" -gt "$copy_cap" ]; then
+    exit 2
+fi
+exit 0
+EOF
     for id in $ALL_STEPS; do
         selected "$id" || continue
         : >"$work/checks"
