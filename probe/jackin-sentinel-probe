@@ -39,6 +39,7 @@ RUN_STATE_FILE=$JACKIN_DIR/run/state
 RECORD_MAX=65536
 SCAN_ROOT=/sandbox
 SCAN_MAX_KIB=262144
+AGENT_HOME_MAX_BYTES=1048576
 SCAN_GREP_SECONDS=20
 LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
 LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
@@ -446,7 +447,7 @@ EOF
         (
             ulimit -f 128
             cd "$PROJECT" || exit 1
-            timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
+            CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
         )
         tool_exit=$?
         events=$(jq -Rs '[split("\n")[] | select(length > 0) | fromjson?]' "$work/tool.out" 2>/dev/null) || events='[]'
@@ -493,11 +494,48 @@ EOF
                  workdir: $workdir, observation: $observation}}'
 }
 
+copy_bounded() {
+    copy_src=$1
+    copy_dst=$2
+    [ -f "$copy_src" ] || return 1
+    timeout 10 head -c $((AGENT_HOME_MAX_BYTES + 1)) -- "$copy_src" >"$copy_dst" || return 1
+    [ -f "$copy_dst" ] || return 1
+    copy_bytes=$(wc -c <"$copy_dst" 2>/dev/null | tr -d '[:space:]') || return 1
+    case $copy_bytes in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ "$copy_bytes" -le "$AGENT_HOME_MAX_BYTES" ] || return 1
+}
+
+stage_agent_home() {
+    stage_dir=$work/agent-home
+    rm -rf "$stage_dir" 2>/dev/null || return 1
+    mkdir -p "$stage_dir" 2>/dev/null || return 1
+    if [ -e "$AUTH_FILE" ] || [ -L "$AUTH_FILE" ]; then
+        [ -f "$AUTH_FILE" ] || return 1
+        stage_name=${AUTH_FILE##*/}
+        case $stage_name in
+            '' | . | ..) return 1 ;;
+        esac
+        copy_bounded "$AUTH_FILE" "$stage_dir/$stage_name" || return 1
+    fi
+    stage_config=${AUTH_FILE%/*}/config.toml
+    if [ -f "$stage_config" ]; then
+        copy_bounded "$stage_config" "$stage_dir/config.toml" || return 1
+    fi
+    return 0
+}
+
 ensure_agent_exec() {
     [ -f "$work/agent_exec.json" ] && return 0
     launch_kind=none
     why="the sandbox holds no credential"
-    cred_path="$AUTH_FILE"
+    if stage_agent_home; then
+        staged=1
+    else
+        staged=0
+    fi
+    cred_path="$work/agent-home/${AUTH_FILE##*/}"
     unsafe=
     if [ -e "$cred_path" ] || [ -L "$cred_path" ]; then
         kinds=$(token_kinds "$cred_path") || kinds="other other other"
@@ -582,7 +620,10 @@ EOF
         inspection_unavailable=1
     fi
     [ "$has_other" = 0 ] || unsafe=1
-    if [ -n "$unsafe" ]; then
+    if [ "$staged" -eq 0 ]; then
+        launch_kind=none
+        why="codex exec was not run: could not stage the validated credential home"
+    elif [ -n "$unsafe" ]; then
         why="codex exec was not run: the sandbox holds a credential that is not a full placeholder, and codex would send it"
     elif [ -n "$inspection_unavailable" ]; then
         why="codex exec was not run: could not inspect inherited credentials"
@@ -596,6 +637,9 @@ EOF
         launch_kind=api_key
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
+    fi
+    if [ "$launch_kind" = none ]; then
+        rm -rf "$work/agent-home" 2>/dev/null
     fi
     printf '%s' "$why" >"$work/agent_exec.why"
     unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
@@ -621,7 +665,7 @@ EOF
             exec 3>&1 || exit 1
             (
                 _jks_stdout_producer_status=0
-                if (cd "$SCAN_ROOT" && timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
+                if (cd "$SCAN_ROOT" && CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
                     :
                 else
                     _jks_stdout_producer_status=$?

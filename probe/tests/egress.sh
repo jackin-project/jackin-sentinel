@@ -175,9 +175,19 @@ zai_spec() {
 zai_says() {
     adapter=$1
     agent=$2
+    provider_url=$3
     cat >"$t/bin/$agent" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
+token=
+if [ -n "\${CODEX_HOME-}" ] && [ -f "\${CODEX_HOME}/auth.json" ]; then
+    token=\$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "\${CODEX_HOME}/auth.json" 2>/dev/null) || token=
+fi
+if [ -n "\$token" ]; then
+    printf '%s\n' "\$token" >>"$t/agent.credential"
+    printf 'Authorization: Bearer %s\n' "\$token" >"$t/agent.header"
+    curl -q -s --noproxy '*' -o /dev/null -H "@$t/agent.header" "$provider_url" >/dev/null 2>&1 </dev/null
+fi
 case " \$* " in
     *"Use one shell tool"*)
         printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
@@ -209,6 +219,21 @@ codex_says() {
     cat >"$t/bin/codex" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
+token=
+if [ -n "\${CODEX_HOME-}" ] && [ -f "\${CODEX_HOME}/auth.json" ]; then
+    token=\$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "\${CODEX_HOME}/auth.json" 2>/dev/null) || token=
+fi
+if [ -n "\$token" ]; then
+    printf '%s\n' "\$token" >>"$t/agent.credential"
+    printf 'Authorization: Bearer %s\n' "\$token" >"$t/agent.header"
+    curl -q -s --noproxy '*' -o /dev/null -H "@$t/agent.header" "$PROVIDER" >/dev/null 2>&1 </dev/null
+fi
+if [ -n "\${CODEX_HOME-}" ] && [ -f "\${CODEX_HOME}/config.toml" ]; then
+    model=\$(jq -R -r 'first(capture("^[[:space:]]*model[[:space:]]*=[[:space:]]*\"(?<v>[^\"]*)\"")? | .v) // empty' "\${CODEX_HOME}/config.toml" 2>/dev/null) || model=
+    if [ -n "\$model" ]; then
+        printf 'config-model=%s\n' "\$model" >>"$t/agent.credential"
+    fi
+fi
 case " \$* " in
     *"Use one shell tool"*)
         printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
@@ -414,6 +439,22 @@ expect_codex_not_run() {
     [ ! -e "$t/codex.ran" ] || problems="$problems codex-ran"
 }
 
+hostile_codex_home() {
+    mkdir -p "$t/hostile"
+    printf '%s\n' "{\"tokens\":{\"access_token\":\"$HOSTILE_TOKEN\"}}" >"$t/hostile/auth.json"
+}
+
+expect_agent_credential() {
+    want=$1
+    got=$(sort -u "$t/agent.credential" 2>/dev/null | tr '\n' ' ')
+    [ "$got" = "$want " ] || problems="$problems agent-credential=[$got](want [$want ])"
+}
+
+expect_no_agent_credential() {
+    got=$(sort -u "$t/agent.credential" 2>/dev/null | tr '\n' ' ')
+    [ -z "$got" ] || problems="$problems agent-credential=[$got](want none)"
+}
+
 bounded() {
     limit=$1
     shift
@@ -522,6 +563,7 @@ PLACEHOLDER=openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN
 PLACEHOLDER_SHOWN='openshel*********************************OKEN'
 API_PLACEHOLDER=openshell:resolve:env:OPENAI_API_KEY
 API_PLACEHOLDER_SHOWN='openshel************************_KEY'
+HOSTILE_TOKEN=synthetic-hostile-home-token-0123456789
 python_bin=$(command -v python3) || exit 70
 case "$python_bin" in
     /*) ;;
@@ -841,6 +883,85 @@ expect agent_reaches_api PASS 'codex exec answered'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
 finish_case
 
+mk j09_the_staged_home_supplies_the_declared_credential
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_the_staged_home_supplies_the_declared_credential step_J09 ''
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
+expect_agent_credential "$PLACEHOLDER"
+expect_never_sent "$HOSTILE_TOKEN"
+expect_absent_from_report "$HOSTILE_TOKEN"
+finish_case
+
+mk j09_a_hostile_codex_home_is_not_the_credential_source
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
+hostile_codex_home
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_a_hostile_codex_home_is_not_the_credential_source step_J09 '' "CODEX_HOME=$t/hostile"
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
+expect_agent_credential "$PLACEHOLDER"
+expect_never_sent "$HOSTILE_TOKEN"
+expect_sent "Authorization: Bearer $PLACEHOLDER"
+expect_absent_from_report "$HOSTILE_TOKEN"
+finish_case
+
+mk j09_environment_only_credentials_ignore_the_hostile_codex_home
+with_curl
+codex_says 'ready' 0
+hostile_codex_home
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_environment_only_credentials_ignore_the_hostile_codex_home step_J09 '' "OPENAI_API_KEY=$API_PLACEHOLDER" "CODEX_HOME=$t/hostile"
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true api_key'
+expect_no_agent_credential
+expect_never_sent "$HOSTILE_TOKEN"
+expect_absent_from_report "$HOSTILE_TOKEN"
+finish_case
+
+mk j09_environment_only_credentials_keep_the_provider_config
+with_curl
+codex_says 'ready' 0
+mkdir -p "$t/sandbox/.codex"
+printf '%s\n' 'model = "synthetic-config-model"' >"$t/sandbox/.codex/config.toml"
+hostile_codex_home
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_environment_only_credentials_keep_the_provider_config step_J09 '' "OPENAI_API_KEY=$API_PLACEHOLDER" "CODEX_HOME=$t/hostile"
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true api_key'
+[ -e "$t/codex.ran" ] || problems="$problems codex-not-run"
+expect_agent_credential 'config-model=synthetic-config-model'
+expect_never_sent "$HOSTILE_TOKEN"
+expect_absent_from_report "$HOSTILE_TOKEN"
+finish_case
+
+mk j09_an_unstageable_auth_file_stops_codex
+with_curl
+codex_says 'ready' 0
+mkdir -p "$t/sandbox/.codex/auth.json"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_an_unstageable_auth_file_stops_codex step_J09 '' "CODEX_AUTH_ACCESS_TOKEN=$PLACEHOLDER"
+expect agent_reaches_api SKIP 'could not stage the validated credential home'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
+expect_codex_not_run
+expect_never_sent "$HOSTILE_TOKEN"
+finish_case
+
 mk j09_an_empty_access_token_in_auth_json_does_not_hide_the_api_key
 with_curl
 codex_says 'ready' 0
@@ -1038,7 +1159,7 @@ zai_case() {
     zai_provider_url=$7
     zai_auth_state=$8
     zai_fingerprint=$9
-    zai_says "$zai_adapter" "$zai_agent"
+    zai_says "$zai_adapter" "$zai_agent" "$zai_provider_url"
     with_curl
     answer "$OUTSIDE" 7 000
     answer "$METADATA" 7 000
@@ -1107,6 +1228,19 @@ for tuple in T09 T14 T18; do
     expect_never_sent "$host_key"
     finish_case
 done
+
+mk T18_a_hostile_codex_home_is_not_the_credential_source
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+hostile_codex_home
+begin T18_a_hostile_codex_home_is_not_the_credential_source step_J09 '' "ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY" "CODEX_HOME=$t/hostile"
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.credential) \(.tool.attempted) \(.tool.succeeded)"' 'static_key true true'
+expect_no_agent_credential
+expect_never_sent "$HOSTILE_TOKEN"
+expect_absent_from_report "$HOSTILE_TOKEN"
+finish_case
 
 mk T14_declared_auth_other_is_not_executed
 host_key=synthetic-T14-host-key-0123456789
