@@ -1517,6 +1517,38 @@ else
     echo "skip j06_physical_symlink_case: running as root"
 fi
 
+mk j06_a_setup_log_over_the_byte_cap_fails_setup_runs
+hook_tree
+mkdir -p "$t/sandbox/.sentinel"
+head -c 1048577 /dev/zero | tr '\000' 'a' >"$t/sandbox/.sentinel/setup.log"
+printf 'preflight ok flag=0\n' >"$t/sandbox/.sentinel/preflight.log"
+chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+begin j06_a_setup_log_over_the_byte_cap_fails_setup_runs sh "$t/probe" --only J06
+chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+expect_rc 0
+expect_report J06 sandbox
+expect setup_runs FAIL 'readable within 1048576 bytes'
+expect preflight_runs PASS 'preflight ran 1 times, 0 failed'
+fact '.setup_runs' 0
+fact '.preflight_runs' 1
+finish_case
+
+mk j06_a_fifo_preflight_log_fails_preflight_runs_without_blocking
+hook_tree
+mkdir -p "$t/sandbox/.sentinel"
+printf 'setup launch=L1 flag=unset\n' >"$t/sandbox/.sentinel/setup.log"
+mkfifo "$t/sandbox/.sentinel/preflight.log"
+chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+begin j06_a_fifo_preflight_log_fails_preflight_runs_without_blocking sh "$t/probe" --only J06
+chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+expect_rc 0
+expect_report J06 sandbox
+expect preflight_runs FAIL 'readable within 1048576 bytes'
+expect setup_runs PASS 'setup ran once'
+fact '.preflight_runs' 0
+fact '.setup_runs' 1
+finish_case
+
 mk only_rejects_whitespace
 begin only_rejects_whitespace sh "$t/probe" --only 'J04 J05'
 expect_usage
@@ -2242,6 +2274,21 @@ if mkdir -p "$t/sandbox/.sentinel" &&
     finish_case
 else
     setup_failed j14_existing_marker_with_byte_34_nul_does_not_disclose_its_id
+fi
+
+mk j14_a_fifo_marker_fails_the_step
+if mkdir -p "$t/sandbox/.sentinel" &&
+    printf '%s\n' '01234567-89ab-cdef-0123-456789abcdef' >"$t/proc/sys/kernel/random/boot_id" &&
+    mkfifo "$t/sandbox/.sentinel/marker"; then
+    begin j14_a_fifo_marker_fails_the_step sh "$t/probe" --only J14
+    expect_rc 0
+    expect_report J14 sandbox
+    expect marker FAIL 'is not a regular file'
+    fact '.marker.id' ''
+    fact '.marker.created' false
+    finish_case
+else
+    setup_failed j14_a_fifo_marker_fails_the_step
 fi
 
 mk j05_parent_repository_is_not_the_project_repository

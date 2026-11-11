@@ -41,6 +41,8 @@ SCAN_ROOT=/sandbox
 SCAN_MAX_KIB=262144
 AGENT_HOME_MAX_BYTES=1048576
 SCAN_GREP_SECONDS=20
+LOG_BYTE_CAP=1048576
+LOG_READ_SECONDS=10
 LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
 LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
 ID_TOKEN_HEADER=$(printf '%s' 'eyJhbGci' 'OiJub25l' 'IiwidHlw' 'IjoiSldU' 'In0')
@@ -123,20 +125,55 @@ require_sandbox() {
     exit 66
 }
 
-count_lines() {
-    if [ -f "$1" ]; then
-        wc -l <"$1" | tr -d ' '
-    else
-        echo 0
+log_snapshot() {
+    log_source=$1
+    log_target=$2
+    rm -f "$log_target"
+    if [ -L "$log_source" ]; then
+        return 1
     fi
+    if [ ! -e "$log_source" ]; then
+        : >"$log_target"
+        return 0
+    fi
+    if [ ! -f "$log_source" ]; then
+        return 1
+    fi
+    if ! timeout "$LOG_READ_SECONDS" head -c $((LOG_BYTE_CAP + 1)) -- "$log_source" >"$log_target" 2>/dev/null; then
+        rm -f "$log_target"
+        return 1
+    fi
+    log_bytes=$(wc -c <"$log_target" 2>/dev/null | tr -d '[:space:]') || log_bytes=
+    case $log_bytes in
+        '' | *[!0-9]*)
+            rm -f "$log_target"
+            return 1
+            ;;
+    esac
+    if [ "$log_bytes" -gt "$LOG_BYTE_CAP" ]; then
+        rm -f "$log_target"
+        return 1
+    fi
+    return 0
+}
+
+count_lines() {
+    if log_snapshot "$1" "$work/log.lines"; then
+        wc -l <"$work/log.lines" | tr -d ' '
+        return 0
+    fi
+    echo 0
+    return 1
 }
 
 count_matches() {
-    n=0
-    if [ -f "$2" ]; then
-        n=$(grep -c "$1" "$2" 2>/dev/null)
+    if log_snapshot "$2" "$work/log.matches"; then
+        n=$(grep -c "$1" "$work/log.matches" 2>/dev/null) || n=0
+        echo "${n:-0}"
+        return 0
     fi
-    echo "${n:-0}"
+    echo 0
+    return 1
 }
 
 file_meta() {
@@ -1318,9 +1355,11 @@ step_J05() (
 )
 
 step_J06() (
-    setup_runs=$(count_lines "$STATE_DIR/setup.log")
-    preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
-    preflight_failures=$(count_matches '^preflight fail' "$STATE_DIR/preflight.log")
+    setup_log_read=readable
+    preflight_log_read=readable
+    setup_runs=$(count_lines "$STATE_DIR/setup.log") || setup_log_read=unreadable
+    preflight_runs=$(count_lines "$STATE_DIR/preflight.log") || preflight_log_read=unreadable
+    preflight_failures=$(count_matches '^preflight fail' "$STATE_DIR/preflight.log") || preflight_log_read=unreadable
     : >"$work/hooks.ndjson"
     exposed=
     for name in setup preflight; do
@@ -1347,12 +1386,16 @@ EOF
         jq -cn --arg name "$name" --arg path "$path" --argjson uid "$uid" --arg mode "$mode" --argjson writable "$writable" \
             '{name: $name, path: $path, uid: $uid, mode: $mode, writable: $writable}' >>"$work/hooks.ndjson"
     done
-    if [ "$setup_runs" = 1 ]; then
+    if [ "$setup_log_read" != readable ]; then
+        fail setup_runs "the setup log is not a regular file readable within $LOG_BYTE_CAP bytes"
+    elif [ "$setup_runs" = 1 ]; then
         pass setup_runs "setup ran once"
     else
         fail setup_runs "setup ran $setup_runs times, expected once"
     fi
-    if [ "$preflight_runs" -ge 1 ]; then
+    if [ "$preflight_log_read" != readable ]; then
+        fail preflight_runs "the preflight log is not a regular file readable within $LOG_BYTE_CAP bytes"
+    elif [ "$preflight_runs" -ge 1 ]; then
         pass preflight_runs "preflight ran $preflight_runs times, $preflight_failures failed"
     else
         fail preflight_runs "preflight never ran"
@@ -1992,21 +2035,40 @@ step_J13() (
         "$JQN"'{project: $project, work_tree: $work_tree, branch: ($branch | n), head: ($head | n), branches: $branches, clean: $clean, stash: $stash}' >"$work/facts"
 )
 
+marker_state_of() {
+    if [ -L "$1" ]; then
+        echo symlink
+    elif [ -e "$1" ]; then
+        if [ -f "$1" ]; then
+            echo regular
+        else
+            echo irregular
+        fi
+    else
+        echo absent
+    fi
+}
+
 step_J14() (
     boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
     marker=$STATE_DIR/marker
     mkdir -p "$STATE_DIR" 2>/dev/null
-    raw_id=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    raw_id=
     id=
     created=false
-    if (
-        set -C
-        printf '%s\n' "$raw_id" >"$marker"
-    ) 2>/dev/null; then
-        created=true
-    else
-        raw_id=
-        marker_bytes=$(od -An -N34 -v -tx1 "$marker" 2>/dev/null) || marker_bytes=
+    marker_state=$(marker_state_of "$marker")
+    if [ "$marker_state" = absent ]; then
+        candidate=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+        # shellcheck disable=SC2016
+        if timeout 5 sh -c 'set -C; printf "%s\n" "$1" >"$2"' sh "$candidate" "$marker" 2>/dev/null; then
+            created=true
+            raw_id=$candidate
+        else
+            marker_state=$(marker_state_of "$marker")
+        fi
+    fi
+    if [ "$created" != true ] && [ "$marker_state" = regular ]; then
+        marker_bytes=$(timeout 5 od -An -N34 -v -tx1 "$marker" 2>/dev/null) || marker_bytes=
         marker_bytes=$(printf '%s' "$marker_bytes" | tr -d '[:space:]')
         if printf '%s' "$marker_bytes" | grep -qE '^((3[0-9]|6[1-6]){32})(0a)?$'; then
             raw_id=$(printf '%s' "$marker_bytes" | awk '
@@ -2018,9 +2080,13 @@ step_J14() (
             ')
         fi
     fi
-    setup_runs=$(count_lines "$STATE_DIR/setup.log")
-    preflight_runs=$(count_lines "$STATE_DIR/preflight.log")
-    if printf '%s' "$raw_id" | grep -qE '^[0-9a-f]{32}$'; then
+    setup_log_read=readable
+    preflight_log_read=readable
+    setup_runs=$(count_lines "$STATE_DIR/setup.log") || setup_log_read=unreadable
+    preflight_runs=$(count_lines "$STATE_DIR/preflight.log") || preflight_log_read=unreadable
+    if [ "$marker_state" = symlink ] || [ "$marker_state" = irregular ]; then
+        fail marker "the marker file $marker is not a regular file"
+    elif printf '%s' "$raw_id" | grep -qE '^[0-9a-f]{32}$'; then
         id=$raw_id
         pass marker "created=$created id=$id"
     else
@@ -2030,6 +2096,11 @@ step_J14() (
         pass boot_id "$boot_id"
     else
         fail boot_id "/proc/sys/kernel/random/boot_id is unreadable"
+    fi
+    if [ "$setup_log_read" != readable ] || [ "$preflight_log_read" != readable ]; then
+        fail hook_logs "the hook logs are not regular files readable within $LOG_BYTE_CAP bytes"
+    else
+        pass hook_logs "the hook logs are readable"
     fi
     jq -n --arg boot_id "$boot_id" --arg path "$marker" --arg id "$id" --argjson created "$created" \
         --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
