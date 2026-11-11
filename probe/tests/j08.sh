@@ -1737,6 +1737,33 @@ sudo_shim() {
     chmod +x "$t/bin/sudo"
 }
 
+sudo_mixed_shim() {
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\ncase "$*" in\n    "-n true") exit 1 ;;\n    "-n -l") echo "sudo: a password is required"; exit 1 ;;\n    "-n /bin/sh") exit 0 ;;\nesac\nexit 1\n' >"$t/bin/sudo"
+    chmod +x "$t/bin/sudo"
+}
+
+sudo_passworded_shim() {
+    mkdir -p "$t/bin"
+    printf '#!/bin/sh\ncase "$*" in\n    "-n true") exit 1 ;;\n    "-n -l") echo "    (root) ALL"; exit 0 ;;\nesac\nexit 1\n' >"$t/bin/sudo"
+    chmod +x "$t/bin/sudo"
+}
+
+id_shim() {
+    mkdir -p "$t/bin"
+    cat >"$t/bin/id" <<EOF
+#!/bin/sh
+case "\$*" in
+    -un) echo sandbox ;;
+    -u) echo 1000 ;;
+    -g) echo 1000 ;;
+    -G) echo $1 ;;
+    *) exec $real_id "\$@" ;;
+esac
+EOF
+    chmod +x "$t/bin/id"
+}
+
 mk j04_a_passwordless_grant_other_than_true_fails_the_sudo_check
 sudo_shim 1 0
 begin j04_a_passwordless_grant_other_than_true_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
@@ -1755,20 +1782,58 @@ expect sudo FAIL 'sudo works'
 fact '.sudo.works' true
 finish_case
 
-mk j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check
-sudo_shim 1 1
-begin j04_a_sudo_without_a_passwordless_grant_passes_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
+mk j04_a_mixed_passwordless_sudo_policy_fails_the_sudo_check
+sudo_mixed_shim
+begin j04_a_mixed_passwordless_sudo_policy_fails_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
 expect_rc 0
 expect_report J04 sandbox
-expect sudo PASS 'found=true works=false'
+expect sudo FAIL 'the sudo policy could not be listed'
+fact '.sudo.found' true
 fact '.sudo.works' false
+finish_case
+
+mk j04_a_sandbox_without_sudo_passes_the_sudo_check
+begin j04_a_sandbox_without_sudo_passes_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect sudo PASS 'policy=absent'
+fact '.sudo.found' false
+fact '.sudo.works' false
+finish_case
+
+mk j04_a_passworded_sudo_policy_passes_the_sudo_check
+sudo_passworded_shim
+begin j04_a_passworded_sudo_policy_passes_the_sudo_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect sudo PASS 'policy=passworded'
+fact '.sudo.found' true
+fact '.sudo.works' false
+finish_case
+
+mk j04_a_supplementary_group_fails_the_identity_check
+id_shim '1000 0'
+begin j04_a_supplementary_group_fails_the_identity_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect identity FAIL 'groups'
+detail_contains identity 'groups=0 1000'
+finish_case
+
+mk j04_a_expected_group_set_passes_the_identity_check
+id_shim '1000'
+begin j04_a_expected_group_set_passes_the_identity_check env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J04
+expect_rc 0
+expect_report J04 sandbox
+expect identity PASS 'groups=1000'
+detail_contains identity 'groups=1000'
 finish_case
 
 hook_tree() {
     mkdir -p "$t/hookroot/lib/hooks"
     : >"$t/hookroot/lib/hooks/setup"
     : >"$t/hookroot/lib/hooks/preflight"
-    chmod 444 "$t/hookroot/lib/hooks/setup" "$t/hookroot/lib/hooks/preflight"
+    chmod 555 "$t/hookroot/lib/hooks/setup" "$t/hookroot/lib/hooks/preflight"
     seam HOOK_DIR "$t/hookroot/lib/hooks"
     seam HOOK_TOP "$t/hookroot"
 }
@@ -1808,7 +1873,7 @@ if [ "$(id -u)" -ne 0 ]; then
 #!/bin/sh
 for last; do :; done
 case \$last in
-    */hookroot/lib/hooks/setup | */hookroot/lib/hooks/preflight) printf '0 444\\n' ;;
+    */hookroot/lib/hooks/setup | */hookroot/lib/hooks/preflight) printf '0 555\\n' ;;
     *) exec $real_stat "\$@" ;;
 esac
 EOF
@@ -1858,6 +1923,66 @@ EOF
 else
     echo "skip j06_physical_symlink_case: running as root"
 fi
+
+mk j06_a_hook_without_the_execute_bit_is_exposed
+mkdir -p "$t/hookroot/lib/hooks" "$t/sandbox/.sentinel"
+printf 'setup launch=L1 flag=unset\n' >"$t/sandbox/.sentinel/setup.log"
+printf 'preflight ok flag=0\n' >"$t/sandbox/.sentinel/preflight.log"
+: >"$t/hookroot/lib/hooks/setup"
+: >"$t/hookroot/lib/hooks/preflight"
+chmod 444 "$t/hookroot/lib/hooks/setup" "$t/hookroot/lib/hooks/preflight"
+chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+seam HOOK_DIR "$t/hookroot/lib/hooks"
+seam HOOK_TOP "$t/hookroot"
+mkdir -p "$t/bin"
+real_stat=$(command -v stat)
+cat >"$t/bin/stat" <<EOF
+#!/bin/sh
+for last; do :; done
+case \$last in
+    */hookroot/lib/hooks/setup | */hookroot/lib/hooks/preflight) printf '0 444\\n' ;;
+    *) exec $real_stat "\$@" ;;
+esac
+EOF
+chmod +x "$t/bin/stat"
+begin j06_a_hook_without_the_execute_bit_is_exposed env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J06
+chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+expect_rc 0
+expect_report J06 sandbox
+expect hooks_immutable FAIL 'not-executable'
+detail_contains hooks_immutable 'setup(not-executable)'
+detail_contains hooks_immutable 'preflight(not-executable)'
+hook_writable false,false
+finish_case
+
+mk j06_a_hook_directory_is_exposed
+mkdir -p "$t/hookroot/lib/hooks/setup" "$t/sandbox/.sentinel"
+printf 'setup launch=L1 flag=unset\n' >"$t/sandbox/.sentinel/setup.log"
+printf 'preflight ok flag=0\n' >"$t/sandbox/.sentinel/preflight.log"
+: >"$t/hookroot/lib/hooks/preflight"
+chmod 555 "$t/hookroot/lib/hooks/setup" "$t/hookroot/lib/hooks/preflight"
+chmod 555 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+seam HOOK_DIR "$t/hookroot/lib/hooks"
+seam HOOK_TOP "$t/hookroot"
+mkdir -p "$t/bin"
+real_stat=$(command -v stat)
+cat >"$t/bin/stat" <<EOF
+#!/bin/sh
+for last; do :; done
+case \$last in
+    */hookroot/lib/hooks/setup | */hookroot/lib/hooks/preflight) printf '0 755\\n' ;;
+    *) exec $real_stat "\$@" ;;
+esac
+EOF
+chmod +x "$t/bin/stat"
+begin j06_a_hook_directory_is_exposed env PATH="$t/bin:$scratch/shim:$scratch/tools" sh "$t/probe" --only J06
+chmod 755 "$t/hookroot/lib/hooks" "$t/hookroot/lib" "$t/hookroot"
+expect_rc 0
+expect_report J06 sandbox
+expect hooks_immutable FAIL 'not-a-regular-file'
+detail_contains hooks_immutable 'setup(not-a-regular-file)'
+hook_writable false,false
+finish_case
 
 mk j06_a_setup_log_over_the_byte_cap_fails_setup_runs
 hook_tree

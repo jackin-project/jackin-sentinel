@@ -1427,28 +1427,64 @@ step_J04() (
     user=$(id -un)
     uid=$(id -u)
     gid=$(id -g)
+    group_ids=$(id -G 2>/dev/null || true)
+    groups=
+    groups_readable=true
+    if [ -z "$group_ids" ]; then
+        groups_readable=false
+    else
+        for group_id in $group_ids; do
+            case $group_id in
+                *[!0-9]*)
+                    groups_readable=false
+                    ;;
+                *)
+                    groups="$groups $group_id"
+                    ;;
+            esac
+        done
+    fi
+    if [ "$groups_readable" = true ]; then
+        groups=$(printf '%s' "$groups" | tr ' ' '\n' | sed '/^$/d' | LC_ALL=C sort -n | tr '\n' ' ')
+        groups=${groups% }
+    else
+        groups=unreadable
+    fi
     home=${HOME-}
     sudo_found=false
     sudo_works=false
+    sudo_policy=absent
     docker_binary=false
     if have sudo; then
         sudo_found=true
-        if timeout 5 sudo -n true >/dev/null 2>&1 </dev/null || timeout 5 sudo -n -l >/dev/null 2>&1 </dev/null; then
+        if timeout 5 sudo -n true >/dev/null 2>&1 </dev/null; then
             sudo_works=true
+            sudo_policy=passwordless
+        elif timeout 5 sudo -n -l >"$work/sudo.list" 2>&1 </dev/null; then
+            if grep -q 'NOPASSWD' "$work/sudo.list"; then
+                sudo_works=true
+                sudo_policy=passwordless
+            else
+                sudo_policy=passworded
+            fi
+        else
+            sudo_policy=unlistable
         fi
     fi
     if have docker; then
         docker_binary=true
     fi
-    if [ "$user" = sandbox ] && [ "$uid" = 1000 ] && [ "$gid" = 1000 ]; then
-        pass identity "$user uid=$uid gid=$gid"
+    if [ "$user" = sandbox ] && [ "$uid" = 1000 ] && [ "$gid" = 1000 ] && [ "$groups" = 1000 ]; then
+        pass identity "$user uid=$uid gid=$gid groups=$groups"
     else
-        fail identity "expected sandbox uid=1000 gid=1000, found $user uid=$uid gid=$gid"
+        fail identity "expected sandbox uid=1000 gid=1000 groups=1000, found $user uid=$uid gid=$gid groups=$groups"
     fi
-    if [ "$sudo_works" = false ]; then
-        pass sudo "sudo found=$sudo_found works=false"
-    else
+    if [ "$sudo_works" = true ]; then
         fail sudo "sudo works"
+    elif [ "$sudo_policy" = unlistable ]; then
+        fail sudo "the sudo policy could not be listed"
+    else
+        pass sudo "sudo found=$sudo_found works=false policy=$sudo_policy"
     fi
     if [ "$docker_binary" = true ] && [ "$docker" = off ]; then
         fail docker_binary "a docker binary exists but the Docker capability is off"
@@ -1672,8 +1708,20 @@ EOF
         if { [ -n "$physical" ] && path_or_ancestor_writable "$physical" "$physical_top"; } || path_or_ancestor_writable "$path" "$HOOK_TOP"; then
             writable=true
         fi
-        if [ ! -e "$path" ] || [ "$symlinked" = true ] || [ "$writable" = true ] || [ "$uid" != 0 ]; then
-            exposed="$exposed $name"
+        regular=false
+        [ -f "$path" ] && regular=true
+        executable=false
+        [ -x "$path" ] && executable=true
+        reasons=
+        [ -e "$path" ] || reasons="$reasons missing"
+        [ "$symlinked" = true ] && reasons="$reasons symlinked"
+        [ "$regular" = true ] || reasons="$reasons not-a-regular-file"
+        [ "$executable" = true ] || reasons="$reasons not-executable"
+        [ "$writable" = true ] && reasons="$reasons writable"
+        [ "$uid" = 0 ] || reasons="$reasons not-root-owned"
+        reasons=${reasons# }
+        if [ -n "$reasons" ]; then
+            exposed="$exposed $name($reasons)"
         fi
         jq -cn --arg name "$name" --arg path "$path" --argjson uid "$uid" --arg mode "$mode" --argjson writable "$writable" \
             '{name: $name, path: $path, uid: $uid, mode: $mode, writable: $writable}' >>"$work/hooks.ndjson"
@@ -1693,9 +1741,9 @@ EOF
         fail preflight_runs "preflight never ran"
     fi
     if [ -z "$exposed" ]; then
-        pass hooks_immutable "both hooks are root-owned, not symlinked, and not writable"
+        pass hooks_immutable "both hooks are root-owned regular executable files, not symlinked, and not writable"
     else
-        fail hooks_immutable "missing, symlinked, not root-owned or writable:$exposed"
+        fail hooks_immutable "missing, symlinked, not a regular executable file, not root-owned or writable:$exposed"
     fi
     jq -n --arg state_dir "$STATE_DIR" --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
         --argjson failures "$preflight_failures" --slurpfile hooks "$work/hooks.ndjson" \
