@@ -201,9 +201,11 @@ git_in() {
         case ${12} in x*) LC_NUMERIC=${12#x}; export LC_NUMERIC ;; *) unset LC_NUMERIC ;; esac
         case ${13} in x*) LC_TIME=${13#x}; export LC_TIME ;; *) unset LC_TIME ;; esac
         shift 13
+        GIT_CONFIG_GLOBAL=/dev/null
+        export GIT_CONFIG_GLOBAL
         project=$1
         shift
-        exec git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$project" "$@"
+        exec git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.excludesFile=/dev/null -C "$project" "$@"
     ' git_in \
         "${PATH+x}${PATH-}" "${HOME+x}${HOME-}" "${XDG_CONFIG_HOME+x}${XDG_CONFIG_HOME-}" "${TMPDIR+x}${TMPDIR-}" \
         "${LANG+x}${LANG-}" "${LANGUAGE+x}${LANGUAGE-}" "${LC_ALL+x}${LC_ALL-}" "${LC_COLLATE+x}${LC_COLLATE-}" \
@@ -301,6 +303,60 @@ proc_stat() {
     echo "$stat_line"
 }
 
+proc_arg() {
+    { tr '\0' '\n' <"/proc/$1/cmdline"; } 2>/dev/null | sed -n "$2p" | cut -c1-200
+}
+
+proc_uid() {
+    sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$1/status" 2>/dev/null
+}
+
+proc_script_identity() {
+    script_pid=$1
+    [ "$(proc_comm "$script_pid")" = "${START_BIN##*/}" ] || return 1
+    script_head=$(head -c 256 "$START_BIN" 2>/dev/null | sed -n 1p)
+    case $script_head in
+        '#!'*) ;;
+        *) return 1 ;;
+    esac
+    script_interp=$(printf '%s\n' "${script_head#\#!}" | awk '{print $1}')
+    [ -n "$script_interp" ] || return 1
+    script_interp_path=$(physical_path "$script_interp") || return 1
+    [ "$identity_exe" = "$script_interp_path" ] || return 1
+    script_interp_arg=$(printf '%s\n' "${script_head#\#!}" | awk '{print $2}')
+    if [ -n "$script_interp_arg" ]; then
+        [ "$(proc_arg "$script_pid" 2)" = "$script_interp_arg" ] || return 1
+        [ "$(proc_arg "$script_pid" 3)" = "$START_BIN" ] || return 1
+    else
+        [ "$(proc_arg "$script_pid" 2)" = "$START_BIN" ] || return 1
+    fi
+}
+
+proc_identity() {
+    identity_pid=$1
+    identity_reject=executable
+    identity_exe=$(readlink "/proc/$identity_pid/exe" 2>/dev/null) || return 1
+    case $identity_exe in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case $identity_exe in
+        *' (deleted)') return 1 ;;
+    esac
+    identity_uid=$(proc_uid "$identity_pid")
+    case $identity_uid in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ -z "$probe_uid" ] || [ "$identity_uid" != "$probe_uid" ]; then
+        identity_reject=uid
+        return 1
+    fi
+    if [ "$identity_exe" = "$START_BIN" ]; then
+        return 0
+    fi
+    proc_script_identity "$identity_pid"
+}
+
 proc_environ() {
     { cat "/proc/$1/environ"; } 2>/dev/null
 }
@@ -387,6 +443,12 @@ collect_processes() {
     boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot_id=
     read_run_state
     main_pid=
+    main_count=0
+    main_pids=
+    main_rejected_exe=0
+    main_rejected_uid=0
+    probe_uid=$(id -u 2>/dev/null) || probe_uid=
+    : >"$work/main.matches"
     for dir in /proc/[0-9]*; do
         pid=${dir#/proc/}
         args=$(proc_args "$pid") || continue
@@ -403,9 +465,20 @@ EOF
                 *"$START_BIN"*) continue ;;
             esac
         fi
-        main_pid=$pid
-        break
+        if proc_identity "$pid"; then
+            printf '%s\n' "$pid" >>"$work/main.matches"
+        elif [ "$identity_reject" = uid ]; then
+            main_rejected_uid=$((main_rejected_uid + 1))
+        else
+            main_rejected_exe=$((main_rejected_exe + 1))
+        fi
     done
+    if [ -s "$work/main.matches" ]; then
+        main_count=$(wc -l <"$work/main.matches" | tr -d ' ')
+        main_pids=$(sort -n "$work/main.matches" | tr '\n' ' ')
+        main_pids=${main_pids% }
+        main_pid=${main_pids%% *}
+    fi
     self_pid=$$
     : >"$work/main.json"
     : >"$work/agent.ndjson"
@@ -445,8 +518,12 @@ process_checks() {
     main_pid=$(jq -r '.main.pid // empty' "$work/processes.json")
     state=$(jq -r '.run_state // ""' "$work/processes.json")
     agent_count=$(jq -r '.agent | length' "$work/processes.json")
-    if [ -n "$main_pid" ]; then
-        pass main_process "pid $main_pid"
+    if [ "$main_count" -eq 1 ]; then
+        pass main_process "pid $main_pid verified as $START_BIN"
+    elif [ "$main_count" -gt 1 ]; then
+        fail main_process "$main_count top-level processes verify as $START_BIN (pids $main_pids); unexpected multiplicity is not a pass"
+    elif [ "$main_rejected_exe" -gt 0 ] || [ "$main_rejected_uid" -gt 0 ]; then
+        fail main_process "no process runs $START_BIN; rejected argv matches: executable=$main_rejected_exe uid=$main_rejected_uid"
     else
         fail main_process "no process runs $START_BIN"
     fi
@@ -1931,6 +2008,8 @@ settle() {
 step_J08() (
     : >"$work/variables.tsv"
     main_pid=
+    main_count=0
+    main_pids=
     agent_pids=
     agent_children=0
     if collect_processes 2>/dev/null; then
@@ -2115,6 +2194,8 @@ EOF
             fi
         fi
         fail environment "$detail"
+    elif [ "$main_count" -gt 1 ]; then
+        fail environment "$main_count top-level processes verify as $START_BIN (pids $main_pids); only pid $main_pid was inspected"
     elif [ "$record_state" != read ]; then
         case $record_state in
             absent) skip environment "no start record at $RECORD_FILE; the environments are unknown, never clean" ;;
@@ -2333,10 +2414,31 @@ step_J13() (
     refs_known=false
     stash=0
     branches='[]'
+    git_isolated=false
+    excludes_config=
     if in_work_tree; then
         work_tree=true
         branch=$(git_in symbolic-ref --short -q HEAD 2>/dev/null)
         head=$(git_in rev-parse -q --verify HEAD 2>/dev/null)
+        excludes_config=$(git_in config --show-scope --show-origin --get-all core.excludesFile 2>/dev/null) || excludes_config=
+        excludes_pinned=false
+        excludes_leak=false
+        while IFS="$(printf '\t')" read -r excludes_scope excludes_origin excludes_value; do
+            [ -n "$excludes_scope" ] || continue
+            case $excludes_scope in
+                global | env) excludes_leak=true ;;
+                command)
+                    if [ "$excludes_origin" = "command line:" ] && [ "$excludes_value" = "/dev/null" ]; then
+                        excludes_pinned=true
+                    fi
+                    ;;
+            esac
+        done <<EOF
+$excludes_config
+EOF
+        if [ "$excludes_pinned" = true ] && [ "$excludes_leak" = false ]; then
+            git_isolated=true
+        fi
         if porcelain=$(git_in -c core.fileMode=true -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null) &&
             git_in ls-files -v -z >"$work/root-index-flags" 2>/dev/null &&
             git_in ls-files -v -z --recurse-submodules >"$work/recursive-index-flags" 2>/dev/null; then
@@ -2368,6 +2470,10 @@ step_J13() (
         else
             clean=false
         fi
+        if [ "$git_isolated" = false ]; then
+            status_known=false
+            clean=false
+        fi
         : >"$work/refs.err"
         if refs=$(git_in for-each-ref --format='%(refname:short) %(objectname)' refs/heads 2>>"$work/refs.err") &&
             git_in for-each-ref refs/stash >/dev/null 2>>"$work/refs.err" &&
@@ -2388,6 +2494,13 @@ step_J13() (
         pass head "$head"
     else
         fail head "HEAD is unborn or unreadable"
+    fi
+    if [ "$work_tree" = false ]; then
+        skip git_isolated "git status not run: $PROJECT is not a git work tree"
+    elif [ "$git_isolated" = true ]; then
+        pass git_isolated "core.excludesFile=/dev/null on the command line; no global git configuration is in effect"
+    else
+        fail git_isolated "the git inspection is not isolated from the host git configuration: $(printf '%s' "$excludes_config" | tr '\t' ' ' | tr '\n' ';' | cut -c1-200)"
     fi
     if [ "$work_tree" = false ]; then
         skip work_tree_status "git status not run: $PROJECT is not a git work tree"

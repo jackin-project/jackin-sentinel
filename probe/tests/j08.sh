@@ -114,10 +114,17 @@ record() {
     printf '%b' "$1" >"$t/sandbox/.jackin/run/env-kinds"
 }
 
+proc_uid_status() {
+    status_uid=$("$real_id" -u)
+    printf 'Uid:\t%s\t%s\t%s\t%s\n' "$status_uid" "$status_uid" "$status_uid" "$status_uid" >"$t/proc/$1/status"
+}
+
 proc_main() {
     mkdir -p "$t/proc/100"
     printf '/usr/local/bin/jackin-start\0codex\0' >"$t/proc/100/cmdline"
     printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+    ln -s /usr/local/bin/jackin-start "$t/proc/100/exe"
+    proc_uid_status 100
 }
 
 proc_codex() {
@@ -1323,6 +1330,55 @@ proc_agent_child() {
     printf '%s (codex) S 100 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' "$1" "$1" >"$t/proc/$1/stat"
 }
 
+physical_of() {
+    physical_candidate=$1
+    physical_hops=0
+    while [ -L "$physical_candidate" ]; do
+        physical_hops=$((physical_hops + 1))
+        [ "$physical_hops" -le 40 ] || return 1
+        physical_target=$(readlink "$physical_candidate") || return 1
+        case $physical_target in
+            /*) physical_candidate=$physical_target ;;
+            *) physical_candidate=$(dirname "$physical_candidate")/$physical_target ;;
+        esac
+    done
+    physical_parent=$(
+        unset CDPATH
+        cd -P "$(dirname "$physical_candidate")" 2>/dev/null && pwd -P
+    ) || return 1
+    printf '%s/%s\n' "${physical_parent%/}" "${physical_candidate##*/}"
+}
+
+proc_verified_main() {
+    verified_pid=$1
+    mkdir -p "$t/proc/$verified_pid"
+    printf '/usr/local/bin/jackin-start\0' >"$t/proc/$verified_pid/cmdline"
+    printf '%s (jackin-start) S 1 %s %s 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' \
+        "$verified_pid" "$verified_pid" "$verified_pid" "$verified_pid" >"$t/proc/$verified_pid/stat"
+    ln -s /usr/local/bin/jackin-start "$t/proc/$verified_pid/exe"
+    proc_uid_status "$verified_pid"
+}
+
+proc_script_main() {
+    script_main_pid=$1
+    mkdir -p "$t/proc/$script_main_pid"
+    printf '/bin/sh\0%s\0' "$t/target/jackin-start" >"$t/proc/$script_main_pid/cmdline"
+    printf '%s (jackin-start) S 1 %s %s 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' \
+        "$script_main_pid" "$script_main_pid" "$script_main_pid" "$script_main_pid" >"$t/proc/$script_main_pid/stat"
+    ln -s "$target_interp" "$t/proc/$script_main_pid/exe"
+    proc_uid_status "$script_main_pid"
+}
+
+proc_decoy_main() {
+    decoy_pid=$1
+    mkdir -p "$t/proc/$decoy_pid"
+    printf 'sh\0-c\0sleep\0%s\0' "$2" >"$t/proc/$decoy_pid/cmdline"
+    printf '%s (sh) S 1 %s %s 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 %s 0 0\n' \
+        "$decoy_pid" "$decoy_pid" "$decoy_pid" "$decoy_pid" >"$t/proc/$decoy_pid/stat"
+    ln -s /bin/sh "$t/proc/$decoy_pid/exe"
+    proc_uid_status "$decoy_pid"
+}
+
 processes() {
     begin "$1" sh "$t/probe" --only "$2"
     expect_rc 0
@@ -1429,6 +1485,87 @@ processes j11_two_agent_children_are_not_a_pass J11
 expect agent_child FAIL '2 Codex processes'
 finish_case
 
+mk j11_a_decoy_argv_without_the_executable_is_not_the_main_process
+state 'running 1'
+proc_decoy_main 100 /usr/local/bin/jackin-start
+processes j11_a_decoy_argv_without_the_executable_is_not_the_main_process J11
+expect main_process FAIL 'executable=1'
+expect agent_child FAIL 'no Codex child'
+fact '.processes.main' null
+finish_case
+
+mk j11_the_verified_script_process_is_the_main_process
+mkdir -p "$t/target"
+printf '#!/bin/sh\nexit 0\n' >"$t/target/jackin-start"
+chmod +x "$t/target/jackin-start"
+if target_interp=$(physical_of /bin/sh) && seam START_BIN "$t/target/jackin-start"; then
+    state 'running 1'
+    proc_decoy_main 100 "$t/target/jackin-start"
+    proc_script_main 105
+    processes j11_the_verified_script_process_is_the_main_process J11
+    expect main_process PASS 'pid 105'
+    fact '.processes.main.pid' 105
+    finish_case
+else
+    setup_failed j11_the_verified_script_process_is_the_main_process
+fi
+
+mk j11_a_spoofed_executable_path_is_not_the_main_process
+mkdir -p "$t/target"
+printf '#!/bin/sh\nexit 0\n' >"$t/target/jackin-start"
+chmod +x "$t/target/jackin-start"
+if target_interp=$(physical_of /bin/sh) && seam START_BIN "$t/target/jackin-start"; then
+    state 'running 1'
+    mkdir -p "$t/proc/100"
+    printf 'x\0%s\0' "$t/target/jackin-start" >"$t/proc/100/cmdline"
+    printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+    ln -s "$t/target/fake-interp" "$t/proc/100/exe"
+    proc_uid_status 100
+    processes j11_a_spoofed_executable_path_is_not_the_main_process J11
+    expect main_process FAIL 'executable=1'
+    fact '.processes.main' null
+    finish_case
+else
+    setup_failed j11_a_spoofed_executable_path_is_not_the_main_process
+fi
+
+mk j11_a_foreign_uid_is_not_the_main_process
+state 'running 1'
+foreign_uid=$(($("$real_id" -u) + 1))
+mkdir -p "$t/proc/100"
+printf '/usr/local/bin/jackin-start\0' >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+ln -s /usr/local/bin/jackin-start "$t/proc/100/exe"
+printf 'Uid:\t%s\t%s\t%s\t%s\n' "$foreign_uid" "$foreign_uid" "$foreign_uid" "$foreign_uid" >"$t/proc/100/status"
+processes j11_a_foreign_uid_is_not_the_main_process J11
+expect main_process FAIL 'uid=1'
+fact '.processes.main' null
+finish_case
+
+mk j11_two_verified_top_level_processes_are_not_a_pass
+state 'running 1'
+proc_verified_main 100
+proc_verified_main 105
+proc_codex
+processes j11_two_verified_top_level_processes_are_not_a_pass J11
+expect main_process FAIL 'unexpected multiplicity is not a pass'
+expect agent_child PASS 'as a child of the main process'
+fact '.processes.main.pid' 100
+finish_case
+
+mk j08_a_second_verified_main_process_is_not_an_environment_pass
+state 'exited 1 0'
+record "$R_OK1"
+proc_verified_main 100
+proc_verified_main 105
+proc_codex
+begin j08_a_second_verified_main_process_is_not_an_environment_pass sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'top-level processes'
+detail_contains environment 'only pid 100 was inspected'
+finish_case
+
 proc_tty_process() {
     mkdir -p "$t/proc/$1"
     printf '%s\0' "$2" >"$t/proc/$1/cmdline"
@@ -1443,6 +1580,8 @@ j12_case() {
     mk "$name"
     state 'running 1'
     proc_tty_process 100 /usr/local/bin/jackin-start jackin-start 1 0
+    ln -s /usr/local/bin/jackin-start "$t/proc/100/exe"
+    proc_uid_status 100
     proc_tty_process 101 'codex\0--sandbox\0' codex 100 "$first_tty"
     proc_tty_process 102 'codex\0--sandbox\0' codex 100 "$second_tty"
     cat >"$t/run-probe.sh" <<'EOF'
@@ -1485,6 +1624,8 @@ finish_case
 mk j12_no_agent_children_remain_unknown
 state 'running 1'
 proc_tty_process 100 /usr/local/bin/jackin-start jackin-start 1 0
+ln -s /usr/local/bin/jackin-start "$t/proc/100/exe"
+proc_uid_status 100
 cat >"$t/run-probe.sh" <<'EOF'
 #!/bin/sh
 pid=$$
@@ -1507,6 +1648,8 @@ self_marker=jackin-sentinel-probe-positional-synthetic-63ac951d
 mkdir -p "$t/proc/100" "$t/proc/101"
 printf '%s\0%s\0' "/usr/local/bin/jackin-start-$main_marker" '--role=jackin' >"$t/proc/100/cmdline"
 printf '100 (jackin-start) S 1 100 100 768 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+ln -s /usr/local/bin/jackin-start "$t/proc/100/exe"
+proc_uid_status 100
 printf 'codex\0--model\0%s\0' "$child_marker" >"$t/proc/101/cmdline"
 printf '101 (codex) S 100 100 100 512 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0 0\n' >"$t/proc/101/stat"
 cat >"$t/run-probe.sh" <<'EOF'
@@ -3063,6 +3206,33 @@ if git_project && mkdir -p "$t/home" && git_fixture config --file "$t/home/.gitc
     finish_git_case
 else
     setup_failed j13_untracked_file_is_dirty_despite_global_configuration
+fi
+
+mk j13_untracked_file_is_dirty_despite_global_excludes_file
+if git_project && mkdir -p "$t/home" && printf 'untracked.txt\n' >"$t/home/excludes" && git_fixture config --file "$t/home/.gitconfig" core.excludesFile "$t/home/excludes" && printf x >"$t/sandbox/project/untracked.txt" && ordinary_status=$(git_global_fixture -C "$t/sandbox/project" status --porcelain --untracked-files=all) && [ -z "$ordinary_status" ]; then
+    begin j13_untracked_file_is_dirty_despite_global_excludes_file env HOME="$t/home" GIT_CONFIG_NOSYSTEM=1 sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    expect git_isolated PASS 'core.excludesFile=/dev/null'
+    detail_contains git_isolated 'no global git configuration is in effect'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_untracked_file_is_dirty_despite_global_excludes_file
+fi
+
+mk j13_untracked_file_is_dirty_despite_local_excludes_file
+if git_project && printf 'untracked.txt\n' >"$t/local-excludes" && git_in_project config core.excludesFile "$t/local-excludes" && printf x >"$t/sandbox/project/untracked.txt" && ordinary_status=$(git_in_project status --porcelain --untracked-files=all) && [ -z "$ordinary_status" ]; then
+    begin j13_untracked_file_is_dirty_despite_local_excludes_file sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    expect git_isolated PASS 'core.excludesFile=/dev/null'
+    fact '.clean' false
+    finish_git_case
+else
+    setup_failed j13_untracked_file_is_dirty_despite_local_excludes_file
 fi
 
 mk j13_untracked_file_is_dirty_despite_config_count_injection
