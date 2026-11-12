@@ -272,6 +272,31 @@ EOF
     chmod +x "$t/bin/codex"
 }
 
+codex_says_tmp_spec_mutator() {
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        for d in /tmp/jackin-sentinel-probe-spec.*; do
+            [ -d "\$d" ] || continue
+            [ -f "\$d/spec.snapshot" ] || continue
+            printf '%s' '{"target":{"tuple":"T99","adapter":"t99-tampered-v1","model":"tampered","provider":"tampered","agent":"codex","spec_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"spec_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' >"\$d/spec.snapshot" 2>/dev/null || :
+            echo seen >>"$t/tmp_spec.seen"
+        done
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+    chmod +x "$t/bin/codex"
+}
+
 codex_says_spec_mutator() {
     cat >"$t/bin/codex" <<EOF
 #!/bin/sh
@@ -1404,6 +1429,35 @@ begin t09_a_commented_contract_url_is_not_the_effective_endpoint step_J09 '' ZAI
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 finish_case
 
+mk t09_a_note_scalar_is_not_the_effective_endpoint
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'note: "baseUrl: https://api.z.ai/api/anthropic"' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'note: "baseUrl: https://api.z.ai/api/anthropic"' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_note_scalar_is_not_the_effective_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_conflicting_effective_endpoint_config_is_rejected
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_conflicting_effective_endpoint_config_is_rejected step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk t14_a_note_scalar_is_not_the_effective_endpoint
+host_key=synthetic-T14-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t14-claude-zai-v1 claude claude '2.1.311 (Claude Code)' Bash ANTHROPIC_AUTH_TOKEN https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' '{"note":{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic"}}}' >"$t/sandbox/.claude/settings.json"
+begin t14_a_note_scalar_is_not_the_effective_endpoint step_J09 '' ANTHROPIC_AUTH_TOKEN=openshell:resolve:env:ANTHROPIC_AUTH_TOKEN
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
 mk t18_a_second_provider_table_is_not_a_conflict
 host_key=synthetic-T18-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
@@ -1424,6 +1478,29 @@ name = "Other"
 base_url = "http://127.0.0.1:9/v1"
 MOCKCONF
 begin t18_a_second_provider_table_is_not_a_conflict step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+mk t18_a_multiline_marker_is_not_a_table_header
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = """
+Z.AI
+[Z.AI]
+"""
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+begin t18_a_multiline_marker_is_not_a_table_header step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
 finish_case
@@ -1479,6 +1556,20 @@ begin j09_the_agent_cannot_reach_the_attested_spec_snapshot step_J09 '' CODEX_AU
 expect agent_reaches_api PASS 'completed the declared tool'
 jq -e '.target.tuple == "T01"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
 [ ! -s "$t/spec.seen" ] || problems="$problems agent-read-the-attested-spec"
+finish_case
+
+mk j09_the_agent_cannot_rewrite_the_tmp_spec_snapshot
+codex_says_tmp_spec_mutator
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+mkdir -p "$t/sandbox/.codex"
+printf '%s\n' "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":\"\",\"id_token\":\"\"}}" >"$t/sandbox/.codex/auth.json"
+begin j09_the_agent_cannot_rewrite_the_tmp_spec_snapshot step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect agent_reaches_api PASS 'completed the declared tool'
+jq -e '.target.tuple == "T01" and .target.adapter == "t01-codex-v1" and .target.spec_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
+[ ! -s "$t/tmp_spec.seen" ] || problems="$problems agent-reached-the-tmp-spec-snapshot"
 finish_case
 
 for tuple in T09 T14 T18; do

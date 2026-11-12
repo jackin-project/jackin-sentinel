@@ -658,7 +658,7 @@ agent_tool_evidence() {
         fi
     else
         if declared_provider_config; then
-            actual_endpoint=$PROVIDER_URL
+            actual_endpoint=$declared_effective
         fi
     fi
     tool_workdir=
@@ -751,35 +751,47 @@ copy_bounded() {
 }
 
 declared_provider_config() {
-    declared_count=$(jq -r '.behavior.credential.config_files // [] | length' "$spec") || return 1
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
     [ "$declared_count" -ge 1 ] || return 1
-    declared_url=false
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
-        declared_path=$(jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path' "$spec") || return 1
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$declared_path" ] || return 1
         read_bounded "$declared_path" "$work/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
-        jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' "$spec" >"$work/config.required" 2>/dev/null || return 1
+        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$work/config.required" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
             grep -Fq -- "$declared_line" "$work/config.snapshot" || return 1
         done <"$work/config.required"
-        jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]' "$spec" >"$work/config.forbidden" 2>/dev/null || return 1
+        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]' >"$work/config.forbidden" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
             grep -Fq -- "$declared_line" "$work/config.snapshot" && return 1
         done <"$work/config.forbidden"
-        sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" 2>/dev/null |
-            grep -Eo "https?://[^\"'<>[:space:]]+" >"$work/config.urls" || :
-        [ -s "$work/config.urls" ] || return 1
-        while IFS= read -r declared_line; do
-            [ -n "$declared_line" ] || continue
-            [ "$declared_line" = "$PROVIDER_URL" ] || return 1
-            declared_url=true
-        done <"$work/config.urls"
+        sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" >"$work/config.stripped" 2>/dev/null || return 1
+        case $ADAPTER in
+            t09-omp-zai-v1)
+                grep -E '^[[:space:]]*baseUrl[[:space:]]*[:=]' "$work/config.stripped" >"$work/config.keys" 2>/dev/null || :
+                [ -s "$work/config.keys" ] || return 1
+                declared_parsed=$(grep -Eo "https?://[^\"'<>[:space:]]+" "$work/config.keys" | sort -u || :)
+                [ -n "$declared_parsed" ] || return 1
+                [ "$(printf '%s\n' "$declared_parsed" | wc -l | tr -d '[:space:]')" -eq 1 ] || return 1
+                ;;
+            t14-claude-zai-v1)
+                declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$work/config.snapshot" 2>/dev/null) || return 1
+                [ -n "$declared_parsed" ] || return 1
+                ;;
+            *) return 1 ;;
+        esac
+        if [ -z "$declared_effective" ]; then
+            declared_effective=$declared_parsed
+        elif [ "$declared_effective" != "$declared_parsed" ]; then
+            return 1
+        fi
         declared_index=$((declared_index + 1))
     done
-    [ "$declared_url" = true ] || return 1
+    [ -n "$declared_effective" ] || return 1
+    return 0
 }
 
 provider_endpoint() {
@@ -790,12 +802,19 @@ provider_endpoint() {
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
     endpoint_value=$(jq -Rrn --arg want "$endpoint_provider" '
+        def complete_header: test("^[[:space:]]*(\\[\\[[^][]]+\\]\\]|\\[[^][]+\\])[[:space:]]*(#.*)?$");
         [inputs] as $lines
-        | [$lines | to_entries[] | select(.value | test("^[[:space:]]*\\[model_providers\\." + $want + "\\][[:space:]]*$")) | .key] as $tables
+        | (reduce $lines[] as $l ({inside: false, starts: []};
+            .starts += [(.inside | not)]
+            | (([$l | scan("\"\"\"|\u0027\u0027\u0027")] | length) % 2) as $n
+            | .inside = (if $n == 1 then (.inside | not) else .inside end))) as $state
+        | ($state.starts) as $outside
+        | [$lines | to_entries[] | select($outside[.key] and (.value | complete_header))] as $headers
+        | [$headers[] | select(.value | test("^[[:space:]]*\\[model_providers\\." + $want + "\\][[:space:]]*$")) | .key] as $tables
         | if ($tables | length) == 0 then ""
         elif ($tables | length) > 1 then "conflict"
         else
-            ([$lines | to_entries[] | select(.key > $tables[0] and (.value | test("^[[:space:]]*\\["))) | .key] | .[0] // ($lines | length)) as $stop
+            ([$headers[] | select(.key > $tables[0]) | .key] | .[0] // ($lines | length)) as $stop
             | [$lines[$tables[0] + 1:$stop][]] as $body
             | [$body[] | select(test("^[[:space:]]*base_url[[:space:]]*="))] as $setters
             | [$body[] | try (capture("^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"(?<u>[^\"]*)\"[[:space:]]*$").u)] as $urls
@@ -813,7 +832,7 @@ stage_provider_config() {
     case $EXPECTED_PROVIDER in
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
-    jq -r --arg path "${AUTH_FILE%/*}/config.toml" --arg provider "$EXPECTED_PROVIDER" \
+    printf '%s\n' "$SPEC_JSON" | jq -r --arg path "${AUTH_FILE%/*}/config.toml" --arg provider "$EXPECTED_PROVIDER" \
         --arg model "$EXPECTED_MODEL" --arg endpoint "$PROVIDER_URL" '
         [.behavior.credential.config_files // [] | .[] | select(.path == $path) | (.required_text // [])[]] as $lines
         | ([$lines[] | select(test("^model_provider[[:space:]]*=")) | capture("^model_provider[[:space:]]*=[[:space:]]*\"(?<v>[^\"]*)\"[[:space:]]*$").v]) as $wired
@@ -825,7 +844,7 @@ stage_provider_config() {
             | (if ($top | length) == 0 then ["model = " + ($model | tojson), "model_provider = " + ($provider | tojson)] else $top end) as $top
             | (if ($table | length) == 0 then ["name = " + ($provider | tojson), "base_url = " + ($endpoint | tojson)] else $table end) as $table
             | $top[], "", "[model_providers." + $provider + "]", $table[]
-        end' "$spec" >"$stage_target" 2>/dev/null || return 1
+        end' >"$stage_target" 2>/dev/null || return 1
     [ -s "$stage_target" ] || return 1
 }
 
@@ -1316,7 +1335,7 @@ token_kinds() {
 }
 
 auth_file_fields() {
-    jq -cn --slurpfile parsed "$1" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+    jq -cn --slurpfile parsed "$1" --argjson selected "$SPEC_JSON" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
         def pointer($name): $name | split("/") | map(select(length > 0));
         def kind($value; $jwt):
             if $value == null then "absent"
@@ -1324,7 +1343,7 @@ auth_file_fields() {
             elif $jwt and $value == $id_token then "placeholder"
             elif ($value | type == "string" and (test($re + "\\z") or . == "placeholder")) then "placeholder"
             else "other" end;
-        [$selected[0].behavior.credential.auth_file.fields[] as $field |
+        [$selected.behavior.credential.auth_file.fields[] as $field |
             ($parsed[0] | getpath(pointer($field.name))) as $value |
             if ($field.kind | type) == "object" and $field.kind.literal.value != null then
                 {name: $field.name, kind: (if $value == $field.kind.literal.value then "literal:" + $value else "other" end)}
@@ -3400,14 +3419,11 @@ main() {
     fi
     if read_bounded "$spec" "$spec_dir/spec.snapshot" "$SPEC_BYTE_CAP"; then
         spec=$spec_dir/spec.snapshot
-    elif jq -jRs '.' "$spec" >"$spec_dir/spec.snapshot" 2>/dev/null && [ -s "$spec_dir/spec.snapshot" ]; then
-        spec=$spec_dir/spec.snapshot
     else
         rm -rf "$spec_dir"
         echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
         exit 65
     fi
-    chmod 400 "$spec_dir/spec.snapshot" 2>/dev/null || :
     if ! jq -e '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
@@ -3460,6 +3476,12 @@ main() {
     EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
     EXPECTED_AGENT=$(jq -r '.target.agent' "$spec") || exit 65
     ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
+    SPEC_TARGET_JSON=$(jq -c '.target' "$spec") || exit 65
+    [ -n "$SPEC_TARGET_JSON" ] || exit 65
+    SPEC_JSON=$(head -c "$SPEC_BYTE_CAP" -- "$spec" 2>/dev/null) || exit 65
+    [ -n "$SPEC_JSON" ] || exit 65
+    rm -rf "$spec_dir" 2>/dev/null || exit 70
+    spec=
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"
         if [ -n "$selected_value" ] && [ "$(printf '%s' "$selected_value" | sha256sum | cut -d' ' -f1)" = "$CREDENTIAL_FINGERPRINT" ]; then
@@ -3527,8 +3549,8 @@ EOF
         exit 70
     done
     printf '%s' "$report_steps" | jq -cMs --arg mode "$mode" --arg docker "$docker" --arg engine "$engine" \
-        --slurpfile spec "$spec" \
-        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $spec[0].target,
+        --argjson target "$SPEC_TARGET_JSON" \
+        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $target,
           mode: $mode, docker: $docker, engine: ($engine | n), steps: add}'
 }
 
