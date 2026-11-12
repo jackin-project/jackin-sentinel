@@ -3389,11 +3389,15 @@ main() {
         echo "$PROBE: no key material for the step seals; refusing to run" >&2
         exit 70
     fi
-    if ! read_bounded "$spec" "$work/spec.snapshot" "$SPEC_BYTE_CAP"; then
+    if read_bounded "$spec" "$work/spec.snapshot" "$SPEC_BYTE_CAP"; then
+        spec=$work/spec.snapshot
+    elif jq -jRs '.' "$spec" >"$work/spec.snapshot" 2>/dev/null && [ -s "$work/spec.snapshot" ]; then
+        spec=$work/spec.snapshot
+    else
+        rm -f "$work/spec.snapshot"
         echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
         exit 65
     fi
-    spec=$work/spec.snapshot
     if ! jq -e '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
@@ -3438,7 +3442,7 @@ main() {
     TOOL_KIND=$(jq -r '.behavior.prompt.tool.kind' "$spec") || exit 65
     TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
     TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
-    TOOL_OBSERVATION_EXPECTED=$(printf '%s\n' "$TOOL_OBSERVATION" | jq -Rn '[inputs | select(length > 0) | @base64d]') || exit 65
+    TOOL_OBSERVATION_EXPECTED=$(jq -c '[.behavior.prompt.tool.observation.directory_contains.entries[]]' "$spec") || exit 65
     CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
     CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
     CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
