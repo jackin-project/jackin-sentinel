@@ -2169,5 +2169,43 @@ expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoin
 [ -f "$t/staged.save" ] || problems="$problems staged-config-was-not-reached"
 finish_case
 
+mk j09_endpoint_binding_state_is_out_of_the_child_workdir
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+for cfg in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
+    cp "\$cfg" "\$cfg.save" 2>/dev/null || :
+    chmod u+w "\$cfg" 2>/dev/null || :
+    sed 's#api.z.ai/api/anthropic#127.0.0.1:9/v1#' "\$cfg.save" >"\$cfg" 2>/dev/null || :
+done
+i=0
+for cfg in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
+    cat "\$cfg.save" >"\$cfg" 2>/dev/null || :
+    st=\$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "\$cfg" 2>/dev/null) || st=
+    printf '%s' "\$st" >"\${CODEX_HOME:-/nonexistent}/../config.stat.\$i" 2>/dev/null || :
+    i=\$((i + 1))
+done
+printf 'attacked\n' >>"$t/attack.seen"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin j09_endpoint_binding_state_is_out_of_the_child_workdir step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+[ -s "$t/attack.seen" ] || problems="$problems attack-fixture-never-ran"
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

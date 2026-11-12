@@ -807,26 +807,26 @@ declared_provider_config() {
         [ -n "$declared_path" ] || return 1
         declared_source=$declared_path
         [ -z "${declared_use_snapshot-}" ] || declared_source=$work/config.validated.$declared_index
-        read_bounded "$declared_source" "$work/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
-        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$work/config.required" 2>/dev/null || return 1
+        read_bounded "$declared_source" "$spec_dir/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
+        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$spec_dir/config.required" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
-            grep -Fq -- "$declared_line" "$work/config.snapshot" || return 1
-        done <"$work/config.required"
-        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]' >"$work/config.forbidden" 2>/dev/null || return 1
+            grep -Fq -- "$declared_line" "$spec_dir/config.snapshot" || return 1
+        done <"$spec_dir/config.required"
+        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]' >"$spec_dir/config.forbidden" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
-            grep -Fq -- "$declared_line" "$work/config.snapshot" && return 1
-        done <"$work/config.forbidden"
+            grep -Fq -- "$declared_line" "$spec_dir/config.snapshot" && return 1
+        done <"$spec_dir/config.forbidden"
         if [ -z "${declared_use_snapshot-}" ]; then
-            rm -f "$work/config.validated.$declared_index" 2>/dev/null || return 1
-            cp "$work/config.snapshot" "$work/config.validated.$declared_index" 2>/dev/null || return 1
-            chmod 0444 "$work/config.validated.$declared_index" 2>/dev/null || return 1
+            rm -f "$spec_dir/config.validated.$declared_index" 2>/dev/null || return 1
+            cp "$spec_dir/config.snapshot" "$spec_dir/config.validated.$declared_index" 2>/dev/null || return 1
+            chmod 0444 "$spec_dir/config.validated.$declared_index" 2>/dev/null || return 1
         fi
-        sed 's/\r$//' "$work/config.snapshot" >"$work/config.normalized" 2>/dev/null || return 1
+        sed 's/\r$//' "$spec_dir/config.snapshot" >"$spec_dir/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                if ! python3 -I - "$work/config.normalized" >"$work/config.declared" <<'PY'
+                if ! python3 -I - "$spec_dir/config.normalized" >"$spec_dir/config.declared" <<'PY'
 import re
 import sys
 
@@ -978,11 +978,11 @@ PY
                 then
                     return 1
                 fi
-                declared_parsed=$(cat "$work/config.declared")
+                declared_parsed=$(cat "$spec_dir/config.declared")
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             t14-claude-zai-v1)
-                declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$work/config.normalized" 2>/dev/null) || return 1
+                declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$spec_dir/config.normalized" 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             *) return 1 ;;
@@ -1055,9 +1055,9 @@ declared_configs_match_snapshot() {
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
-        [ -f "$work/config.validated.$declared_index" ] || return 1
-        read_bounded "$declared_path" "$work/config.livecheck" "$CONFIG_BYTE_CAP" || return 1
-        jq -Rrsn --rawfile a "$work/config.livecheck" --rawfile b "$work/config.validated.$declared_index" '$a == $b' </dev/null 2>/dev/null | grep -q true || return 1
+        [ -f "$spec_dir/config.validated.$declared_index" ] || return 1
+        read_bounded "$declared_path" "$spec_dir/config.livecheck" "$CONFIG_BYTE_CAP" || return 1
+        jq -Rrsn --rawfile a "$spec_dir/config.livecheck" --rawfile b "$spec_dir/config.validated.$declared_index" '$a == $b' </dev/null 2>/dev/null | grep -q true || return 1
         declared_index=$((declared_index + 1))
     done
     return 0
