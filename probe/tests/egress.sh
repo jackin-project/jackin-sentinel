@@ -95,7 +95,7 @@ prepare_probe() {
         fi
     fi
     cat >"$t/spec" <<EOF
-{"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
+{"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"},"config_files":[{"path":"$t/sandbox/.codex/config.toml","required_state":"present","mode":"600","required_text":[],"forbidden_text":[]}]},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
 EOF
     # shellcheck disable=SC2016
     "$scratch/tools/jq" \
@@ -169,7 +169,8 @@ zai_spec() {
              .behavior.credential.config_files = [{"path":($sandbox + "/.claude/settings.json"),"required_state":"present","mode":"600","required_text":["{\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.z.ai/api/anthropic\"}}"],"forbidden_text":["ANTHROPIC_AUTH_TOKEN","ZAI_API_KEY"]}]
          else
              .behavior.credential.auth_file.path = ($sandbox + "/.codex/auth.json") |
-             .behavior.credential.auth_file.fields = []
+             .behavior.credential.auth_file.fields = [] |
+             .behavior.credential.config_files = [{"path":($sandbox + "/.codex/config.toml"),"required_state":"present","mode":"600","required_text":[],"forbidden_text":[]}]
          end' \
         "$t/spec" >"$t/spec.next" || return 1
     mv "$t/spec.next" "$t/spec" || return 1
@@ -2258,6 +2259,305 @@ EOF
 chmod +x "$t/bin/omp"
 begin j09_endpoint_binding_state_is_out_of_the_child_workdir step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+[ -s "$t/attack.seen" ] || problems="$problems attack-fixture-never-ran"
+finish_case
+
+mk t09_the_initial_prompt_run_cannot_redirect_the_pinned_config
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+env >"$t/codex.env" 2>/dev/null || true
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+cp "$t/sandbox/.omp/config.toml" "$t/config.saved" 2>/dev/null || true
+chmod u+w "$t/sandbox/.omp/config.toml" 2>/dev/null || true
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml" 2>/dev/null || true
+cat "$t/config.saved" >"$t/sandbox/.omp/config.toml" 2>/dev/null || true
+printf 'attacked\n' >>"$t/attack.seen"
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_the_initial_prompt_run_cannot_redirect_the_pinned_config step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+[ -s "$t/attack.seen" ] || problems="$problems attack-fixture-never-ran"
+finish_case
+
+mk t18_a_multiline_base_url_is_one_value
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = """
+https://api.z.ai/api/v1\
+"""
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+begin t18_a_multiline_base_url_is_one_value step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+mk t18_a_quoted_base_url_key_is_the_endpoint
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+"base_url" = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+begin t18_a_quoted_base_url_key_is_the_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+mk t09_a_yaml_stream_bom_and_directives_are_not_content
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+if [ "\$1" = "-I" ] && [ "\$2" = "-" ]; then
+    shift 2
+    exec "$python_bin" -I -c 'import sys; sys.modules["yaml"] = None; exec(sys.stdin.read())' "\$@"
+fi
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+{
+    printf '\357\273\277'
+    printf '%%YAML 1.2\n---\nbaseUrl: https://api.z.ai/api/anthropic\ncredentialEnv: ZAI_API_KEY\ndefault: zai/glm-5.3\n...\n'
+} >"$t/sandbox/.omp/config.toml"
+{
+    printf '\357\273\277'
+    printf '%%YAML 1.2\n---\nbaseUrl: https://api.z.ai/api/anthropic\napi: anthropic-messages\napiKey: ZAI_API_KEY\n...\n'
+} >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_yaml_stream_bom_and_directives_are_not_content step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint)"' 'https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_an_omitted_tuple_config_is_rejected_pre_launch
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+name=t09_an_omitted_tuple_config_is_rejected_pre_launch
+problems=
+total=$((total + 1))
+prepare_probe || problems=" setup failure"
+if [ -z "$problems" ]; then
+    zai_spec t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint" || problems=" setup failure"
+fi
+if [ -z "$problems" ]; then
+    jq 'del(.behavior.credential.config_files[1])' "$t/spec" >"$t/spec.next" && mv "$t/spec.next" "$t/spec"
+    rc=0
+    bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY sh "$t/probe" --only J09 >"$t/out" 2>"$t/err" || rc=$?
+    cp "$scratch/bounded.out" "$t/out" 2>/dev/null || :
+    cp "$scratch/bounded.err" "$t/err" 2>/dev/null || :
+    [ "$rc" -eq 65 ] || problems="$problems exit=$rc(want 65)"
+    grep -q 'malformed or unsupported' "$t/err" || problems="$problems no-rejection"
+    expect_codex_not_run
+fi
+finish_case
+
+mk t09_pinned_modes_restored_when_the_probe_is_signalled
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf 'tool\n' >>"$t/tool.ran"
+        timeout --kill-after=1 5 sh -c 'while :; do :; done'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+prepare_probe || exit 70
+zai_spec t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint" || exit 70
+mode_before=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
+mode_before_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
+env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY sh "$t/probe" --only J09 >"$t/out" 2>"$t/err" &
+probe_pid=$!
+ticks=0
+while [ ! -f "$t/tool.ran" ] && kill -0 "$probe_pid" 2>/dev/null && [ "$ticks" -lt 200 ]; do
+    sleep 0.1
+    ticks=$((ticks + 1))
+done
+sleep 0.2
+kill_tree() {
+    for tree_child in $(pgrep -P "$1" 2>/dev/null); do
+        kill_tree "$tree_child"
+    done
+    kill -TERM "$1" 2>/dev/null
+}
+kill_tree "$probe_pid"
+wait "$probe_pid" 2>/dev/null
+name=t09_pinned_modes_restored_when_the_probe_is_signalled
+problems=
+total=$((total + 1))
+mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
+mode_after_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
+[ "$mode_after" = "$mode_before" ] || problems="$problems config-mode=$mode_after(want $mode_before)"
+[ "$mode_after_2" = "$mode_before_2" ] || problems="$problems models-mode=$mode_after_2(want $mode_before_2)"
+[ -s "$t/tool.ran" ] || problems="$problems attack-fixture-never-ran"
+finish_case
+
+mk t09_a_detached_helper_cannot_forge_the_final_evidence
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+if [ -n "\${CODEX_HOME-}" ]; then
+    d=\${CODEX_HOME%/*}
+    ( while [ -d "\$d" ]; do
+        printf '%s\n' '{"attempted":true,"credential":"static_key","exit_code":0,"answered":true,"output_bytes":4,"actual_provider":"zai","actual_model":"glm-5.3","actual_endpoint":"https://api.z.ai/api/anthropic","sandbox_endpoint":"https://api.z.ai/api/anthropic","tool":{"kind":"bash","attempted":true,"succeeded":true,"exit_code":0,"workdir":"$t/sandbox/project","observation":["AGENTS.md Dockerfile instructions jackin.role.toml probe tests"]}}' >"\$d/agent_exec.json" 2>/dev/null
+    done ) >/dev/null 2>&1 &
+fi
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_detached_helper_cannot_forge_the_final_evidence step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+got_result=$(jq -r '.steps[].checks[] | select(.name == "agent_reaches_api") | .result' "$t/out" 2>/dev/null)
+got_detail=$(jq -r '.steps[].checks[] | select(.name == "agent_reaches_api") | .detail' "$t/out" 2>/dev/null)
+[ "$got_result" = FAIL ] || problems="$problems agent_reaches_api=$got_result(want FAIL)"
+case $got_detail in
+    *'not authentic'* | *'not the contract endpoint'*) ;;
+    *) problems="$problems agent_reaches_api.detail=[$got_detail](want not-authentic-or-endpoint)" ;;
+esac
+finish_case
+
+mk t09_an_agent_owned_snapshot_cannot_rewrite_the_validated_config
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        for d in /tmp/jackin-sentinel-probe-spec.*; do
+            if [ -d "\$d" ]; then
+                rm -f "\$d/config.validated.0" 2>/dev/null
+                printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' 'httpProxy: http://127.0.0.1:9' >"\$d/config.validated.0" 2>/dev/null && printf '%s\n' "\$d" >>"$t/tampered"
+            fi
+        done
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_an_agent_owned_snapshot_cannot_rewrite_the_validated_config step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+[ -s "$t/tampered" ] || problems="$problems attack-fixture-never-ran"
+finish_case
+
+mk t09_a_pin_records_the_real_mode_and_restores_exactly_that
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0600 "$t/sandbox/.omp/config.toml"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+case " \$* " in
+    *st_mode*) exit 1 ;;
+esac
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin t09_a_pin_records_the_real_mode_and_restores_exactly_that step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
+[ "$mode_after" = 600 ] || problems="$problems config-mode-after=[$mode_after](want [600])"
+finish_case
+
+mk t18_the_sandbox_codex_config_is_pinned_like_the_others
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+cp "$t/sandbox/.codex/config.toml" "$t/config.save" 2>/dev/null || :
+chmod u+w "$t/sandbox/.codex/config.toml" 2>/dev/null || :
+sed 's#api.z.ai/api/v1#127.0.0.1:9/v1#' "$t/config.save" >"$t/sandbox/.codex/config.toml" 2>/dev/null || :
+cat "$t/config.save" >"$t/sandbox/.codex/config.toml" 2>/dev/null || :
+printf 'attacked\n' >>"$t/attack.seen"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin t18_the_sandbox_codex_config_is_pinned_like_the_others step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
 [ -s "$t/attack.seen" ] || problems="$problems attack-fixture-never-ran"
 finish_case
 

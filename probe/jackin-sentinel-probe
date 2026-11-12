@@ -661,8 +661,8 @@ agent_tool_evidence() {
             sandbox_conflict=true
         fi
     else
-        declared_use_snapshot=
-        if declared_provider_config; then
+        declared_use_snapshot=1
+        if [ "${prompt_configs_validated-}" = true ] && declared_provider_config; then
             actual_endpoint=$declared_effective
         fi
     fi
@@ -677,12 +677,10 @@ agent_tool_evidence() {
 $TOOL_ARGV
 EOF
         configs_pinned=false
-        if [ "$EXPECTED_AGENT" != codex ] && [ -n "$actual_endpoint" ]; then
-            if pin_declared_configs; then
-                configs_pinned=true
-            else
-                actual_endpoint=
-            fi
+        if [ "${prompt_configs_pinned-}" = true ]; then
+            configs_pinned=true
+        elif [ "$EXPECTED_AGENT" != codex ] && [ -n "$actual_endpoint" ]; then
+            actual_endpoint=
         fi
         (
             ulimit -f 128
@@ -733,6 +731,9 @@ EOF
         if [ -n "$stage_config_stat" ] || [ -e "$work/agent-home/config.toml" ]; then
             stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$work/agent-home/config.toml" 2>/dev/null) || stage_stat_now=
             [ -n "$stage_config_stat" ] && [ "$stage_stat_now" = "$stage_config_stat" ] || sandbox_conflict=true
+        fi
+        if [ "$configs_pinned" = true ] && { [ "$configs_stat_ok" != true ] || ! declared_configs_match_snapshot; }; then
+            actual_endpoint=
         fi
     elif [ -n "$actual_endpoint" ]; then
         declared_use_snapshot=1
@@ -805,9 +806,17 @@ declared_provider_config() {
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$declared_path" ] || return 1
-        declared_source=$declared_path
-        [ -z "${declared_use_snapshot-}" ] || declared_source=$spec_dir/config.validated.$declared_index
-        read_bounded "$declared_source" "$spec_dir/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
+        if [ -z "${declared_use_snapshot-}" ]; then
+            read_bounded "$declared_path" "$spec_dir/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
+        else
+            case $declared_index in
+                0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+                1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+                *) return 1 ;;
+            esac
+            [ -n "$_jks_vcfg_sel" ] || return 1
+            printf '%s' "$_jks_vcfg_sel" >"$spec_dir/config.snapshot" || return 1
+        fi
         printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$spec_dir/config.required" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
@@ -819,9 +828,16 @@ declared_provider_config() {
             grep -Fq -- "$declared_line" "$spec_dir/config.snapshot" && return 1
         done <"$spec_dir/config.forbidden"
         if [ -z "${declared_use_snapshot-}" ]; then
-            rm -f "$spec_dir/config.validated.$declared_index" 2>/dev/null || return 1
-            cp "$spec_dir/config.snapshot" "$spec_dir/config.validated.$declared_index" 2>/dev/null || return 1
-            chmod 0444 "$spec_dir/config.validated.$declared_index" 2>/dev/null || return 1
+            _jks_vcfg_st=$(
+                cat "$spec_dir/config.snapshot"
+                printf x
+            ) || return 1
+            _jks_vcfg_st=${_jks_vcfg_st%x}
+            case $declared_index in
+                0) _jks_vcfg_0=$_jks_vcfg_st ;;
+                1) _jks_vcfg_1=$_jks_vcfg_st ;;
+                *) return 1 ;;
+            esac
         fi
         sed 's/\r$//' "$spec_dir/config.snapshot" >"$spec_dir/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
@@ -877,9 +893,13 @@ def plain_root_scalars(text):
     while i < len(lines):
         line = lines[i]
         i += 1
+        if line.startswith("%") and not root:
+            continue
         if line.startswith("---") and line[3:4] in ("", " ", "\t"):
             line = line[3:].lstrip(" \t")
-        elif line.rstrip() == "...":
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+        elif line.split("#", 1)[0].rstrip() == "...":
             continue
         if not line.strip() or line[0] in " \t" or line[0] == "#":
             continue
@@ -1008,7 +1028,7 @@ def plain_root_scalars(text):
 
 
 try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
+    with open(sys.argv[1], encoding="utf-8-sig") as handle:
         if yaml is not None:
 
             class Loader(yaml.SafeLoader):
@@ -1046,6 +1066,10 @@ PY
                 declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$spec_dir/config.normalized" 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
+            t01-codex-v1 | t18-codex-zai-v1)
+                declared_parsed=$(provider_endpoint "$spec_dir/config.normalized" "$EXPECTED_PROVIDER" 2>/dev/null) || return 1
+                [ -n "$declared_parsed" ] || return 1
+                ;;
             *) return 1 ;;
         esac
         if [ -z "$declared_effective" ]; then
@@ -1075,15 +1099,20 @@ pin_declared_configs_run() {
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
-        [ -f "$spec_dir/config.validated.$declared_index" ] || return 1
-        declared_mode=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_path" 2>/dev/null) || declared_mode=
+        case $declared_index in
+            0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+            1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+            *) return 1 ;;
+        esac
+        [ -n "$_jks_vcfg_sel" ] || return 1
+        declared_mode=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_path" 2>/dev/null) || return 1
         case $declared_mode in
-            '' | *[!0-7]*) declared_mode=0644 ;;
+            '' | *[!0-7]*) return 1 ;;
         esac
         PIN_MODES="${PIN_MODES}${declared_mode}
 "
         chmod 0644 "$declared_path" 2>/dev/null || true
-        cat "$spec_dir/config.validated.$declared_index" >"$declared_path" || return 1
+        printf '%s' "$_jks_vcfg_sel" >"$declared_path" || return 1
         chmod 0444 "$declared_path" || return 1
         declared_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$declared_path" 2>/dev/null) || return 1
         PIN_STATS="${PIN_STATS}${declared_stat}
@@ -1094,6 +1123,7 @@ pin_declared_configs_run() {
 }
 
 unpin_declared_configs() {
+    [ -n "${PIN_MODES-}" ] || return 0
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 0
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
@@ -1108,6 +1138,7 @@ unpin_declared_configs() {
         chmod "$declared_mode" "$declared_path" 2>/dev/null || true
         declared_index=$((declared_index + 1))
     done
+    PIN_MODES=
     return 0
 }
 
@@ -1116,9 +1147,19 @@ declared_configs_match_snapshot() {
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
-        [ -f "$spec_dir/config.validated.$declared_index" ] || return 1
+        case $declared_index in
+            0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+            1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+            *) return 1 ;;
+        esac
+        [ -n "$_jks_vcfg_sel" ] || return 1
         read_bounded "$declared_path" "$spec_dir/config.livecheck" "$CONFIG_BYTE_CAP" || return 1
-        jq -Rrsn --rawfile a "$spec_dir/config.livecheck" --rawfile b "$spec_dir/config.validated.$declared_index" '$a == $b' </dev/null 2>/dev/null | grep -q true || return 1
+        _jks_live=$(
+            cat "$spec_dir/config.livecheck"
+            printf x
+        ) || return 1
+        _jks_live=${_jks_live%x}
+        [ "$_jks_live" = "$_jks_vcfg_sel" ] || return 1
         declared_index=$((declared_index + 1))
     done
     return 0
@@ -1149,12 +1190,14 @@ provider_endpoint() {
     endpoint_value=$(jq -Rrs --arg want "$endpoint_provider" \
         'def toml_unesc:
   explode
-  | reduce .[] as $c ({o: "", s: 0, h: "", n: 0};
+  | reduce .[] as $c ({o: "", s: 0, h: "", n: 0, f: 0};
       if .s == 0 then
-        (if $c == 92 then .s = 1 else .o += ([$c] | implode) end)
+        (if .f == 1 then (if ([9, 10, 13, 32] | index($c)) == null then .f = 0 | .o += ([$c] | implode) else . end)
+         elif $c == 92 then .s = 1 else .o += ([$c] | implode) end)
       elif .s == 1 then
         (if $c == 117 then .s = 2 | .h = "" | .n = 4
          elif $c == 85 then .s = 2 | .h = "" | .n = 8
+         elif $c == 10 then .s = 0 | .f = 1
          elif ([98, 116, 110, 102, 114, 34, 92] | index($c)) == null then .s = -1
          else .o += (if $c == 98 then "\b" elif $c == 116 then "\t" elif $c == 110 then "\n" elif $c == 102 then "\f" elif $c == 114 then "\r" elif $c == 34 then "\"" else "\\" end) | .s = 0 end)
       elif .s == 2 then
@@ -1170,18 +1213,20 @@ provider_endpoint() {
   | if .s == 0 then .o else null end;
 def outline:
     split("\n") | map(sub("\r$"; "")) as $lines
-    | reduce range(0; $lines | length) as $i ({state: "out", skip: 0, out: [], code: "", lits: [], lit: null};
+    | reduce range(0; $lines | length) as $i ({state: "out", skip: 0, drop: 0, out: [], code: "", lits: [], lit: null, fresh: false};
         ($lines[$i] | explode) as $cs
         | reduce range(0; $cs | length) as $j (.;
             if .skip > 0 then
                 .skip -= 1
-                | (if .lit != null then .lit += ([$cs[$j]] | implode) else .code += " " end)
+                | (if .drop > 0 then .drop -= 1
+                    elif .lit != null then .lit += ([$cs[$j]] | implode)
+                    else .code += " " end)
             else
                 (([$cs[$j], ($cs[$j + 1] // -1), ($cs[$j + 2] // -1)] | map(if . == -1 then "" else ([.] | implode) end) | join("")) as $t3
                  | ([$cs[$j]] | implode) as $c
                  | if .state == "out" then
-                       (if $t3 == "\"\"\"" then .state = "mlb" | .skip = 2 | .code += "   " | .lit = ""
-                        elif $t3 == "'"'"''"'"''"'"'" then .state = "mll" | .skip = 2 | .code += "   " | .lit = ""
+                       (if $t3 == "\"\"\"" then .state = "mlb" | .skip = 2 | .drop = 2 | .code += "   " | .lit = "" | .fresh = true
+                        elif $t3 == "'"'"''"'"''"'"'" then .state = "mll" | .skip = 2 | .drop = 2 | .code += "   " | .lit = "" | .fresh = true
                         elif $c == "\"" then .state = "bs" | .code += " " | .lit = ""
                         elif $c == "'"'"'" then .state = "ls" | .code += " " | .lit = ""
                         elif $c == "#" then .skip = ($cs | length) - $j - 1 | .code += " "
@@ -1196,21 +1241,22 @@ def outline:
                    elif .state == "mlb" then
                        (if $t3 == "\"\"\"" then
                             ([$cs[$j:][]] | implode | capture("^(?<run>\"*)").run | length) as $run
-                            | .state = "out" | .skip = ($run - 1) | .code += (" " * $run)
-                            | .lit += ("\"" * ($run - 3)) | .lits += [(.lit | toml_unesc)] | .lit = null
+                            | .state = "out" | .skip = ($run - 1) | .code += ("\u0001" + (" " * ($run - 1)))
+                            | .lit += ("\"" * ($run - 3)) | .lits += [(.lit | toml_unesc)] | .lit = null | .fresh = false
                         elif $c == "\\" then .skip = 1 | .lit += $c
                         else .lit += $c end)
                    else
                        (if $t3 == "'"'"''"'"''"'"'" then
                             ([$cs[$j:][]] | implode | capture("^(?<run>'"'"'*)").run | length) as $run
-                            | .state = "out" | .skip = ($run - 1) | .code += (" " * $run)
-                            | .lit += ("'"'"'" * ($run - 3)) | .lits += [.lit] | .lit = null
+                            | .state = "out" | .skip = ($run - 1) | .code += ("\u0001" + (" " * ($run - 1)))
+                            | .lit += ("'"'"'" * ($run - 3)) | .lits += [.lit] | .lit = null | .fresh = false
                         else .lit += $c end)
                    end)
             end)
-        | (if .lit != null then .lit += "\n" else . end)
-        | .out += [{code: .code, lits: .lits}]
-        | .code = "" | .lits = [] | .skip = 0)
+        | (if .lit == null then (.out += [{code: .code, lits: .lits}] | .code = "" | .lits = [])
+            elif .fresh and (.lit | length) == 0 then .fresh = false
+            else .lit += "\n" | .fresh = false end)
+        | .skip = 0 | .drop = 0)
     | .out;
 . as $raw
 | outline as $o
@@ -1218,14 +1264,14 @@ def outline:
 | [$L[] | select((.code | startswith("[") and endswith("]")))] as $headers
 | [$headers[] | select(.code == ("[model_providers." + $want + "]"))] as $tables
 | (if ($tables | length) == 1 then ([$headers[] | select(.i > $tables[0].i) | .i] | .[0] // ([$L[] | .i] | length)) else 0 end) as $stop
-| [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^base_url[ \t]*=")))] as $setters
-| [$setters[] | select((.code | sub("^base_url[ \t]*=[ \t]*"; "")) == "\u0001" and (.lits | length) == 1)] as $urls
+| [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^(base_url|\u0001)[ \t]*=")) and (if (.code | startswith("\u0001")) then ((.lits | length) >= 1 and .lits[0] == "base_url") else true end))] as $setters
+| [$setters[] | select((.code | sub("^(base_url|\u0001)[ \t]*=[ \t]*"; "")) == "\u0001") | select((if (.code | startswith("\u0001")) then (.lits | length) == 2 else (.lits | length) == 1 end))] as $urls
 | if ($tables | length) == 0 then ""
   elif ($tables | length) > 1 then "conflict"
   elif ($setters | length) > 1 then "conflict"
   elif ($setters | length) != ($urls | length) then "conflict"
   elif ($setters | length) == 0 then ""
-  else ($setters[0].lits[0] // "conflict") end' "$endpoint_file" 2>/dev/null) || return 1
+  else ($setters[0].lits[-1] // "conflict") end' "$endpoint_file" 2>/dev/null) || return 1
     [ "$endpoint_value" = conflict ] && return 1
     printf '%s' "$endpoint_value"
 }
@@ -1273,6 +1319,23 @@ stage_agent_home() {
         stage_config_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_dir/config.toml" 2>/dev/null) || return 1
     fi
     return 0
+}
+
+agent_exec_seal() {
+    _jks_agent_exec_seal=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
+    _jks_agent_exec_seal=${_jks_agent_exec_seal%% *}
+    printf '%s\n' "$_jks_agent_exec_seal" >"$work/agent_exec.seal" || return 1
+    return 0
+}
+
+agent_exec_verified() {
+    [ -f "$work/agent_exec.json" ] && [ -f "$work/agent_exec.seal" ] || return 1
+    [ -n "$RUN_KEY" ] || return 1
+    _jks_agent_exec_doc=$(cat "$work/agent_exec.json" 2>/dev/null) || return 1
+    _jks_agent_exec_want=$(cat "$work/agent_exec.seal" 2>/dev/null) || return 1
+    _jks_agent_exec_got=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
+    _jks_agent_exec_got=${_jks_agent_exec_got%% *}
+    [ "$_jks_agent_exec_got" = "$_jks_agent_exec_want" ]
 }
 
 ensure_agent_exec() {
@@ -1661,12 +1724,14 @@ EOF
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
     unset _jks_stdout_parsed_answer _jks_stdout_extra
     evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","actual_endpoint":"","sandbox_endpoint":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
-    jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
+    _jks_agent_exec_doc=$(jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" --argjson evidence "$evidence" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
           answered: $answered, output_bytes: $bytes,
           actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model,
-          actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}' >"$work/agent_exec.json"
+          actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}') || exit 70
+    printf '%s\n' "$_jks_agent_exec_doc" >"$work/agent_exec.json" || exit 70
+    agent_exec_seal || exit 70
 }
 
 egress() {
@@ -2538,7 +2603,27 @@ step_J07() (
     collect_processes
     ensure_agent_exec
     process_checks
-    attempted=$(jq -r '.attempted' "$work/agent_exec.json")
+    if ! agent_exec_verified; then
+        fail agent_exec "the agent exec evidence is not authentic"
+        _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0], agent_exec: null}')
+        seal_facts "$_jks_facts_doc"
+        return 0
+    fi
+    attempted=$(
+        jq -r '.attempted' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
+    ae_answered=$(
+        jq -r '.answered' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
+    ae_exit=$(
+        jq -r '.exit_code' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
     complete=$(
         printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
             --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
@@ -2546,28 +2631,38 @@ step_J07() (
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and
-        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json" 3<<EOF_JKS_EXPECTED_MODEL
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' /dev/fd/4 3<<EOF_JKS_EXPECTED_MODEL 4<<EOF_JKS_AGENT_EXEC
 $EXPECTED_MODEL
 EOF_JKS_EXPECTED_MODEL
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
     )
-    endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
-        '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
-         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
+    endpoint_mismatch=$(
+        jq -r --arg endpoint "$PROVIDER_URL" \
+            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
     if [ "$attempted" = true ]; then
         if [ "$complete" = true ]; then
             pass agent_exec "codex exec answered the fixed prompt and completed the declared tool"
-        elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
-            fail agent_exec "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
+        elif [ "$ae_answered" != true ]; then
+            fail agent_exec "codex exec exit $ae_exit gave no answer"
         elif [ "$endpoint_mismatch" = true ]; then
             fail agent_exec "the provider endpoint is not the contract endpoint $PROVIDER_URL"
         else
-            fail agent_exec "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
+            fail agent_exec "agent exec or tool evidence is incomplete (exit $ae_exit)"
         fi
     else
         skip agent_exec "$(cat "$work/agent_exec.why")"
     fi
-    _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
-        '{processes: $p[0], agent_exec: $x[0]}')
+    _jks_facts_doc=$(
+        jq -n --slurpfile p "$work/processes.json" --slurpfile x /dev/fd/4 \
+            '{processes: $p[0], agent_exec: $x[0]}' 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
     seal_facts "$_jks_facts_doc"
 )
 
@@ -3007,32 +3102,59 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    complete=$(
-        printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-            --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
+    if agent_exec_verified; then
+        _jks_ae_facts_doc=$_jks_agent_exec_doc
+        attempted=$(
+            jq -r '.attempted' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        ae_answered=$(
+            jq -r '.answered' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        ae_exit=$(
+            jq -r '.exit_code' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        complete=$(
+            printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+                --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
         .answered == true and .actual_provider == $provider and .actual_model == ($model | rtrimstr("\n")) and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and
-        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json" 3<<EOF_JKS_EXPECTED_MODEL
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' /dev/fd/4 3<<EOF_JKS_EXPECTED_MODEL 4<<EOF_JKS_AGENT_EXEC
 $EXPECTED_MODEL
 EOF_JKS_EXPECTED_MODEL
-    )
-    endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
-        '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
-         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
-    if [ "$(jq -r '.attempted' "$work/agent_exec.json")" = true ]; then
-        if [ "$complete" = true ]; then
-            pass agent_reaches_api "codex exec answered and completed the declared tool"
-        elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
-            fail agent_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
-        elif [ "$endpoint_mismatch" = true ]; then
-            fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL"
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        endpoint_mismatch=$(
+            jq -r --arg endpoint "$PROVIDER_URL" \
+                '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        if [ "$attempted" = true ]; then
+            if [ "$complete" = true ]; then
+                pass agent_reaches_api "codex exec answered and completed the declared tool"
+            elif [ "$ae_answered" != true ]; then
+                fail agent_reaches_api "codex exec exit $ae_exit gave no answer"
+            elif [ "$endpoint_mismatch" = true ]; then
+                fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL"
+            else
+                fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $ae_exit)"
+            fi
         else
-            fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
+            skip agent_reaches_api "$(cat "$work/agent_exec.why")"
         fi
     else
-        skip agent_reaches_api "$(cat "$work/agent_exec.why")"
+        _jks_ae_facts_doc=null
+        fail agent_reaches_api "the agent exec evidence is not authentic"
     fi
     if [ -n "$proxies" ]; then
         fail outside_host_denied "proxy variables are set: $proxies"
@@ -3060,8 +3182,12 @@ EOF_JKS_EXPECTED_MODEL
         fi
     fi
     rm -f "$work/provider.body"
-    _jks_facts_doc=$(jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/agent_exec.json" \
-        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}')
+    _jks_facts_doc=$(
+        jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x /dev/fd/4 \
+            '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}' 4<<EOF_JKS_AGENT_EXEC
+$_jks_ae_facts_doc
+EOF_JKS_AGENT_EXEC
+    )
     seal_facts "$_jks_facts_doc"
 )
 
@@ -3818,7 +3944,7 @@ main() {
     work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
     spec_dir=$(mktemp -d /tmp/jackin-sentinel-probe-spec.XXXXXX) || exit 70
     chmod 700 "$spec_dir" 2>/dev/null || :
-    trap 'rm -rf "$work" "$spec_dir"' EXIT
+    trap 'unpin_declared_configs; rm -rf "$work" "$spec_dir"' EXIT
     trap 'exit 70' INT TERM HUP
     RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
     RUN_KEY=${RUN_KEY%% *}
@@ -3866,6 +3992,10 @@ main() {
         (.behavior.prompt.tool.workdir | type == "string" and length > 0) and
         (.behavior.prompt.tool.observation.directory_contains.entries | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
         (.behavior.credential.classification | type == "string" and (IN("oauth_login", "static_key", "api_key"))) and
+        ((.target.tuple == "T01" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".codex/config.toml"] | sort))) or
+         (.target.tuple == "T09" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".omp/config.toml", "agent/models.yml"] | sort))) or
+         (.target.tuple == "T14" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".claude/settings.json"] | sort))) or
+         (.target.tuple == "T18" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".codex/config.toml"] | sort)))) and
         (.behavior.credential.environment | type == "array" and length > 0 and (.[0].name | test("^[A-Za-z_][A-Za-z0-9_]*$"))) and
         ((.behavior.credential.classification == "static_key" and (.credential_sha256 | test("^[0-9a-f]{64}$"))) or
          (.behavior.credential.classification != "static_key")) and
@@ -3914,6 +4044,15 @@ main() {
     [ -n "$SPEC_JSON" ] || exit 65
     rm -f "$spec_dir/spec.snapshot" "$spec_dir/spec.capped" 2>/dev/null || exit 70
     spec=
+    prompt_configs_validated=false
+    prompt_configs_pinned=false
+    declared_use_snapshot=
+    if declared_provider_config; then
+        prompt_configs_validated=true
+        if pin_declared_configs; then
+            prompt_configs_pinned=true
+        fi
+    fi
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"
         if [ -n "$selected_value" ] && [ "$(printf '%s' "$selected_value" | sha256sum | cut -d' ' -f1)" = "$CREDENTIAL_FINGERPRINT" ]; then
