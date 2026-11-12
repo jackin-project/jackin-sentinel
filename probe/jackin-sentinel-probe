@@ -2213,12 +2213,12 @@ step_J07() (
     process_checks
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
     complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --argjson expected "$TOOL_OBSERVATION_EXPECTED" '
+        --arg endpoint "$PROVIDER_URL" --slurpfile expected "$spec_dir/expected.snapshot.json" '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and
-        ([.tool.observation[]] as $obs | $expected | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
     endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
         '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
          (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
@@ -2674,12 +2674,12 @@ step_J09() (
         fi
     fi
     complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --argjson expected "$TOOL_OBSERVATION_EXPECTED" '
+        --arg endpoint "$PROVIDER_URL" --slurpfile expected "$spec_dir/expected.snapshot.json" '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and
-        ([.tool.observation[]] as $obs | $expected | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
     endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
         '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
          (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
@@ -3553,6 +3553,8 @@ main() {
     TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
     TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
     TOOL_OBSERVATION_EXPECTED=$(jq -c '[.behavior.prompt.tool.observation.directory_contains.entries[]]' "$spec") || exit 65
+    printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" >"$spec_dir/expected.snapshot.json" || exit 70
+    chmod 600 "$spec_dir/expected.snapshot.json" 2>/dev/null || :
     CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
     CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
     CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
