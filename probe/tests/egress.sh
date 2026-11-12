@@ -11,7 +11,7 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp chmod sha256sum cut sort python3; do
+for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head dd od mkdir cp chmod sha256sum cut sort python3; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
     else
@@ -1621,13 +1621,137 @@ used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
 [ "$used_endpoint" = https://api.z.ai/api/anthropic ] || problems="$problems used-endpoint=[$used_endpoint]"
 finish_case
 
+mk t09_an_owner_restore_after_a_mid_run_swap_is_detected
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+env >"$t/codex.env" 2>/dev/null || true
+case " \$* " in
+    *"Use one shell tool"*)
+        conf=$t/sandbox/.omp/config.toml
+        cp "\$conf" "$t/omp.orig" 2>/dev/null || true
+        chmod 0644 "\$conf" 2>/dev/null || true
+        printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
+        effective=\$(sed -n 's/^baseUrl: //p' "\$conf" | head -n 1)
+        printf '%s\n' "\$effective" >"$t/omp.used"
+        curl -q -s --noproxy '*' -o /dev/null "\$effective" >/dev/null 2>&1 </dev/null
+        cp "$t/omp.orig" "\$conf" 2>/dev/null || true
+        chmod 0444 "\$conf" 2>/dev/null || true
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_an_owner_restore_after_a_mid_run_swap_is_detected step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
+[ "$used_endpoint" = http://127.0.0.1:9/v1 ] || problems="$problems swap-not-effective=[$used_endpoint]"
+finish_case
+
+mk t09_a_headless_run_still_streams_a_bounded_config
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mv "$scratch/tools/head" "$scratch/head.save"
+begin t09_a_headless_run_still_streams_a_bounded_config step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+mv "$scratch/head.save" "$scratch/tools/head"
+
+mk t09_a_run_without_any_bounded_reader_is_refused
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mv "$scratch/tools/head" "$scratch/head.save"
+mv "$scratch/tools/dd" "$scratch/dd.save"
+total=$((total + 1))
+problems=
+execute step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+execute_rc=$?
+[ "$execute_rc" -eq 65 ] || problems="$problems exit=[$execute_rc](want [65])"
+grep -q 'unreadable or beyond' "$t/err" 2>/dev/null || problems="$problems bounded-read-not-refused"
+finish_case
+mv "$scratch/head.save" "$scratch/tools/head"
+mv "$scratch/dd.save" "$scratch/tools/dd"
+
 mk t09_a_missing_pyyaml_does_not_reject_the_run
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '#!/bin/sh\nexec %s -S "$@"\n' "$python_bin" >"$t/bin/python3"
+chmod +x "$t/bin/python3"
 mkdir -p "$t/noyaml"
 printf '%s\n' 'raise ImportError("PyYAML is unavailable in this run")' >"$t/noyaml/yaml.py"
-begin t09_a_missing_pyyaml_does_not_reject_the_run step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY PYTHONPATH=$t/noyaml
+begin t09_a_missing_pyyaml_does_not_reject_the_run step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY PYTHONPATH="$t"/noyaml
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_a_caller_pythonpath_cannot_forge_the_parsed_endpoint
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mkdir -p "$t/forge"
+cat >"$t/forge/yaml.py" <<EOF
+open("$t/yaml.forge.ran", "w").write("ran")
+
+
+class SafeLoader:
+    @classmethod
+    def add_constructor(cls, *args):
+        pass
+
+
+class _Base:
+    DEFAULT_MAPPING_TAG = None
+
+
+class _Resolver:
+    BaseResolver = _Base
+
+
+resolver = _Resolver()
+
+
+def load(handle, Loader=None):
+    return {"baseUrl": "https://api.z.ai/api/anthropic"}
+EOF
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' '# baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' '# baseUrl: https://api.z.ai/api/anthropic' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_caller_pythonpath_cannot_forge_the_parsed_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY PYTHONPATH="$t"/forge
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+[ ! -e "$t/yaml.forge.ran" ] || problems="$problems caller-yaml-imported"
+finish_case
+
+mk t09_a_leading_document_marker_is_accepted
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '#!/bin/sh\nexec %s -S "$@"\n' "$python_bin" >"$t/bin/python3"
+chmod +x "$t/bin/python3"
+cat >"$t/sandbox/.omp/config.toml" <<'MOCKCONF'
+---
+baseUrl: https://api.z.ai/api/anthropic
+credentialEnv: ZAI_API_KEY
+default: zai/glm-5.3
+MOCKCONF
+cat >"$t/sandbox/.omp/agent/models.yml" <<'MOCKCONF'
+---
+baseUrl: https://api.z.ai/api/anthropic
+api: anthropic-messages
+apiKey: ZAI_API_KEY
+MOCKCONF
+begin t09_a_leading_document_marker_is_accepted step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
 finish_case
@@ -1658,6 +1782,17 @@ mkdir -p "$t/sandbox/.codex"
     printf '\twire_api = "responses"\n'
 } >"$t/sandbox/.codex/config.toml"
 begin t18_a_tab_indented_provider_table_is_a_provider_table step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+mk t18_a_crlf_config_is_parsed_normalized
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+printf 'model = "glm-5.3"\r\nmodel_provider = "zai"\r\n\r\n[model_providers.zai]\r\nname = "Z.AI"\r\nbase_url = "https://api.z.ai/api/v1"\r\nenv_key = "ZAI_API_KEY"\r\nwire_api = "responses"\r\n' >"$t/sandbox/.codex/config.toml"
+begin t18_a_crlf_config_is_parsed_normalized step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
 finish_case
