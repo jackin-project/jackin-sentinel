@@ -741,7 +741,8 @@ provider_endpoint() {
     endpoint_value=$(jq -Rrn --arg want "$endpoint_provider" '
         [inputs] as $lines
         | [$lines | to_entries[] | select(.value | test("^[[:space:]]*\\[model_providers\\." + $want + "\\][[:space:]]*$")) | .key] as $tables
-        | if ($tables | length) != 1 then "conflict"
+        | if ($tables | length) == 0 then ""
+        elif ($tables | length) > 1 then "conflict"
         else
             [$lines[$tables[0] + 1:][] | select(test("^[[:space:]]*\\[") | not)] as $body
             | [$body[] | select(test("^[[:space:]]*base_url[[:space:]]*="))] as $setters
