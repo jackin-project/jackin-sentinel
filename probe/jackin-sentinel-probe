@@ -565,6 +565,7 @@ EOF
         (
             ulimit -f 128
             cd "$PROJECT" || exit 1
+            sanitize_launch_environment || exit 1
             CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
         )
         tool_exit=$?
@@ -756,6 +757,10 @@ EOF
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
     fi
+    if [ "$launch_kind" != none ] && ! (sanitize_launch_environment); then
+        launch_kind=none
+        why="codex exec was not run: the probe could not build a sanitized environment for the launch"
+    fi
     if [ "$launch_kind" = none ]; then
         rm -rf "$work/agent-home" 2>/dev/null
     fi
@@ -783,7 +788,7 @@ EOF
             exec 3>&1 || exit 1
             (
                 _jks_stdout_producer_status=0
-                if (cd "$SCAN_ROOT" && CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
+                if (cd "$SCAN_ROOT" && sanitize_launch_environment && CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
                     :
                 else
                     _jks_stdout_producer_status=$?
@@ -1141,8 +1146,29 @@ credential_variables() {
         | .[($separator + 1):] as $value
         | select($name | test("^[A-Za-z_][A-Za-z0-9_]*$"))
         | ($name | ascii_upcase) as $upper
-        | select($upper != "SSH_AUTH_SOCK" and ($upper | test("(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)")))
+        | select($upper != "SSH_AUTH_SOCK" and (
+              ($upper | test("(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH)(_|$)"))
+              or ($upper | test("(TOKEN|SECRET|SECRETS|PASSWORD|PASSWD|CREDENTIALS?)$"))
+              or ($upper | test("_PWD$"))))
         | [$name, kind($value), $source] | @tsv'
+}
+
+sanitize_launch_environment() {
+    launch_names=$(env -0 2>/dev/null | jq -Rrs 'split("\u0000") | map(select(length > 0) | split("=")[0]) | .[]' 2>/dev/null) || return 1
+    while IFS= read -r launch_name; do
+        [ -n "$launch_name" ] || continue
+        case $launch_name in
+            *[!A-Za-z0-9_]*) continue ;;
+        esac
+        case $launch_name in
+            PATH | HOME | LANG | LANGUAGE | LC_ALL | LC_CTYPE | TERM | USER | LOGNAME | SHELL | TZ | PWD | OLDPWD | CODEX_HOME | CODEX_AUTH_ACCESS_TOKEN | OPENAI_API_KEY) continue ;;
+        esac
+        [ "$launch_name" = "$CREDENTIAL_ENV" ] && continue
+        unset "$launch_name"
+    done <<EOF
+$launch_names
+EOF
+    return 0
 }
 
 is_placeholder() {
@@ -2833,6 +2859,12 @@ EOF
     host=${DOCKER_HOST-}
     tls=${DOCKER_TLS_VERIFY-}
     cert_path=${DOCKER_CERT_PATH-}
+    context=${DOCKER_CONTEXT-}
+    unset DOCKER_CONTEXT
+    if [ -n "$host" ]; then
+        DOCKER_HOST=$host
+        export DOCKER_HOST
+    fi
     unset _jks_docker_run_capture _jks_docker_run_capture_status _jks_docker_run_parsed
     unset _jks_docker_run_parse_status _jks_docker_run_extra _jks_docker_run_producer
     unset _jks_docker_run_complete _jks_docker_run_hello
@@ -2932,6 +2964,11 @@ EOF
             ;;
         *) fail environment "DOCKER_HOST is '${host:-unset}', expected tcp://host.openshell.internal:<port>" ;;
     esac
+    if [ -n "$context" ]; then
+        pass docker_context "DOCKER_CONTEXT=$context was set and was overridden; the Docker commands used DOCKER_HOST=${host:-unset}"
+    else
+        pass docker_context "no DOCKER_CONTEXT is set; the Docker commands used DOCKER_HOST=${host:-unset}"
+    fi
     if [ -z "$cert_problem" ]; then
         pass certificates "ca.pem, cert.pem and key.pem (mode 600) exist in $cert_dir"
     else

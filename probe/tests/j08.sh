@@ -655,6 +655,17 @@ state 'exited 1 0'
 record 'jackin-env-kinds 2\nattempt 1\nmain GITHUB_TOKEN empty\nagent STRIPE_SECRET other\n'
 verify fail_other_in_codex FAIL 'STRIPE_SECRET' read
 
+mk fail_other_in_the_probe_environment
+state 'exited 1 0'
+record "$R_OK1"
+begin fail_other_in_the_probe_environment env PATH="$t/bin:$scratch/shim:$scratch/tools" PGPASSWORD=FAKE-REAL-PASSWORD sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'not a placeholder: PGPASSWORD'
+fact '.environment | map(select(.name == "PGPASSWORD" and .kind == "other" and .source == "probe")) | length' 1
+not_disclosed 'FAKE-REAL-PASSWORD'
+finish_case
+
 mk fail_invalid_name_other
 state waiting
 record 'jackin-env-kinds 2\nattempt 0\nmain INVALID_NAME other\n'
@@ -4013,6 +4024,65 @@ fact '.run.exit_code' 0
 expect engine FAIL ''
 fact '.engine.id' null
 fact '.engine.server_version' null
+finish_case
+
+j15_context_case() {
+    name=$1
+    context=$2
+    mk "$name"
+    mkdir -p "$t/bin/docker-data" "$t/sandbox/.jackin/docker"
+    cat >"$t/bin/docker" <<'EOF'
+#!/bin/sh
+data=$(dirname "$0")/docker-data
+printf 'context=%s host=%s\n' "${DOCKER_CONTEXT-unset}" "${DOCKER_HOST-unset}" >"$data/endpoint"
+case "${DOCKER_CONTEXT-}" in
+    '') ;;
+    *) exit 93 ;;
+esac
+case "$#:$1:${2-}:${3-}" in
+    "3:run:--rm:hello-world@sha256:c567b231f65614688711a75f31518a064258a51d442117a3e771a3a8fdba78ef") : >"$data/run.called"; cat "$data/run.out" || exit 91; status=$(cat "$data/run.status") || exit 92; printf '%s\n' "$status" >"$data/run.complete"; exit "$status" ;;
+    "3:info:--format:{{.ID}} {{.ServerVersion}}") : >"$data/info.called"; cat "$data/info.out" || exit 93; status=$(cat "$data/info.status") || exit 94; printf '%s\n' "$status" >"$data/info.complete"; exit "$status" ;;
+    *) exit 95 ;;
+esac
+EOF
+    chmod +x "$t/bin/docker"
+    printf 'Hello from Docker!\n' >"$t/bin/docker-data/run.out"
+    printf 'ENGINE-ID 1.2.3\n' >"$t/bin/docker-data/info.out"
+    printf '0\n' >"$t/bin/docker-data/run.status"
+    printf '0\n' >"$t/bin/docker-data/info.status"
+    printf 'ca\n' >"$t/sandbox/.jackin/docker/ca.pem"
+    printf 'cert\n' >"$t/sandbox/.jackin/docker/cert.pem"
+    printf 'key\n' >"$t/sandbox/.jackin/docker/key.pem"
+    chmod 600 "$t/sandbox/.jackin/docker/key.pem"
+    if [ -n "$context" ]; then
+        begin "$name" env PATH="$t/bin:$scratch/shim:$scratch/tools" \
+            DOCKER_HOST=tcp://host.openshell.internal:2376 DOCKER_TLS_VERIFY=1 \
+            DOCKER_CERT_PATH="$t/sandbox/.jackin/docker" "DOCKER_CONTEXT=$context" \
+            sh "$t/probe" --only J15 --docker on
+    else
+        begin "$name" env PATH="$t/bin:$scratch/shim:$scratch/tools" \
+            DOCKER_HOST=tcp://host.openshell.internal:2376 DOCKER_TLS_VERIFY=1 \
+            DOCKER_CERT_PATH="$t/sandbox/.jackin/docker" \
+            sh "$t/probe" --only J15 --docker on
+    fi
+    expect_rc 0
+    expect_report J15 sandbox
+    expect environment PASS 'DOCKER_HOST=tcp://host.openshell.internal:2376'
+    expect hello_world PASS '@sha256:'
+    expect engine PASS 'ENGINE-ID'
+    fact '.run.hello' true
+    fact '.engine.id' ENGINE-ID
+    want_endpoint='context=unset host=tcp://host.openshell.internal:2376'
+    got_endpoint=$(cat "$t/bin/docker-data/endpoint" 2>/dev/null)
+    [ "$got_endpoint" = "$want_endpoint" ] || problems="$problems endpoint=[$got_endpoint](want [$want_endpoint])"
+}
+
+j15_context_case j15_a_docker_context_cannot_redirect_the_engine alternate-engine
+expect docker_context PASS 'DOCKER_CONTEXT=alternate-engine was set and was overridden'
+finish_case
+
+j15_context_case j15_without_a_docker_context_the_engine_is_the_validated_host ''
+expect docker_context PASS 'no DOCKER_CONTEXT is set'
 finish_case
 
 mk j15_od_execution_failure

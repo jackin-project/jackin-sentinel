@@ -179,6 +179,7 @@ zai_says() {
     cat >"$t/bin/$agent" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
+env >"$t/codex.env" 2>/dev/null || true
 token=
 if [ -n "\${CODEX_HOME-}" ] && [ -f "\${CODEX_HOME}/auth.json" ]; then
     token=\$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "\${CODEX_HOME}/auth.json" 2>/dev/null) || token=
@@ -219,6 +220,7 @@ codex_says() {
     cat >"$t/bin/codex" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
+env >"$t/codex.env" 2>/dev/null || true
 token=
 if [ -n "\${CODEX_HOME-}" ] && [ -f "\${CODEX_HOME}/auth.json" ]; then
     token=\$(jq -r '.tokens.access_token // .OPENAI_API_KEY // empty' "\${CODEX_HOME}/auth.json" 2>/dev/null) || token=
@@ -399,7 +401,8 @@ auth_json() {
 }
 
 with_curl() {
-    cp "$scratch/stub-curl" "$t/bin/curl"
+    sed -e "s#\$STUB_TABLE#$t/table#g" -e "s#\$STUB_LOG#$t/curl.log#g" "$scratch/stub-curl" >"$t/bin/curl"
+    chmod +x "$t/bin/curl"
 }
 
 answer() {
@@ -437,6 +440,20 @@ expect_absent_from_report() {
 
 expect_codex_not_run() {
     [ ! -e "$t/codex.ran" ] || problems="$problems codex-ran"
+}
+
+expect_child_variable() {
+    variable=$1
+    value=$2
+    got=$(grep "^$variable=" "$t/codex.env" 2>/dev/null | head -n 1)
+    [ "$got" = "$variable=$value" ] || problems="$problems child-variable=[$got](want [$variable=$value])"
+}
+
+expect_no_child_variable() {
+    variable=$1
+    if [ -f "$t/codex.env" ] && grep -q "^$variable=" "$t/codex.env" 2>/dev/null; then
+        problems="$problems child-received-$variable"
+    fi
 }
 
 hostile_codex_home() {
@@ -881,6 +898,36 @@ answer "$PROVIDER" 7 000
 begin j09_codex_uses_the_access_token_variable step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
 expect agent_reaches_api PASS 'codex exec answered'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
+finish_case
+
+mk j09_the_codex_child_runs_with_an_allowlisted_environment
+with_curl
+codex_says 'ready' 0
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_the_codex_child_runs_with_an_allowlisted_environment step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER" DATABASE_URL=mysql://operator:synthetic-secret@db.internal/one
+expect agent_reaches_api PASS 'codex exec answered'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
+expect_child_variable CODEX_AUTH_ACCESS_TOKEN "$PLACEHOLDER"
+expect_no_child_variable DATABASE_URL
+expect_never_sent 'synthetic-secret'
+expect_absent_from_report 'synthetic-secret'
+finish_case
+
+mk j09_a_conventional_credential_name_blocks_the_codex_launch
+with_curl
+codex_says 'ready' 0
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+begin j09_a_conventional_credential_name_blocks_the_codex_launch step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER" PGPASSWORD=synthetic-postgres-secret
+expect agent_reaches_api SKIP 'the sandbox holds a credential that is not a full placeholder'
+fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
+expect_codex_not_run
+expect_no_child_variable PGPASSWORD
+expect_never_sent 'synthetic-postgres-secret'
+expect_absent_from_report 'synthetic-postgres-secret'
 finish_case
 
 mk j09_the_staged_home_supplies_the_declared_credential
