@@ -1621,6 +1621,47 @@ used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
 [ "$used_endpoint" = https://api.z.ai/api/anthropic ] || problems="$problems used-endpoint=[$used_endpoint]"
 finish_case
 
+mk t09_a_missing_pyyaml_does_not_reject_the_run
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mkdir -p "$t/noyaml"
+printf '%s\n' 'raise ImportError("PyYAML is unavailable in this run")' >"$t/noyaml/yaml.py"
+begin t09_a_missing_pyyaml_does_not_reject_the_run step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY PYTHONPATH=$t/noyaml
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+
+mk j09_a_tool_run_preserves_the_declared_config_permissions
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0600 "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"
+begin j09_a_tool_run_preserves_the_declared_config_permissions step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+for declared_mode_file in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
+    declared_mode_after=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_mode_file" 2>/dev/null)
+    [ "$declared_mode_after" = 600 ] || problems="$problems mode-after-run=[$declared_mode_after](want [600])"
+done
+finish_case
+
+mk t18_a_tab_indented_provider_table_is_a_provider_table
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+{
+    printf '%s\n' 'model = "glm-5.3"' 'model_provider = "zai"' ''
+    printf '\t[model_providers.zai]\n'
+    printf '\tbase_url\t=\t"https://api.z.ai/api/v1"\n'
+    printf '\tenv_key = "ZAI_API_KEY"\n'
+    printf '\twire_api = "responses"\n'
+} >"$t/sandbox/.codex/config.toml"
+begin t18_a_tab_indented_provider_table_is_a_provider_table step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
 mk t09_a_quoted_key_root_base_url_is_the_effective_endpoint
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
