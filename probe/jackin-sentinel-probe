@@ -730,8 +730,10 @@ $TOOL_OBSERVATION
 EOF
     fi
     if [ "$EXPECTED_AGENT" = codex ]; then
-        endpoint_value=$(provider_endpoint "$work/agent-home/config.toml" "$EXPECTED_PROVIDER" 2>/dev/null) || endpoint_value=conflict
-        [ "$endpoint_value" = "$actual_endpoint" ] || sandbox_conflict=true
+        if [ -n "$stage_config_stat" ] || [ -e "$work/agent-home/config.toml" ]; then
+            stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$work/agent-home/config.toml" 2>/dev/null) || stage_stat_now=
+            [ -n "$stage_config_stat" ] && [ "$stage_stat_now" = "$stage_config_stat" ] || sandbox_conflict=true
+        fi
     elif [ -n "$actual_endpoint" ]; then
         declared_use_snapshot=1
         declared_provider_config || actual_endpoint=
@@ -1202,6 +1204,11 @@ stage_agent_home() {
         copy_bounded "$AUTH_FILE" "$stage_dir/$stage_name" || return 1
     fi
     stage_provider_config "$stage_dir/config.toml" || return 1
+    stage_config_stat=
+    if [ -f "$stage_dir/config.toml" ]; then
+        chmod 0444 "$stage_dir/config.toml" 2>/dev/null || return 1
+        stage_config_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_dir/config.toml" 2>/dev/null) || return 1
+    fi
     return 0
 }
 
