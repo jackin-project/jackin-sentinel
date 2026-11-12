@@ -11,7 +11,7 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp sha256sum cut; do
+for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp sha256sum cut sort; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
     else
