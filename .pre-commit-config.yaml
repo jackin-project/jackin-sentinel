@@ -1,14 +1,53 @@
 repos:
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.30.1
-    hooks:
-      - id: gitleaks
-
   - repo: local
     hooks:
-      - id: jackin-marketplace-audit
-        name: jackin.role.toml plugin marketplace audit
-        entry: scripts/marketplace-audit.sh
-        language: script
-        files: ^jackin\.role\.toml$
+      - id: gitleaks
+        name: gitleaks
+        language: system
+        entry: sh hooks/gitleaks.sh
+        types: []
+        types_or: [file, symlink]
+      - id: gitleaks-cases
+        name: staged gitleaks cases
+        language: system
+        entry: sh tests/gitleaks.sh
+        files: ^(.pre-commit-config.yaml|tests/gitleaks\.sh|hooks/gitleaks\.sh|hooks/gitleaks-(trace2|stderr)\.jq)$
+        pass_filenames: false
+      - id: gitleaks-filter-syntax
+        name: gitleaks filter syntax
+        language: system
+        entry: sh -c 'for file; do jq -nR --argjson expected "[]" --arg mode git -f "$file" </dev/null >/dev/null || exit 1; done' gitleaks-filter-syntax
+        files: ^hooks/gitleaks-(trace2|stderr)\.jq$
+      - id: shellcheck
+        name: shellcheck
+        language: system
+        entry: shellcheck
+        files: ^(probe/jackin-sentinel-probe|probe/tests/[^/]+\.sh|hooks/[^/]+\.sh)$
+      - id: shfmt
+        name: shfmt
+        language: system
+        entry: shfmt -d -i 4 -ci
+        files: ^(probe/jackin-sentinel-probe|probe/tests/[^/]+\.sh|hooks/[^/]+\.sh)$
+      - id: hadolint
+        name: hadolint
+        language: system
+        entry: hadolint
+        files: ^Dockerfile$
+      - id: probe-j08
+        name: probe J08 cases
+        language: system
+        entry: sh probe/tests/j08.sh
+        files: ^probe/(jackin-sentinel-probe|tests/j08\.sh)$
+        pass_filenames: false
+      - id: hooks-setup
+        name: setup hook cases
+        language: system
+        entry: sh probe/tests/hooks.sh
+        files: ^(hooks/setup\.sh|probe/tests/hooks\.sh)$
+        pass_filenames: false
+      - id: probe-egress
+        name: probe egress cases
+        language: system
+        entry: sh probe/tests/egress.sh
+        files: ^probe/(jackin-sentinel-probe|tests/egress\.sh)$
         pass_filenames: false

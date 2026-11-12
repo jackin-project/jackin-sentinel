@@ -1,0 +1,163 @@
+{
+  "target": {
+    "tuple": "T09",
+    "agent": "omp",
+    "provider": "zai",
+    "model": "glm-5.3",
+    "adapter": "t09-omp-zai-v1",
+    "spec_sha256": "185d6c9dfa4312cf8395778a4421db1cfa2291f1fe2809f15e4de84d4d9fd022"
+  },
+  "behavior": {
+    "version": {
+      "binary": "/usr/local/bin/omp",
+      "exact_output": "omp/18.18.3"
+    },
+    "process": {
+      "comm": "omp",
+      "minimum_age_seconds": 15
+    },
+    "prompt": {
+      "argv": [
+        "/usr/local/bin/omp",
+        "-p",
+        "--mode",
+        "json",
+        "--no-session",
+        "--model",
+        "zai/glm-5.3",
+        "Reply with exactly ready"
+      ],
+      "answer": {
+        "word_case_insensitive": {
+          "word": "ready"
+        }
+      },
+      "tool": {
+        "argv": [
+          "/usr/local/bin/omp",
+          "-p",
+          "--mode",
+          "json",
+          "--no-session",
+          "--model",
+          "zai/glm-5.3",
+          "Use the bash tool once with command ls -A in /sandbox/project, then reply with exactly ready"
+        ],
+        "answer": {
+          "word_case_insensitive": {
+            "word": "ready"
+          }
+        },
+        "kind": "bash",
+        "workdir": "/sandbox/project",
+        "observation": {
+          "directory_contains": {
+            "entries": [
+              "AGENTS.md",
+              "Dockerfile",
+              "instructions",
+              "jackin.role.toml",
+              "probe",
+              "tests"
+            ]
+          }
+        }
+      }
+    },
+    "terminal": {
+      "ready_text": "omp 18.18.3",
+      "interrupt": 3,
+      "quit_interrupts": 2,
+      "exit_notice": "omp exited with code"
+    },
+    "credential": {
+      "classification": "static_key",
+      "environment": [
+        {
+          "name": "ZAI_API_KEY",
+          "kind": "brokered"
+        }
+      ],
+      "absent_environment": [
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY"
+      ],
+      "auth_file": {
+        "required_state": "present",
+        "path": "/sandbox/.omp/auth.json",
+        "mode": "600",
+        "fields": [
+          {
+            "name": "/zai/type",
+            "kind": {
+              "literal": {
+                "value": "api_key"
+              }
+            }
+          },
+          {
+            "name": "/zai/key",
+            "kind": "placeholder"
+          }
+        ]
+      },
+      "config_files": [
+        {
+          "path": "/sandbox/.omp/config.toml",
+          "required_state": "present",
+          "mode": "600",
+          "required_text": [
+            "baseUrl: https://api.z.ai/api/anthropic",
+            "credentialEnv: ZAI_API_KEY",
+            "default: zai/glm-5.3"
+          ],
+          "forbidden_text": [
+            "https://api.z.ai/api/coding/paas/v4"
+          ]
+        },
+        {
+          "path": "/sandbox/.omp/agent/models.yml",
+          "required_state": "present",
+          "mode": "600",
+          "required_text": [
+            "baseUrl: https://api.z.ai/api/anthropic",
+            "api: anthropic-messages",
+            "apiKey: ZAI_API_KEY"
+          ],
+          "forbidden_text": [
+            "https://api.z.ai/api/coding/paas/v4"
+          ]
+        }
+      ]
+    },
+    "reflection": {
+      "url": "https://api.z.ai/api/anthropic",
+      "descendant_comm": "omp"
+    },
+    "provider": {
+      "probe_url": "https://api.z.ai/api/anthropic",
+      "accepted_status": null,
+      "accepted_body": null,
+      "policy_hosts": [
+        "api.z.ai",
+        "*.api.z.ai"
+      ]
+    },
+    "usage": {
+      "windows": {
+        "required": [
+          "five_hour",
+          "weekly"
+        ],
+        "optional": [
+          "monthly"
+        ]
+      }
+    }
+  },
+  "provider_hosts": [
+    "api.z.ai"
+  ],
+  "credential_sha256": null
+}

@@ -1,0 +1,145 @@
+{
+  "target": {
+    "tuple": "T14",
+    "agent": "claude",
+    "provider": "zai",
+    "model": "glm-5.3",
+    "adapter": "t14-claude-zai-v1",
+    "spec_sha256": "c244a7646be08e071fb3b585bb7f9b111cb3b128d3e8e9ea76705f89aa9e782e"
+  },
+  "behavior": {
+    "version": {
+      "binary": "/usr/local/bin/claude",
+      "exact_output": "2.1.311 (Claude Code)"
+    },
+    "process": {
+      "comm": "claude",
+      "minimum_age_seconds": 15
+    },
+    "prompt": {
+      "argv": [
+        "/usr/local/bin/claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--model",
+        "glm-5.3",
+        "--allowedTools",
+        "Bash",
+        "Reply with exactly ready using model glm-5.3"
+      ],
+      "answer": {
+        "word_case_insensitive": {
+          "word": "ready"
+        }
+      },
+      "tool": {
+        "argv": [
+          "/usr/local/bin/claude",
+          "-p",
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--model",
+          "glm-5.3",
+          "--allowedTools",
+          "Bash",
+          "Use the Bash tool once with command ls -A in /sandbox/project using model glm-5.3, then reply with exactly ready"
+        ],
+        "answer": {
+          "word_case_insensitive": {
+            "word": "ready"
+          }
+        },
+        "kind": "Bash",
+        "workdir": "/sandbox/project",
+        "observation": {
+          "directory_contains": {
+            "entries": [
+              "AGENTS.md",
+              "Dockerfile",
+              "instructions",
+              "jackin.role.toml",
+              "probe",
+              "tests"
+            ]
+          }
+        }
+      }
+    },
+    "terminal": {
+      "ready_text": "Claude Code",
+      "interrupt": 3,
+      "quit_interrupts": 2,
+      "exit_notice": "claude exited with code"
+    },
+    "credential": {
+      "classification": "static_key",
+      "environment": [
+        {
+          "name": "ANTHROPIC_AUTH_TOKEN",
+          "kind": "brokered"
+        }
+      ],
+      "absent_environment": [
+        "ZAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY"
+      ],
+      "auth_file": {
+        "required_state": "present",
+        "path": "/sandbox/.claude/.credentials.json",
+        "mode": "600",
+        "fields": [
+          {
+            "name": "/ANTHROPIC_API_KEY",
+            "kind": "placeholder"
+          }
+        ]
+      },
+      "config_files": [
+        {
+          "path": "/sandbox/.claude/settings.json",
+          "required_state": "present",
+          "mode": "600",
+          "required_text": [
+            "{\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.z.ai/api/anthropic\"}}"
+          ],
+          "forbidden_text": [
+            "ANTHROPIC_AUTH_TOKEN",
+            "ZAI_API_KEY"
+          ]
+        }
+      ]
+    },
+    "reflection": {
+      "url": "https://api.z.ai/api/anthropic",
+      "descendant_comm": "claude"
+    },
+    "provider": {
+      "probe_url": "https://api.z.ai/api/anthropic",
+      "accepted_status": null,
+      "accepted_body": null,
+      "policy_hosts": [
+        "api.z.ai",
+        "*.api.z.ai"
+      ]
+    },
+    "usage": {
+      "windows": {
+        "required": [
+          "five_hour",
+          "weekly"
+        ],
+        "optional": [
+          "monthly"
+        ]
+      }
+    }
+  },
+  "provider_hosts": [
+    "api.z.ai"
+  ],
+  "credential_sha256": null
+}
