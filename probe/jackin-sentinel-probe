@@ -816,33 +816,112 @@ declared_provider_config() {
         sed 's/\r$//' "$work/config.snapshot" >"$work/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                declared_parsed=$(python3 - "$work/config.normalized" <<'PY'
+                if ! python3 - "$work/config.normalized" >"$work/config.declared" <<'PY'
 import re
 import sys
 
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 url_re = re.compile(r'^https?://[^\s"<>]+\Z')
+key_re = re.compile(r'^("(?:[^"\\]|\\.)*"|\'[^\']*\'|[^:#\s][^:]*?)\s*:(?:[ \t]+(.*))?$')
 
 
-class Loader(yaml.SafeLoader):
-    pass
-
-
-def construct_mapping(loader, node, deep=False):
-    mapping = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
+def plain_root_scalars(text):
+    """Root-level scalars of a YAML block mapping (strict subset, no third-party code)."""
+    root = {}
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if not line.strip() or line[0] in " \t" or line[0] == "#":
+            continue
+        match = key_re.match(line)
+        if match is None:
+            raise ValueError("unsupported line")
+        raw_key = match.group(1)
+        key = raw_key[1:-1] if raw_key[0] in "\"'" else raw_key
+        if key in root:
             raise ValueError("duplicate key")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
+        rest = match.group(2) or ""
+        if not rest.strip() or rest.lstrip().startswith("#"):
+            root[key] = None
+            continue
+        rest = re.sub(r"[ \t]+#.*$", "", rest).strip()
+        if rest[0] in "\"'":
+            value = None
+            quote = rest[0]
+            buf = rest[1:]
+            out = []
+            j = 0
+            while value is None:
+                while j < len(buf):
+                    ch = buf[j]
+                    j += 1
+                    if quote == "'":
+                        if ch == "'":
+                            if buf[j:j + 1] == "'":
+                                out.append("'")
+                                j += 1
+                                continue
+                            tail = buf[j:].strip()
+                            if tail and not tail.startswith("#"):
+                                raise ValueError("trailing content")
+                            value = "".join(out)
+                            break
+                        out.append(ch)
+                    else:
+                        if ch == "\\" and j < len(buf):
+                            out.append(ch)
+                            out.append(buf[j])
+                            j += 1
+                            continue
+                        if ch == '"':
+                            tail = buf[j:].strip()
+                            if tail and not tail.startswith("#"):
+                                raise ValueError("trailing content")
+                            value = "".join(out)
+                            break
+                        out.append(ch)
+                if value is None:
+                    if i >= len(lines):
+                        raise ValueError("unterminated scalar")
+                    out.append("\n")
+                    buf = lines[i]
+                    i += 1
+                    j = 0
+        else:
+            value = rest
+            while i < len(lines) and lines[i] and lines[i][0] in " \t" and not lines[i].lstrip().startswith("#"):
+                value += " " + lines[i].strip()
+                i += 1
+        root[key] = value
+    return root
 
 
-Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
-        doc = yaml.load(handle, Loader=Loader)
+        if yaml is not None:
+
+            class Loader(yaml.SafeLoader):
+                pass
+
+            def construct_mapping(loader, node, deep=False):
+                mapping = {}
+                for key_node, value_node in node.value:
+                    key = loader.construct_object(key_node, deep=deep)
+                    if key in mapping:
+                        raise ValueError("duplicate key")
+                    mapping[key] = loader.construct_object(value_node, deep=deep)
+                return mapping
+
+            Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+            doc = yaml.load(handle, Loader=Loader)
+        else:
+            doc = plain_root_scalars(handle.read())
 except Exception:
     raise SystemExit(1)
 if not isinstance(doc, dict) or "baseUrl" not in doc:
@@ -852,7 +931,10 @@ if not isinstance(value, str) or url_re.match(value) is None:
     raise SystemExit(1)
 sys.stdout.write(value)
 PY
-                ) || return 1
+                then
+                    return 1
+                fi
+                declared_parsed=$(cat "$work/config.declared")
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             t14-claude-zai-v1)
