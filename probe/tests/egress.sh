@@ -1586,6 +1586,41 @@ jq -e '.target.model | length == 200000' "$t/out" >/dev/null 2>&1 || problems="$
 zai_model=
 finish_case
 
+mk t09_a_mid_request_swap_and_restore_does_not_rebind_the_launch
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+env >"$t/codex.env" 2>/dev/null || true
+conf=$t/sandbox/.omp/config.toml
+cp "\$conf" "$t/omp.orig" 2>/dev/null || true
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
+effective=\$(sed -n 's/^baseUrl: //p' "\$conf" | head -n 1)
+printf '%s\n' "\$effective" >"$t/omp.used"
+curl -q -s --noproxy '*' -o /dev/null "\$effective" >/dev/null 2>&1 </dev/null
+cp "$t/omp.orig" "\$conf" 2>/dev/null || true
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_mid_request_swap_and_restore_does_not_rebind_the_launch step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+expect_never_sent 'http://127.0.0.1:9/v1'
+used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
+[ "$used_endpoint" = https://api.z.ai/api/anthropic ] || problems="$problems used-endpoint=[$used_endpoint]"
+finish_case
+
 mk t09_a_quoted_key_root_base_url_is_the_effective_endpoint
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)

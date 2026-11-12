@@ -657,6 +657,7 @@ agent_tool_evidence() {
             sandbox_conflict=true
         fi
     else
+        declared_use_snapshot=
         if declared_provider_config; then
             actual_endpoint=$declared_effective
         fi
@@ -671,6 +672,14 @@ agent_tool_evidence() {
         done <<EOF
 $TOOL_ARGV
 EOF
+        configs_pinned=false
+        if [ "$EXPECTED_AGENT" != codex ] && [ -n "$actual_endpoint" ]; then
+            if pin_declared_configs; then
+                configs_pinned=true
+            else
+                actual_endpoint=
+            fi
+        fi
         (
             ulimit -f 128
             cd "$PROJECT" || exit 1
@@ -678,6 +687,9 @@ EOF
             CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
         )
         tool_exit=$?
+        if [ "$configs_pinned" = true ]; then
+            unpin_declared_configs
+        fi
         events=$(jq -Rs '[split("\n")[] | select(length > 0) | fromjson?]' "$work/tool.out" 2>/dev/null) || events='[]'
         actual_provider=$(printf '%s' "$events" | jq -r '[.. | objects | .provider? // .provider_name? // .model_provider? // empty | select(type == "string" and length > 0)] | .[0] // ""')
         actual_model=$(printf '%s' "$events" | jq -r '[.. | objects | .model? // .canonicalModel? // (.modelUsage? | if type == "object" then keys[] else empty end) // empty | select(type == "string" and length > 0)] | .[0] // ""')
@@ -716,8 +728,12 @@ EOF
         endpoint_value=$(provider_endpoint "$work/agent-home/config.toml" "$EXPECTED_PROVIDER" 2>/dev/null) || endpoint_value=conflict
         [ "$endpoint_value" = "$actual_endpoint" ] || sandbox_conflict=true
     elif [ -n "$actual_endpoint" ]; then
+        declared_use_snapshot=1
         declared_provider_config || actual_endpoint=
-        [ "$actual_endpoint" = "$declared_effective" ] || actual_endpoint=
+        declared_use_snapshot=
+        if [ -n "$actual_endpoint" ] && ! declared_configs_match_snapshot; then
+            actual_endpoint=
+        fi
     fi
     observation=$(jq -Rn '[inputs]' <"$work/tool.observation")
     jq -cn --arg provider "$actual_provider" --arg model "$actual_model" --arg kind "$TOOL_KIND" \
@@ -779,7 +795,9 @@ declared_provider_config() {
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$declared_path" ] || return 1
-        read_bounded "$declared_path" "$work/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
+        declared_source=$declared_path
+        [ -z "${declared_use_snapshot-}" ] || declared_source=$work/config.validated.$declared_index
+        read_bounded "$declared_source" "$work/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
         printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$work/config.required" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
@@ -790,7 +808,11 @@ declared_provider_config() {
             [ -n "$declared_line" ] || continue
             grep -Fq -- "$declared_line" "$work/config.snapshot" && return 1
         done <"$work/config.forbidden"
-        sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" >"$work/config.stripped" 2>/dev/null || return 1
+        if [ -z "${declared_use_snapshot-}" ]; then
+            rm -f "$work/config.validated.$declared_index" 2>/dev/null || return 1
+            cp "$work/config.snapshot" "$work/config.validated.$declared_index" 2>/dev/null || return 1
+            chmod 0444 "$work/config.validated.$declared_index" 2>/dev/null || return 1
+        fi
         sed 's/\r$//' "$work/config.snapshot" >"$work/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
@@ -847,6 +869,45 @@ PY
         declared_index=$((declared_index + 1))
     done
     [ -n "$declared_effective" ] || return 1
+    return 0
+}
+
+pin_declared_configs() {
+    command -v chmod >/dev/null 2>&1 || return 1
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
+        [ -f "$work/config.validated.$declared_index" ] || return 1
+        chmod 0644 "$declared_path" 2>/dev/null || true
+        cat "$work/config.validated.$declared_index" >"$declared_path" || return 1
+        chmod 0444 "$declared_path" || return 1
+        declared_index=$((declared_index + 1))
+    done
+    return 0
+}
+
+unpin_declared_configs() {
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 0
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 0
+        chmod 0644 "$declared_path" 2>/dev/null || true
+        declared_index=$((declared_index + 1))
+    done
+    return 0
+}
+
+declared_configs_match_snapshot() {
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
+        [ -f "$work/config.validated.$declared_index" ] || return 1
+        read_bounded "$declared_path" "$work/config.livecheck" "$CONFIG_BYTE_CAP" || return 1
+        jq -Rrsn --rawfile a "$work/config.livecheck" --rawfile b "$work/config.validated.$declared_index" '$a == $b' </dev/null 2>/dev/null | grep -q true || return 1
+        declared_index=$((declared_index + 1))
+    done
     return 0
 }
 
