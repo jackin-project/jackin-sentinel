@@ -49,6 +49,8 @@ LOG_READ_SECONDS=10
 PROJECT_FILE_MAX_BYTES=67108864
 PROJECT_TOTAL_MAX_BYTES=536870912
 PROJECT_HASH_SECONDS=300
+GIT_INSPECT_SECONDS=30
+GIT_TIMEOUT=$GIT_INSPECT_SECONDS
 LEAK_SK='(^|[^A-Za-z0-9]|\\([nrtbf]|u[0-9A-Fa-f]{4}))sk-[A-Za-z0-9_-]{20,}'
 LEAK_JWT='eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
 ID_TOKEN_HEADER=$(printf '%s' 'eyJhbGci' 'OiJub25l' 'IiwidHlw' 'IjoiSldU' 'In0')
@@ -271,17 +273,27 @@ git_in() {
         case ${11} in x*) LC_MONETARY=${11#x}; export LC_MONETARY ;; *) unset LC_MONETARY ;; esac
         case ${12} in x*) LC_NUMERIC=${12#x}; export LC_NUMERIC ;; *) unset LC_NUMERIC ;; esac
         case ${13} in x*) LC_TIME=${13#x}; export LC_TIME ;; *) unset LC_TIME ;; esac
-        shift 13
+        case ${14} in x*) GIT_TIMEOUT=${14#x}; export GIT_TIMEOUT ;; *) unset GIT_TIMEOUT ;; esac
+        shift 14
+        GIT_CONFIG_NOSYSTEM=1
+        export GIT_CONFIG_NOSYSTEM
+        GIT_CONFIG_SYSTEM=/dev/null
+        export GIT_CONFIG_SYSTEM
         GIT_CONFIG_GLOBAL=/dev/null
         export GIT_CONFIG_GLOBAL
+        GIT_ATTR_NOSYSTEM=1
+        export GIT_ATTR_NOSYSTEM
         project=$1
         shift
-        exec git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.excludesFile=/dev/null -C "$project" "$@"
+        if [ -n "${GIT_TIMEOUT-}" ]; then
+            exec timeout --kill-after=5 "$GIT_TIMEOUT" git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null -C "$project" "$@"
+        fi
+        exec git --no-optional-locks -c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null -C "$project" "$@"
     ' git_in \
         "${PATH+x}${PATH-}" "${HOME+x}${HOME-}" "${XDG_CONFIG_HOME+x}${XDG_CONFIG_HOME-}" "${TMPDIR+x}${TMPDIR-}" \
         "${LANG+x}${LANG-}" "${LANGUAGE+x}${LANGUAGE-}" "${LC_ALL+x}${LC_ALL-}" "${LC_COLLATE+x}${LC_COLLATE-}" \
         "${LC_CTYPE+x}${LC_CTYPE-}" "${LC_MESSAGES+x}${LC_MESSAGES-}" "${LC_MONETARY+x}${LC_MONETARY-}" \
-        "${LC_NUMERIC+x}${LC_NUMERIC-}" "${LC_TIME+x}${LC_TIME-}" "$PROJECT" "$@"
+        "${LC_NUMERIC+x}${LC_NUMERIC-}" "${LC_TIME+x}${LC_TIME-}" "${GIT_TIMEOUT+x}${GIT_TIMEOUT-}" "$PROJECT" "$@"
 }
 
 in_work_tree() {
@@ -289,6 +301,12 @@ in_work_tree() {
     [ "$inside" = true ] || return 1
     prefix=$(git_in rev-parse --show-prefix 2>/dev/null) || return 1
     [ -z "$prefix" ]
+}
+
+git_filter_drivers() {
+    git_in config --get-regexp '^filter\..*\.(clean|smudge|process|required)$' 2>/dev/null |
+        awk '{ name = $1; sub(/^filter\./, "", name); sub(/\.(clean|smudge|process|required)$/, "", name); print name }' |
+        LC_ALL=C sort -u
 }
 
 git_index_flags_state() {
@@ -2602,12 +2620,25 @@ EOF
         if [ "$excludes_pinned" = true ] && [ "$excludes_leak" = false ]; then
             git_isolated=true
         fi
-        if porcelain=$(git_in -c core.fileMode=true -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all --ignore-submodules=none 2>/dev/null) &&
+        filter_drivers=$(git_filter_drivers)
+        set --
+        while IFS= read -r driver; do
+            [ -n "$driver" ] || continue
+            set -- "$@" -c "filter.$driver.clean=" -c "filter.$driver.smudge=" -c "filter.$driver.process=" -c "filter.$driver.required=false"
+        done <<EOF
+$filter_drivers
+EOF
+        set -- "$@" -c core.fileMode=true -c core.trustctime=true -c core.checkStat=default status --porcelain --untracked-files=all --ignore-submodules=none
+        if porcelain=$(git_in "$@" 2>/dev/null) &&
             git_in ls-files -v -z >"$work/root-index-flags" 2>/dev/null &&
             git_in ls-files -v -z --recurse-submodules >"$work/recursive-index-flags" 2>/dev/null; then
             status_known=true
             clean=true
             [ -z "$porcelain" ] || clean=false
+            if [ "$(git_filter_drivers)" != "$filter_drivers" ]; then
+                status_known=false
+                clean=false
+            fi
             if git_index_flags_state "$work/root-index-flags" "$work/root-index-flags.hex"; then
                 :
             else

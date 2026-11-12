@@ -3318,6 +3318,43 @@ else
     setup_failed j13_untracked_file_is_dirty_despite_local_excludes_file
 fi
 
+mk j13_a_filter_driver_does_not_run_during_the_status
+if git_project && printf 'tracked.txt filter=evil\n' >"$t/sandbox/project/.gitattributes" &&
+    printf tracked >"$t/sandbox/project/tracked.txt" &&
+    git_in_project add .gitattributes tracked.txt &&
+    git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m tracked &&
+    git_in_project config filter.evil.clean "tee $t/filter-ran" &&
+    git_in_project config filter.evil.smudge cat &&
+    touch "$t/sandbox/project/tracked.txt"; then
+    begin j13_a_filter_driver_does_not_run_during_the_status sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' true
+    [ ! -e "$t/filter-ran" ] || problems="$problems the-filter-ran-during-the-status"
+    finish_git_case
+else
+    setup_failed j13_a_filter_driver_does_not_run_during_the_status
+fi
+
+mk j13_a_nonterminating_filter_does_not_stall_the_inspection
+if git_project && printf 'tracked.txt filter=evil\n' >"$t/sandbox/project/.gitattributes" &&
+    printf tracked >"$t/sandbox/project/tracked.txt" &&
+    git_in_project add .gitattributes tracked.txt &&
+    git_in_project -c user.name=probe -c user.email=probe@example.invalid commit -q -m tracked &&
+    git_in_project config filter.evil.clean "sleep 60" &&
+    git_in_project config filter.evil.smudge cat &&
+    touch "$t/sandbox/project/tracked.txt"; then
+    begin j13_a_nonterminating_filter_does_not_stall_the_inspection sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect work_tree_status PASS 'git status ran'
+    fact '.clean' true
+    finish_git_case
+else
+    setup_failed j13_a_nonterminating_filter_does_not_stall_the_inspection
+fi
+
 mk j13_untracked_file_is_dirty_despite_config_count_injection
 if git_project && printf x >"$t/sandbox/project/untracked.txt"; then
     begin j13_untracked_file_is_dirty_despite_config_count_injection env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=status.showUntrackedFiles GIT_CONFIG_VALUE_0=no sh "$t/probe" --only J13
