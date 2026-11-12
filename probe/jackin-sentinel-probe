@@ -751,6 +751,7 @@ copy_bounded() {
 }
 
 declared_provider_config() {
+    declared_effective=
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
     [ "$declared_count" -ge 1 ] || return 1
     declared_index=0
