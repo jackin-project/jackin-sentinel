@@ -1565,6 +1565,16 @@ begin t09_an_indented_nested_base_url_is_not_the_root_key step_J09 '' ZAI_API_KE
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 finish_case
 
+mk t09_a_crlf_config_is_parsed_normalized
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf 'baseUrl: https://api.z.ai/api/anthropic\r\ncredentialEnv: ZAI_API_KEY\r\ndefault: zai/glm-5.3\r\n' >"$t/sandbox/.omp/config.toml"
+printf 'baseUrl: https://api.z.ai/api/anthropic\r\napi: anthropic-messages\r\napiKey: ZAI_API_KEY\r\n' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_crlf_config_is_parsed_normalized step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
 for selected_step in J07 J09; do
     if [ "$selected_step" = J07 ]; then
         step_name=j07

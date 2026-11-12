@@ -791,6 +791,7 @@ declared_provider_config() {
             grep -Fq -- "$declared_line" "$work/config.snapshot" && return 1
         done <"$work/config.forbidden"
         sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" >"$work/config.stripped" 2>/dev/null || return 1
+        sed 's/\r$//' "$work/config.snapshot" >"$work/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
                 declared_parsed=$(jq -Rrs --arg re '^https?://[^[:space:]"<>]+$' '
@@ -816,12 +817,12 @@ declared_provider_config() {
                           end)
                     | if .bad > 0 or (.vals | length) != 1 then {ok: false}
                       else {ok: true, url: .vals[0]} end' \
-                    "$work/config.snapshot" 2>/dev/null) || return 1
+                    "$work/config.normalized" 2>/dev/null) || return 1
                 declared_parsed=$(printf '%s' "$declared_parsed" | jq -r 'if .ok then .url else empty end' 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             t14-claude-zai-v1)
-                declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$work/config.snapshot" 2>/dev/null) || return 1
+                declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$work/config.normalized" 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             *) return 1 ;;
