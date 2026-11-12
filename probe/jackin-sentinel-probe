@@ -3562,7 +3562,11 @@ main() {
     ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
     SPEC_TARGET_JSON=$(jq -c '.target' "$spec") || exit 65
     [ -n "$SPEC_TARGET_JSON" ] || exit 65
-    SPEC_JSON=$(head -c "$SPEC_BYTE_CAP" -- "$spec" 2>/dev/null) || exit 65
+    if command -v head >/dev/null 2>&1; then
+        SPEC_JSON=$(head -c "$SPEC_BYTE_CAP" -- "$spec" 2>/dev/null) || exit 65
+    else
+        SPEC_JSON=$(jq -Rrsn --argjson n "$((SPEC_BYTE_CAP + 1))" --rawfile src "$spec" '$src | .[0:$n]' 2>/dev/null) || exit 65
+    fi
     [ -n "$SPEC_JSON" ] || exit 65
     # Keep the validated document in a private snapshot file so no invocation
     # ever places it on the argument vector (execve E2BIG) or re-reads /tmp.
