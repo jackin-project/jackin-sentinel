@@ -3631,9 +3631,11 @@ EOF
         exit 70
     done
     printf '%s' "$report_steps" | jq -cMs --arg mode "$mode" --arg docker "$docker" --arg engine "$engine" \
-        --argjson target "$SPEC_TARGET_JSON" \
-        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $target,
-          mode: $mode, docker: $docker, engine: ($engine | n), steps: add}'
+        --slurpfile target /dev/fd/3 \
+        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $target[0],
+          mode: $mode, docker: $docker, engine: ($engine | n), steps: add}' 3<<EOF
+$SPEC_TARGET_JSON
+EOF
 }
 
 main "$@"

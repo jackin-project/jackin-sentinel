@@ -138,12 +138,12 @@ zai_spec() {
         --arg adapter "$adapter" --arg agent "$agent" --arg comm "$comm" --arg version "$version" \
         --arg kind "$kind" --arg env_name "$env_name" --arg provider_url "$provider_url" \
         --arg auth_state "$auth_state" --arg fingerprint "$fingerprint" --arg workdir "$t/sandbox/project" \
-        --arg binary "$t/bin/$agent" --arg sandbox "$t/sandbox" \
+        --arg binary "$t/bin/$agent" --arg sandbox "$t/sandbox" --arg model "${zai_model:-glm-5.3}" \
         '.target.tuple = ($adapter[0:3] | ascii_upcase) |
          .target.adapter = $adapter |
          .target.agent = $agent |
          .target.provider = "zai" |
-         .target.model = "glm-5.3" |
+         .target.model = $model |
          .credential_sha256 = $fingerprint |
          .behavior.version.binary = $binary |
          .behavior.version.exact_output = $version |
@@ -1563,6 +1563,16 @@ printf '%s\n' 'note:' '  baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv
 printf '%s\n' 'note:' '  baseUrl: https://api.z.ai/api/anthropic' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
 begin t09_an_indented_nested_base_url_is_not_the_root_key step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk j04_an_oversized_target_model_still_emits_the_report
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_model=$(printf '%200000s' '' | tr ' ' m)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+begin j04_an_oversized_target_model_still_emits_the_report step_J04 ''
+jq -e '.target.model | length == 200000' "$t/out" >/dev/null 2>&1 || problems="$problems target-model-not-in-report"
+zai_model=
 finish_case
 
 mk t09_a_crlf_config_is_parsed_normalized
