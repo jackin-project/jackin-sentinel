@@ -812,8 +812,8 @@ declared_provider_config() {
                           else
                             .block = -1
                             | (if ($l | test("^ *[A-Za-z0-9_.-]+ *: *[|>][0-9]*[+-]? *(#.*)?$")) then .block = $n
-                               elif ($l | test("^ *baseUrl *:")) then
-                                  ($l | capture("^ *baseUrl *: *(?<rest>.*)$").rest
+                               elif ($n == 0 and ($l | test("^baseUrl *:"))) then
+                                  ($l | capture("^baseUrl *: *(?<rest>.*)$").rest
                                    | sub("(^ +| +$)"; "")
                                    | if test("^#") then ""
                                      elif test("^\\u0022[^\\u0022]*\\u0022$") then capture("^\\u0022(?<v>[^\\u0022]*)\\u0022$").v
