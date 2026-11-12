@@ -712,6 +712,16 @@ EOF
 $TOOL_OBSERVATION
 EOF
     fi
+    # The reported endpoint stays bound to the configuration that was
+    # validated before launch: a live file replaced while the child ran voids
+    # the evidence instead of certifying the remembered value.
+    if [ "$EXPECTED_AGENT" = codex ]; then
+        endpoint_value=$(provider_endpoint "$work/agent-home/config.toml" "$EXPECTED_PROVIDER" 2>/dev/null) || endpoint_value=conflict
+        [ "$endpoint_value" = "$actual_endpoint" ] || sandbox_conflict=true
+    elif [ -n "$actual_endpoint" ]; then
+        declared_provider_config || actual_endpoint=
+        [ "$actual_endpoint" = "$declared_effective" ] || actual_endpoint=
+    fi
     observation=$(jq -Rn '[inputs]' <"$work/tool.observation")
     jq -cn --arg provider "$actual_provider" --arg model "$actual_model" --arg kind "$TOOL_KIND" \
         --arg endpoint "$actual_endpoint" --arg sandbox "$sandbox_endpoint" --argjson conflict "$sandbox_conflict" \
@@ -732,9 +742,25 @@ read_bounded() {
     if [ -L "$read_src" ]; then
         return 1
     fi
-    timeout 10 head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" || return 1
+    read_bytes=
+    if command -v head >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" 2>/dev/null || return 1
+        else
+            head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" 2>/dev/null || return 1
+        fi
+    else
+        # The source is already verified to be a regular private file, so this
+        # bounded slice never blocks; the byte count below enforces the cap.
+        jq -Rrsn --argjson n "$((read_cap + 1))" --rawfile src "$read_src" '$src | .[0:$n]' \
+            >"$read_dst" 2>/dev/null || return 1
+    fi
     [ -f "$read_dst" ] || return 1
-    read_bytes=$(wc -c <"$read_dst" 2>/dev/null | tr -d '[:space:]') || return 1
+    if command -v wc >/dev/null 2>&1; then
+        read_bytes=$(wc -c <"$read_dst" 2>/dev/null | tr -d '[:space:]') || return 1
+    else
+        read_bytes=$(jq -Rrn --rawfile d "$read_dst" '$d | utf8bytelength' 2>/dev/null) || return 1
+    fi
     case $read_bytes in
         '' | *[!0-9]*) return 1 ;;
     esac
@@ -772,11 +798,36 @@ declared_provider_config() {
         sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" >"$work/config.stripped" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                grep -E '^[[:space:]]*baseUrl[[:space:]]*[:=]' "$work/config.stripped" >"$work/config.keys" 2>/dev/null || :
-                [ -s "$work/config.keys" ] || return 1
-                declared_parsed=$(grep -Eo "https?://[^\"'<>[:space:]]+" "$work/config.keys" | sort -u || :)
+                # Structural parse of the OMP YAML mapping: only one complete
+                # top-level baseUrl scalar counts, and block scalars, comments,
+                # quoted prose, invalid scalars and duplicate setters are all
+                # rejected instead of being searched for a URL.
+                declared_parsed=$(jq -Rrs --arg re '^https?://[^[:space:]"<>]+$' '
+                    def ind($l): ($l | length) - ($l | sub("^ *"; "") | length);
+                    split("\n") as $lines
+                    | reduce range(0; $lines | length) as $i ({block: -1, vals: [], bad: 0};
+                        ($lines[$i]) as $l
+                        | (ind($l)) as $n
+                        | if .block >= 0 and (($l | test("^\\s*$")) or $n > .block) then .
+                          else
+                            .block = -1
+                            | (if ($l | test("^ *[A-Za-z0-9_.-]+ *: *[|>][0-9]*[+-]? *(#.*)?$")) then .block = $n
+                               elif ($l | test("^ *baseUrl *:")) then
+                                  ($l | capture("^ *baseUrl *: *(?<rest>.*)$").rest
+                                   | sub("(^ +| +$)"; "")
+                                   | if test("^#") then ""
+                                     elif test("^\\u0022[^\\u0022]*\\u0022$") then capture("^\\u0022(?<v>[^\\u0022]*)\\u0022$").v
+                                     elif test("^\\u0027[^\\u0027]*\\u0027$") then capture("^\\u0027(?<v>[^\\u0027]*)\\u0027$").v
+                                     else sub(" + #.*$"; "") end) as $v
+                                  | if ($v | test("^\\s*$")) or ($v | test($re) | not) then .bad += 1
+                                    else .vals += [$v] end
+                               else . end)
+                          end)
+                    | if .bad > 0 or (.vals | length) != 1 then {ok: false}
+                      else {ok: true, url: .vals[0]} end' \
+                    "$work/config.snapshot" 2>/dev/null) || return 1
+                declared_parsed=$(printf '%s' "$declared_parsed" | jq -r 'if .ok then .url else empty end' 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
-                [ "$(printf '%s\n' "$declared_parsed" | wc -l | tr -d '[:space:]')" -eq 1 ] || return 1
                 ;;
             t14-claude-zai-v1)
                 declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$work/config.snapshot" 2>/dev/null) || return 1
@@ -802,27 +853,59 @@ provider_endpoint() {
     case $endpoint_provider in
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
-    endpoint_value=$(jq -Rrn --arg want "$endpoint_provider" '
-        def complete_header: test("^[[:space:]]*(\\[\\[[^][]]+\\]\\]|\\[[^][]+\\])[[:space:]]*(#.*)?$");
-        [inputs] as $lines
-        | (reduce $lines[] as $l ({inside: false, starts: []};
-            .starts += [(.inside | not)]
-            | (([$l | scan("\"\"\"|\u0027\u0027\u0027")] | length) % 2) as $n
-            | .inside = (if $n == 1 then (.inside | not) else .inside end))) as $state
-        | ($state.starts) as $outside
-        | [$lines | to_entries[] | select($outside[.key] and (.value | complete_header))] as $headers
-        | [$headers[] | select(.value | test("^[[:space:]]*\\[model_providers\\." + $want + "\\][[:space:]]*$")) | .key] as $tables
-        | if ($tables | length) == 0 then ""
-        elif ($tables | length) > 1 then "conflict"
-        else
-            ([$headers[] | select(.key > $tables[0]) | .key] | .[0] // ($lines | length)) as $stop
-            | [$lines[$tables[0] + 1:$stop][]] as $body
-            | [$body[] | select(test("^[[:space:]]*base_url[[:space:]]*="))] as $setters
-            | [$body[] | try (capture("^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"(?<u>[^\"]*)\"[[:space:]]*$").u)] as $urls
-            | if ($urls | length) > 1 or ($setters | length) != ($urls | length) then "conflict"
-            elif ($urls | length) == 0 then ""
-            else $urls[0] end
-        end' "$endpoint_file" 2>/dev/null) || return 1
+    endpoint_value=$(jq -Rrs --arg want "$endpoint_provider" \
+        'def outline:
+    split("\n") as $lines
+    | reduce range(0; $lines | length) as $i ({state: "out", skip: 0, out: [], code: "", lits: [], lit: null};
+        ($lines[$i] | explode) as $cs
+        | reduce range(0; $cs | length) as $j (.;
+            if .skip > 0 then
+                .skip -= 1
+                | (if .lit != null then .lit += ([$cs[$j]] | implode) else .code += " " end)
+            else
+                (([$cs[$j], ($cs[$j + 1] // -1), ($cs[$j + 2] // -1)] | map(if . == -1 then "" else ([.] | implode) end) | join("")) as $t3
+                 | ([$cs[$j]] | implode) as $c
+                 | if .state == "out" then
+                       (if $t3 == "\"\"\"" then .state = "mlb" | .skip = 2 | .code += "   " | .lit = ""
+                        elif $t3 == "'"'"''"'"''"'"'" then .state = "mll" | .skip = 2 | .code += "   " | .lit = ""
+                        elif $c == "\"" then .state = "bs" | .code += " " | .lit = ""
+                        elif $c == "'"'"'" then .state = "ls" | .code += " " | .lit = ""
+                        elif $c == "#" then .skip = ($cs | length) - $j - 1 | .code += " "
+                        else .code += $c end)
+                   elif .state == "bs" then
+                       (if $c == "\"" then .state = "out" | .code += "\u0001" | .lits += [.lit] | .lit = null
+                        elif $c == "\\" then .skip = 1 | .lit += $c
+                        else .lit += $c end)
+                   elif .state == "ls" then
+                       (if $c == "'"'"'" then .state = "out" | .code += "\u0001" | .lits += [.lit] | .lit = null
+                        else .lit += $c end)
+                   elif .state == "mlb" then
+                       (if $t3 == "\"\"\"" then .state = "out" | .skip = 2 | .code += "   " | .lits += [.lit] | .lit = null
+                        elif $c == "\\" then .skip = 1 | .lit += $c
+                        else .lit += $c end)
+                   else
+                       (if $t3 == "'"'"''"'"''"'"'" then .state = "out" | .skip = 2 | .code += "   " | .lits += [.lit] | .lit = null
+                        else .lit += $c end)
+                   end)
+            end)
+        | (if .lit != null then .lit += "\n" else . end)
+        | .out += [{code: .code, lits: .lits}]
+        | .code = "" | .lits = [] | .skip = 0)
+    | .out;
+. as $raw
+| outline as $o
+| [$o | to_entries[] | {i: .key, code: (.value.code | sub("^ +"; "") | sub(" +$"; "")), lits: .value.lits}] as $L
+| [$L[] | select((.code | startswith("[") and endswith("]")))] as $headers
+| [$headers[] | select(.code == ("[model_providers." + $want + "]"))] as $tables
+| (if ($tables | length) == 1 then ([$headers[] | select(.i > $tables[0].i) | .i] | .[0] // ([$L[] | .i] | length)) else 0 end) as $stop
+| [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^base_url *=")))] as $setters
+| [$setters[] | select((.code | sub("^base_url *= *"; "")) == "\u0001" and (.lits | length) == 1)] as $urls
+| if ($tables | length) == 0 then ""
+  elif ($tables | length) > 1 then "conflict"
+  elif ($setters | length) > 1 then "conflict"
+  elif ($setters | length) != ($urls | length) then "conflict"
+  elif ($setters | length) == 0 then ""
+  else ($setters[0].lits[0] // "conflict") end' "$endpoint_file" 2>/dev/null) || return 1
     [ "$endpoint_value" = conflict ] && return 1
     printf '%s' "$endpoint_value"
 }
@@ -1336,7 +1419,7 @@ token_kinds() {
 }
 
 auth_file_fields() {
-    jq -cn --slurpfile parsed "$1" --argjson selected "$SPEC_JSON" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+    jq -cn --slurpfile parsed "$1" --slurpfile selected "$SPEC_SNAPSHOT" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
         def pointer($name): $name | split("/") | map(select(length > 0));
         def kind($value; $jwt):
             if $value == null then "absent"
@@ -1344,7 +1427,7 @@ auth_file_fields() {
             elif $jwt and $value == $id_token then "placeholder"
             elif ($value | type == "string" and (test($re + "\\z") or . == "placeholder")) then "placeholder"
             else "other" end;
-        [$selected.behavior.credential.auth_file.fields[] as $field |
+        [$selected[0].behavior.credential.auth_file.fields[] as $field |
             ($parsed[0] | getpath(pointer($field.name))) as $value |
             if ($field.kind | type) == "object" and $field.kind.literal.value != null then
                 {name: $field.name, kind: (if $value == $field.kind.literal.value then "literal:" + $value else "other" end)}
@@ -3480,6 +3563,13 @@ main() {
     SPEC_TARGET_JSON=$(jq -c '.target' "$spec") || exit 65
     [ -n "$SPEC_TARGET_JSON" ] || exit 65
     SPEC_JSON=$(head -c "$SPEC_BYTE_CAP" -- "$spec" 2>/dev/null) || exit 65
+    [ -n "$SPEC_JSON" ] || exit 65
+    # Keep the validated document in a private snapshot file so no invocation
+    # ever places it on the argument vector (execve E2BIG) or re-reads /tmp.
+    SPEC_SNAPSHOT=$work/spec.snapshot.json
+    printf '%s\n' "$SPEC_JSON" >"$SPEC_SNAPSHOT" || exit 70
+    chmod 600 "$SPEC_SNAPSHOT" 2>/dev/null || :
+    SPEC_JSON=$(jq -c '.' "$SPEC_SNAPSHOT" 2>/dev/null) || exit 65
     [ -n "$SPEC_JSON" ] || exit 65
     rm -rf "$spec_dir" 2>/dev/null || exit 70
     spec=
