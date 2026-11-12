@@ -940,7 +940,7 @@ answer "$PROVIDER" 7 000
 begin j09_the_staged_home_supplies_the_declared_credential step_J09 ''
 expect agent_reaches_api PASS 'codex exec answered'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
-expect_agent_credential "$PLACEHOLDER"
+expect_agent_credential "config-model=gpt-6.1-sol $PLACEHOLDER"
 expect_never_sent "$HOSTILE_TOKEN"
 expect_absent_from_report "$HOSTILE_TOKEN"
 finish_case
@@ -956,7 +956,7 @@ answer "$PROVIDER" 7 000
 begin j09_a_hostile_codex_home_is_not_the_credential_source step_J09 '' "CODEX_HOME=$t/hostile"
 expect agent_reaches_api PASS 'codex exec answered'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'true oauth_login'
-expect_agent_credential "$PLACEHOLDER"
+expect_agent_credential "config-model=gpt-6.1-sol $PLACEHOLDER"
 expect_never_sent "$HOSTILE_TOKEN"
 expect_sent "Authorization: Bearer $PLACEHOLDER"
 expect_absent_from_report "$HOSTILE_TOKEN"
@@ -972,12 +972,12 @@ answer "$PROVIDER" 7 000
 begin j09_environment_only_credentials_ignore_the_hostile_codex_home step_J09 '' "OPENAI_API_KEY=$API_PLACEHOLDER" "CODEX_HOME=$t/hostile"
 expect agent_reaches_api PASS 'codex exec answered'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'true api_key'
-expect_no_agent_credential
+expect_agent_credential 'config-model=gpt-6.1-sol'
 expect_never_sent "$HOSTILE_TOKEN"
 expect_absent_from_report "$HOSTILE_TOKEN"
 finish_case
 
-mk j09_environment_only_credentials_keep_the_provider_config
+mk j09_environment_only_credentials_launch_with_the_contract_provider_config
 with_curl
 codex_says 'ready' 0
 mkdir -p "$t/sandbox/.codex"
@@ -986,11 +986,11 @@ hostile_codex_home
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
 answer "$PROVIDER" 7 000
-begin j09_environment_only_credentials_keep_the_provider_config step_J09 '' "OPENAI_API_KEY=$API_PLACEHOLDER" "CODEX_HOME=$t/hostile"
+begin j09_environment_only_credentials_launch_with_the_contract_provider_config step_J09 '' "OPENAI_API_KEY=$API_PLACEHOLDER" "CODEX_HOME=$t/hostile"
 expect agent_reaches_api PASS 'codex exec answered'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'true api_key'
 [ -e "$t/codex.ran" ] || problems="$problems codex-not-run"
-expect_agent_credential 'config-model=synthetic-config-model'
+expect_agent_credential 'config-model=gpt-6.1-sol'
 expect_never_sent "$HOSTILE_TOKEN"
 expect_absent_from_report "$HOSTILE_TOKEN"
 finish_case

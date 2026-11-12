@@ -28,6 +28,7 @@ CREDENTIAL_FINGERPRINT=
 RAW_CREDENTIAL=0
 EXPECTED_PROVIDER=
 EXPECTED_MODEL=
+EXPECTED_AGENT=
 ADAPTER=
 AUTH_REQUIRED=present
 START_BIN=/usr/local/bin/jackin-start
@@ -641,6 +642,19 @@ agent_tool_evidence() {
     tool_exit=
     actual_provider=
     actual_model=
+    actual_endpoint=
+    sandbox_endpoint=
+    sandbox_conflict=false
+    if [ "$EXPECTED_AGENT" = codex ]; then
+        if endpoint_value=$(provider_endpoint "$work/agent-home/config.toml" "$EXPECTED_PROVIDER" 2>/dev/null); then
+            actual_endpoint=$endpoint_value
+        fi
+        if endpoint_value=$(provider_endpoint "${AUTH_FILE%/*}/config.toml" "$EXPECTED_PROVIDER" 2>/dev/null); then
+            sandbox_endpoint=$endpoint_value
+        else
+            sandbox_conflict=true
+        fi
+    fi
     tool_workdir=
     if [ "$launch_kind" != none ]; then
         set --
@@ -694,9 +708,11 @@ EOF
     fi
     observation=$(jq -Rn '[inputs]' <"$work/tool.observation")
     jq -cn --arg provider "$actual_provider" --arg model "$actual_model" --arg kind "$TOOL_KIND" \
+        --arg endpoint "$actual_endpoint" --arg sandbox "$sandbox_endpoint" --argjson conflict "$sandbox_conflict" \
         --argjson attempted "$tool_attempted" --argjson succeeded "$tool_succeeded" --arg exit_code "$tool_exit" \
         --arg workdir "$tool_workdir" --argjson observation "$observation" \
-        "$JQN"'{actual_provider: $provider, actual_model: $model,
+        "$JQN"'{actual_provider: $provider, actual_model: $model, actual_endpoint: $endpoint,
+          sandbox_endpoint: (if $conflict then null else $sandbox end),
           tool: {kind: $kind, attempted: $attempted, succeeded: $succeeded,
                  exit_code: ($exit_code | n | if . == null then null else tonumber end),
                  workdir: $workdir, observation: $observation}}'
@@ -715,6 +731,51 @@ copy_bounded() {
     [ "$copy_bytes" -le "$AGENT_HOME_MAX_BYTES" ] || return 1
 }
 
+provider_endpoint() {
+    endpoint_file=$1
+    endpoint_provider=$2
+    [ -f "$endpoint_file" ] || return 0
+    case $endpoint_provider in
+        '' | *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    endpoint_value=$(jq -Rrn --arg want "$endpoint_provider" '
+        [inputs] as $lines
+        | [$lines | to_entries[] | select(.value | test("^[[:space:]]*\\[model_providers\\." + $want + "\\][[:space:]]*$")) | .key] as $tables
+        | if ($tables | length) != 1 then "conflict"
+        else
+            [$lines[$tables[0] + 1:][] | select(test("^[[:space:]]*\\[") | not)] as $body
+            | [$body[] | select(test("^[[:space:]]*base_url[[:space:]]*="))] as $setters
+            | [$body[] | try (capture("^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"(?<u>[^\"]*)\"[[:space:]]*$").u)] as $urls
+            | if ($urls | length) > 1 or ($setters | length) != ($urls | length) then "conflict"
+            elif ($urls | length) == 0 then ""
+            else $urls[0] end
+        end' "$endpoint_file" 2>/dev/null) || return 1
+    [ "$endpoint_value" = conflict ] && return 1
+    printf '%s' "$endpoint_value"
+}
+
+stage_provider_config() {
+    stage_target=$1
+    [ "$EXPECTED_AGENT" = codex ] || return 0
+    case $EXPECTED_PROVIDER in
+        '' | *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    jq -r --arg path "${AUTH_FILE%/*}/config.toml" --arg provider "$EXPECTED_PROVIDER" \
+        --arg model "$EXPECTED_MODEL" --arg endpoint "$PROVIDER_URL" '
+        [.behavior.credential.config_files // [] | .[] | select(.path == $path) | (.required_text // [])[]] as $lines
+        | ([$lines[] | select(test("^model_provider[[:space:]]*=")) | capture("^model_provider[[:space:]]*=[[:space:]]*\"(?<v>[^\"]*)\"[[:space:]]*$").v]) as $wired
+        | if any($lines[]; test("^[[:space:]]*\\[") or test("[[:cntrl:]]")) then empty
+        elif ($wired | length) > 1 or (($wired | length) == 1 and $wired[0] != $provider) then empty
+        else
+            ([$lines[] | select(test("^(model|model_provider)[[:space:]]*="))]) as $top
+            | ([$lines[] | select(test("^(model|model_provider)[[:space:]]*=") | not)]) as $table
+            | (if ($top | length) == 0 then ["model = " + ($model | tojson), "model_provider = " + ($provider | tojson)] else $top end) as $top
+            | (if ($table | length) == 0 then ["name = " + ($provider | tojson), "base_url = " + ($endpoint | tojson)] else $table end) as $table
+            | $top[], "", "[model_providers." + $provider + "]", $table[]
+        end' "$spec" >"$stage_target" 2>/dev/null || return 1
+    [ -s "$stage_target" ] || return 1
+}
+
 stage_agent_home() {
     stage_dir=$work/agent-home
     rm -rf "$stage_dir" 2>/dev/null || return 1
@@ -727,10 +788,7 @@ stage_agent_home() {
         esac
         copy_bounded "$AUTH_FILE" "$stage_dir/$stage_name" || return 1
     fi
-    stage_config=${AUTH_FILE%/*}/config.toml
-    if [ -f "$stage_config" ]; then
-        copy_bounded "$stage_config" "$stage_dir/config.toml" || return 1
-    fi
+    stage_provider_config "$stage_dir/config.toml" || return 1
     return 0
 }
 
@@ -1119,12 +1177,13 @@ EOF
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
     unset _jks_stdout_parsed_answer _jks_stdout_extra
-    evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
+    evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","actual_endpoint":"","sandbox_endpoint":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
     jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" --argjson evidence "$evidence" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
           answered: $answered, output_bytes: $bytes,
-          actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model, tool: $evidence.tool}' >"$work/agent_exec.json"
+          actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model,
+          actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}' >"$work/agent_exec.json"
 }
 
 egress() {
@@ -1997,15 +2056,27 @@ step_J07() (
     ensure_agent_exec
     process_checks
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
-    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" '
+    codex_target=false
+    [ "$EXPECTED_AGENT" = codex ] && codex_target=true
+    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+        --arg endpoint "$PROVIDER_URL" --argjson codex "$codex_target" '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
+        ($codex == false or (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint)))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
+    endpoint_mismatch=false
+    if [ "$codex_target" = true ]; then
+        endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
+            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+             (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
+    fi
     if [ "$attempted" = true ]; then
         if [ "$complete" = true ]; then
             pass agent_exec "codex exec answered the fixed prompt and completed the declared tool"
         elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
             fail agent_exec "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
+        elif [ "$endpoint_mismatch" = true ]; then
+            fail agent_exec "the provider endpoint is not the contract endpoint $PROVIDER_URL"
         else
             fail agent_exec "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
         fi
@@ -2450,15 +2521,27 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" '
+    codex_target=false
+    [ "$EXPECTED_AGENT" = codex ] && codex_target=true
+    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+        --arg endpoint "$PROVIDER_URL" --argjson codex "$codex_target" '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
+        ($codex == false or (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint)))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
+    endpoint_mismatch=false
+    if [ "$codex_target" = true ]; then
+        endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
+            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+             (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
+    fi
     if [ "$(jq -r '.attempted' "$work/agent_exec.json")" = true ]; then
         if [ "$complete" = true ]; then
             pass agent_reaches_api "codex exec answered and completed the declared tool"
         elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
             fail agent_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
+        elif [ "$endpoint_mismatch" = true ]; then
+            fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL"
         else
             fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
         fi
@@ -3295,6 +3378,7 @@ main() {
     CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
     EXPECTED_PROVIDER=$(jq -r '.target.provider' "$spec") || exit 65
     EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
+    EXPECTED_AGENT=$(jq -r '.target.agent' "$spec") || exit 65
     ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"

@@ -1553,6 +1553,42 @@ for step in J07 J11; do
     finish_case
 done
 
+mk j07_a_sandbox_config_with_a_hostile_endpoint_fails_the_contract_endpoint_check
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "http://127.0.0.1:9/v1"\n'
+} >"$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin j07_a_sandbox_config_with_a_hostile_endpoint_fails_the_contract_endpoint_check sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+expect agent_exec FAIL 'contract endpoint'
+fact '.agent_exec.sandbox_endpoint' 'http://127.0.0.1:9/v1'
+fact '.agent_exec.actual_endpoint' 'https://chatgpt.com/backend-api/models'
+finish_case
+
 mk j11_two_agent_children_are_not_a_pass
 state 'running 1'
 proc_main
