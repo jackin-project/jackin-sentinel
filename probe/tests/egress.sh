@@ -292,6 +292,27 @@ EOF
     chmod +x "$t/bin/codex"
 }
 
+codex_says_home_mutator() {
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        cat "\$CODEX_HOME/../spec.snapshot" >>"$t/spec.seen" 2>/dev/null || :
+        printf 'corrupted' >>"\$CODEX_HOME/../spec.snapshot" 2>/dev/null || :
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+    chmod +x "$t/bin/codex"
+}
+
 shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
@@ -1444,6 +1465,20 @@ printf '%s\n' "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":
 begin j09_a_spec_rewritten_midrun_cannot_change_the_report step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
 expect agent_reaches_api PASS 'completed the declared tool'
 jq -e '.target.tuple == "T01" and .target.adapter == "t01-codex-v1" and .target.spec_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
+finish_case
+
+mk j09_the_agent_cannot_reach_the_attested_spec_snapshot
+codex_says_home_mutator
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+mkdir -p "$t/sandbox/.codex"
+printf '%s\n' "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":\"\",\"id_token\":\"\"}}" >"$t/sandbox/.codex/auth.json"
+begin j09_the_agent_cannot_reach_the_attested_spec_snapshot step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.target.tuple' 'T01'
+[ ! -s "$t/spec.seen" ] || problems="$problems agent-read-the-attested-spec"
 finish_case
 
 for tuple in T09 T14 T18; do

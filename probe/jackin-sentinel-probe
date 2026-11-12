@@ -3375,7 +3375,9 @@ main() {
         exit 65
     fi
     work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
-    trap 'rm -rf "$work"' EXIT
+    spec_dir=$(mktemp -d /tmp/jackin-sentinel-probe-spec.XXXXXX) || exit 70
+    chmod 700 "$spec_dir" 2>/dev/null || :
+    trap 'rm -rf "$work" "$spec_dir"' EXIT
     trap 'exit 70' INT TERM HUP
     RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
     RUN_KEY=${RUN_KEY%% *}
@@ -3396,15 +3398,16 @@ main() {
         echo "$PROBE: no key material for the step seals; refusing to run" >&2
         exit 70
     fi
-    if read_bounded "$spec" "$work/spec.snapshot" "$SPEC_BYTE_CAP"; then
-        spec=$work/spec.snapshot
-    elif jq -jRs '.' "$spec" >"$work/spec.snapshot" 2>/dev/null && [ -s "$work/spec.snapshot" ]; then
-        spec=$work/spec.snapshot
+    if read_bounded "$spec" "$spec_dir/spec.snapshot" "$SPEC_BYTE_CAP"; then
+        spec=$spec_dir/spec.snapshot
+    elif jq -jRs '.' "$spec" >"$spec_dir/spec.snapshot" 2>/dev/null && [ -s "$spec_dir/spec.snapshot" ]; then
+        spec=$spec_dir/spec.snapshot
     else
-        rm -f "$work/spec.snapshot"
+        rm -rf "$spec_dir"
         echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
         exit 65
     fi
+    chmod 400 "$spec_dir/spec.snapshot" 2>/dev/null || :
     if ! jq -e '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
