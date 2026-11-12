@@ -2532,7 +2532,7 @@ EOF
             auth_state=malformed
             auth_problem=1
         else
-            fields=$(auth_file_fields "$auth") || fields='[]'
+            fields=$(auth_file_fields "$auth") || { fields='[]'; auth_problem=1; }
         fi
         auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
             '{state: $state, path: $path, mode: $mode, fields: $fields}')
@@ -3570,12 +3570,11 @@ main() {
     [ -n "$SPEC_JSON" ] || exit 65
     # Keep the validated document in a private snapshot file so no invocation
     # ever places it on the argument vector (execve E2BIG) or re-reads /tmp.
-    SPEC_SNAPSHOT=$work/spec.snapshot.json
+    SPEC_SNAPSHOT=$spec_dir/spec.snapshot.json
     printf '%s\n' "$SPEC_JSON" >"$SPEC_SNAPSHOT" || exit 70
     chmod 600 "$SPEC_SNAPSHOT" 2>/dev/null || :
     SPEC_JSON=$(jq -c '.' "$SPEC_SNAPSHOT" 2>/dev/null) || exit 65
     [ -n "$SPEC_JSON" ] || exit 65
-    rm -rf "$spec_dir" 2>/dev/null || exit 70
     spec=
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"
