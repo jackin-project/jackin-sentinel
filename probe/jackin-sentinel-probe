@@ -769,8 +769,8 @@ declared_provider_config() {
             [ -n "$declared_line" ] || continue
             grep -Fq -- "$declared_line" "$work/config.snapshot" && return 1
         done <"$work/config.forbidden"
-        sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" 2>/dev/null \
-            | grep -Eo "https?://[^\"'<>[:space:]]+" >"$work/config.urls" || :
+        sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" 2>/dev/null |
+            grep -Eo "https?://[^\"'<>[:space:]]+" >"$work/config.urls" || :
         [ -s "$work/config.urls" ] || return 1
         while IFS= read -r declared_line; do
             [ -n "$declared_line" ] || continue
