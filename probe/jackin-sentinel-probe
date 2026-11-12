@@ -28,6 +28,9 @@ CREDENTIAL_FINGERPRINT=
 RAW_CREDENTIAL=0
 EXPECTED_PROVIDER=
 EXPECTED_MODEL=
+PIN_MODES=
+PIN_STATS=
+stage_config_stat=
 EXPECTED_AGENT=
 ADAPTER=
 AUTH_REQUIRED=present
@@ -994,21 +997,34 @@ PY
 }
 
 pin_declared_configs() {
+    PIN_MODES=
+    PIN_STATS=
+    pin_declared_configs_run || {
+        unpin_declared_configs
+        return 1
+    }
+    return 0
+}
+
+pin_declared_configs_run() {
     command -v chmod >/dev/null 2>&1 || return 1
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
-        [ -f "$work/config.validated.$declared_index" ] || return 1
+        [ -f "$spec_dir/config.validated.$declared_index" ] || return 1
         declared_mode=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_path" 2>/dev/null) || declared_mode=
         case $declared_mode in
             '' | *[!0-7]*) declared_mode=0644 ;;
         esac
-        printf '%s\n' "$declared_mode" >"$work/config.mode.$declared_index" || return 1
+        PIN_MODES="${PIN_MODES}${declared_mode}
+"
         chmod 0644 "$declared_path" 2>/dev/null || true
-        cat "$work/config.validated.$declared_index" >"$declared_path" || return 1
+        cat "$spec_dir/config.validated.$declared_index" >"$declared_path" || return 1
         chmod 0444 "$declared_path" || return 1
-        python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$declared_path" >"$work/config.stat.$declared_index" 2>/dev/null || return 1
+        declared_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$declared_path" 2>/dev/null) || return 1
+        PIN_STATS="${PIN_STATS}${declared_stat}
+"
         declared_index=$((declared_index + 1))
     done
     return 0
@@ -1019,9 +1035,12 @@ unpin_declared_configs() {
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 0
-        declared_mode=$(cat "$work/config.mode.$declared_index" 2>/dev/null) || declared_mode=
+        declared_mode=$(printf '%s\n' "$PIN_MODES" | sed -n "$((declared_index + 1))p")
         case $declared_mode in
-            '' | *[!0-7]*) declared_mode=0644 ;;
+            '' | *[!0-7]*)
+                declared_index=$((declared_index + 1))
+                continue
+                ;;
         esac
         chmod "$declared_mode" "$declared_path" 2>/dev/null || true
         declared_index=$((declared_index + 1))
@@ -1049,7 +1068,8 @@ declared_configs_stat_unchanged() {
         stat_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$stat_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$stat_path" ] || return 1
         stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stat_path" 2>/dev/null) || return 1
-        stat_pinned=$(cat "$work/config.stat.$stat_index" 2>/dev/null) || return 1
+        stat_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((stat_index + 1))p")
+        [ -n "$stat_pinned" ] || return 1
         [ "$stat_now" = "$stat_pinned" ] || return 1
         stat_index=$((stat_index + 1))
     done

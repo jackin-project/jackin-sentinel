@@ -2117,5 +2117,26 @@ expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
 finish_case
 
+mk j09_a_pinning_abort_restores_the_declared_config_modes
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0600 "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"
+cat >"$t/bad-bin/chmod" <<EOF
+#!/bin/sh
+if [ "\$1" = 0444 ] && [ "\$2" = "$t/sandbox/.omp/agent/models.yml" ]; then
+    exit 1
+fi
+exec "$scratch/tools/chmod" "\$@"
+EOF
+chmod +x "$t/bad-bin/chmod"
+begin j09_a_pinning_abort_restores_the_declared_config_modes step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+for declared_mode_file in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
+    declared_mode_after=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_mode_file" 2>/dev/null)
+    [ "$declared_mode_after" = 600 ] || problems="$problems mode-after-run=[$declared_mode_after](want [600])"
+done
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
