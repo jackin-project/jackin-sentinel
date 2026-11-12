@@ -822,7 +822,7 @@ import sys
 
 import yaml
 
-url_re = re.compile(r'^https?://[^[:space:]"<>]+$')
+url_re = re.compile(r'^https?://[^\s"<>]+\Z')
 
 
 class Loader(yaml.SafeLoader):
