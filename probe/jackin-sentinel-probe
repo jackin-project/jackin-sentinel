@@ -62,6 +62,13 @@ J10_ALLOWED="$STATE_DIR /tmp"
 J10_DENIED="/var/tmp /dev/shm /usr/local/bin /etc /opt /var/lib"
 ALL_STEPS='J00 J04 J05 J06 J07 J08 J09 J10 J11 J12 J13 J14 J15 J16'
 JQN='def n: if . == "" then null else . end;'
+RUN_KEY=
+RUN_SEED=
+_jks_chain=
+_jks_doc=
+_jks_facts_doc=
+_jks_step=
+report_steps=
 
 usage() {
     echo "usage: $PROBE --spec PATH [--host] [--docker on|off] [--engine HOST:PORT] [--only J04,J05,...]" >&2
@@ -78,8 +85,55 @@ check() {
     if [ "$2" != PASS ] && [ -z "$detail" ]; then
         detail="no detail"
     fi
-    jq -cn --arg name "$1" --arg result "$2" --arg detail "$detail" \
-        '{name: $name, result: $result, detail: ($detail | .[0:300])}' >>"$work/checks"
+    _jks_doc=$(jq -cn --arg name "$1" --arg result "$2" --arg detail "$detail" \
+        '{name: $name, result: $result, detail: ($detail | .[0:300])}') || return 0
+    if [ -z "$_jks_doc" ]; then
+        return 0
+    fi
+    if [ -n "$RUN_KEY" ]; then
+        _jks_chain=$(printf '%s%s\n' "$RUN_KEY$_jks_chain" "$_jks_doc" | sha256sum)
+        _jks_chain=${_jks_chain%% *}
+        if [ -n "$_jks_chain" ]; then
+            printf '%s\n' "$_jks_chain" >"$work/checks.tag"
+        fi
+    fi
+    printf '%s\n' "$_jks_doc" >>"$work/checks"
+}
+
+seal_facts() {
+    if [ -z "$1" ]; then
+        : >"$work/facts"
+        : >"$work/facts.tag"
+        return 0
+    fi
+    printf '%s\n' "$1" >"$work/facts"
+    if [ -n "$RUN_KEY" ]; then
+        _jks_chain=$(printf '%s%s\n' "$RUN_KEY$_jks_chain" "$1" | sha256sum)
+        _jks_chain=${_jks_chain%% *}
+        printf '%s\n' "$_jks_chain" >"$work/facts.tag"
+    fi
+}
+
+seal_replay() {
+    _jks_h=$RUN_SEED
+    while IFS= read -r _jks_line; do
+        [ -n "$_jks_line" ] || continue
+        _jks_h=$(printf '%s%s\n' "$RUN_KEY$_jks_h" "$_jks_line" | sha256sum)
+        _jks_h=${_jks_h%% *}
+    done
+    if [ -n "$_jks_checks_tag" ]; then
+        [ "$_jks_checks_tag" = "$_jks_h" ] || return 1
+    elif [ -n "$_jks_checks" ]; then
+        return 1
+    fi
+    if [ -n "$_jks_facts" ]; then
+        [ -n "$_jks_facts_tag" ] || return 1
+        _jks_h=$(printf '%s%s\n' "$RUN_KEY$_jks_h" "$_jks_facts" | sha256sum)
+        _jks_h=${_jks_h%% *}
+        [ "$_jks_facts_tag" = "$_jks_h" ] || return 1
+    elif [ -n "$_jks_facts_tag" ]; then
+        return 1
+    fi
 }
 
 pass() {
@@ -95,12 +149,27 @@ skip() {
 }
 
 finish() {
-    jq -cn --arg id "$1" --slurpfile checks "$work/checks" --slurpfile facts "$work/facts" '
-        ($checks
+    for _jks_material in checks checks.tag facts facts.tag; do
+        [ -f "$work/$_jks_material" ] || {
+            echo "$PROBE: step $1 seal material is missing; refusing to attest" >&2
+            exit 70
+        }
+    done
+    _jks_checks=$(cat "$work/checks")
+    _jks_checks_tag=$(cat "$work/checks.tag")
+    _jks_facts=$(cat "$work/facts")
+    _jks_facts_tag=$(cat "$work/facts.tag")
+    if [ -n "$RUN_KEY" ] && ! printf '%s\n' "$_jks_checks" | seal_replay >/dev/null; then
+        echo "$PROBE: step $1 evidence does not match its seal; refusing to attest" >&2
+        exit 70
+    fi
+    _jks_step=$(printf '%s\n%s\n' "${_jks_facts:-null}" "$_jks_checks" | jq -cs --arg id "$1" '
+        . as $stream | ($stream[0] // null) as $facts | $stream[1:] as $checks
+        | ($checks
             + (if ($checks | length) == 0
                then [{name: "checks", result: "FAIL", detail: "the step recorded no check"}]
                else [] end)
-            + (if $facts[0] == null and all($checks[]; .result != "SKIP")
+            + (if $facts == null and all($checks[]; .result != "SKIP")
                then [{name: "facts", result: "FAIL", detail: "the step collected no facts"}]
                else [] end)) as $c
         | (if any($c[]; .result == "FAIL") then "FAIL"
@@ -112,7 +181,9 @@ finish() {
                      else ([$c[] | select(.result == $r) | "\(.name): \(.detail)"] | join("; ") | .[0:600])
                      end),
             checks: $c,
-            facts: ($facts[0] // null)}}' >"$work/step.$1"
+            facts: $facts}}')
+    report_steps="$report_steps$_jks_step
+"
 }
 
 selected() {
@@ -1568,8 +1639,9 @@ step_J00() (
     else
         fail agent_binary "$AGENT_BIN is not an executable file"
     fi
-    jq -n --arg path "$AGENT_BIN" --argjson present "$present" --argjson executable "$executable" --arg version "$version" \
-        "$JQN"'{agent: {path: $path, present: $present, executable: $executable, version: ($version | n)}}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --arg path "$AGENT_BIN" --argjson present "$present" --argjson executable "$executable" --arg version "$version" \
+        "$JQN"'{agent: {path: $path, present: $present, executable: $executable, version: ($version | n)}}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J04() (
@@ -1642,9 +1714,10 @@ step_J04() (
     else
         pass docker_binary "found=$docker_binary with the capability $docker"
     fi
-    jq -n --arg user "$user" --argjson uid "$uid" --argjson gid "$gid" --arg home "$home" \
+    _jks_facts_doc=$(jq -n --arg user "$user" --argjson uid "$uid" --argjson gid "$gid" --arg home "$home" \
         --argjson sudo_found "$sudo_found" --argjson sudo_works "$sudo_works" --argjson docker_binary "$docker_binary" \
-        '{user: $user, uid: $uid, gid: $gid, home: $home, sudo: {found: $sudo_found, works: $sudo_works}, docker_binary: $docker_binary}' >"$work/facts"
+        '{user: $user, uid: $uid, gid: $gid, home: $home, sudo: {found: $sudo_found, works: $sudo_works}, docker_binary: $docker_binary}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J05() (
@@ -1827,8 +1900,9 @@ EOF
     else
         fail files "the project holds no file"
     fi
-    jq -n --arg project "$PROJECT" --argjson tree "$git_work_tree" --argjson files "$files" \
-        '{project: $project, git_work_tree: $tree, files: $files}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --arg project "$PROJECT" --argjson tree "$git_work_tree" --argjson files "$files" \
+        '{project: $project, git_work_tree: $tree, files: $files}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J06() (
@@ -1894,9 +1968,10 @@ EOF
     else
         fail hooks_immutable "missing, symlinked, not a regular executable file, not root-owned or writable:$exposed"
     fi
-    jq -n --arg state_dir "$STATE_DIR" --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
+    _jks_facts_doc=$(jq -n --arg state_dir "$STATE_DIR" --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
         --argjson failures "$preflight_failures" --slurpfile hooks "$work/hooks.ndjson" \
-        '{state_dir: $state_dir, setup_runs: $setup, preflight_runs: $preflight, preflight_failures: $failures, hooks: $hooks}' >"$work/facts"
+        '{state_dir: $state_dir, setup_runs: $setup, preflight_runs: $preflight, preflight_failures: $failures, hooks: $hooks}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J07() (
@@ -1919,8 +1994,9 @@ step_J07() (
     else
         skip agent_exec "$(cat "$work/agent_exec.why")"
     fi
-    jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
-        '{processes: $p[0], agent_exec: $x[0]}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
+        '{processes: $p[0], agent_exec: $x[0]}')
+    seal_facts "$_jks_facts_doc"
 )
 
 agent_env() {
@@ -2309,13 +2385,14 @@ EOF
         read | stale) attempt_fact=$record_attempt ;;
         *) attempt_fact=null ;;
     esac
-    jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
+    _jks_facts_doc=$(jq -n --argjson environment "$environment" --argjson auth_file "$auth_file" --argjson leaks "$leaks" \
         --argjson leak_count "$leak_count" \
         --arg main_env "$main_env" --arg agent_env "$agent_env" \
         --arg record_state "$record_state" --argjson record_attempt "$attempt_fact" \
         '{environment: $environment, agent_environment: {main: $main_env, agent: $agent_env},
           start_record: {state: $record_state, attempt: $record_attempt},
-          auth_file: $auth_file, leaks: $leaks, leak_count: $leak_count}' >"$work/facts"
+          auth_file: $auth_file, leaks: $leaks, leak_count: $leak_count}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J09() (
@@ -2386,8 +2463,9 @@ step_J09() (
         fi
     fi
     rm -f "$work/provider.body"
-    jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/agent_exec.json" \
-        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/agent_exec.json" \
+        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J10() (
@@ -2445,13 +2523,15 @@ step_J10() (
     else
         fail denial_by_policy "no denied path was writable by mode, so the policy is not proven"
     fi
-    jq -n --slurpfile writes "$work/writes.ndjson" '{writes: $writes}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --slurpfile writes "$work/writes.ndjson" '{writes: $writes}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J11() (
     collect_processes
     process_checks
-    jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J12() (
@@ -2474,7 +2554,8 @@ step_J12() (
     else
         pass distinct_tty "probe $self_tty, every Codex child has a distinct tty"
     fi
-    jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}' >"$work/facts"
+    _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0]}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J13() (
@@ -2588,9 +2669,10 @@ EOF
     else
         fail refs "git for-each-ref failed or reported a broken ref, so the branches and stash facts are unknown: $(head -n 3 "$work/refs.err" 2>/dev/null | tr '\n' ';')"
     fi
-    jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
+    _jks_facts_doc=$(jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
         --argjson branches "$branches" --argjson clean "$clean" --argjson stash "$stash" \
-        "$JQN"'{project: $project, work_tree: $work_tree, branch: ($branch | n), head: ($head | n), branches: $branches, clean: $clean, stash: $stash}' >"$work/facts"
+        "$JQN"'{project: $project, work_tree: $work_tree, branch: ($branch | n), head: ($head | n), branches: $branches, clean: $clean, stash: $stash}')
+    seal_facts "$_jks_facts_doc"
 )
 
 marker_state_of() {
@@ -2660,9 +2742,10 @@ step_J14() (
     else
         pass hook_logs "the hook logs are readable"
     fi
-    jq -n --arg boot_id "$boot_id" --arg path "$marker" --arg id "$id" --argjson created "$created" \
+    _jks_facts_doc=$(jq -n --arg boot_id "$boot_id" --arg path "$marker" --arg id "$id" --argjson created "$created" \
         --argjson setup "$setup_runs" --argjson preflight "$preflight_runs" \
-        '{boot_id: $boot_id, marker: {path: $path, id: $id, created: $created}, setup_runs: $setup, preflight_runs: $preflight}' >"$work/facts"
+        '{boot_id: $boot_id, marker: {path: $path, id: $id, created: $created}, setup_runs: $setup, preflight_runs: $preflight}')
+    seal_facts "$_jks_facts_doc"
 )
 
 docker_capture() (
@@ -2989,14 +3072,15 @@ EOF
         fail engine "docker info gave no engine id"
     fi
     unset _jks_docker_run_complete_fact
-    jq -n --argjson found "$found" --arg path "$docker_path" --arg host "$host" --arg tls "$tls" --arg cert_path "$cert_path" \
+    _jks_facts_doc=$(jq -n --argjson found "$found" --arg path "$docker_path" --arg host "$host" --arg tls "$tls" --arg cert_path "$cert_path" \
         --slurpfile certs "$work/certs.ndjson" --arg run_exit "$run_exit" --argjson hello "$hello" \
         --arg engine_id "$engine_id" --arg engine_version "$engine_version" \
         "$JQN"'{docker_binary: {found: $found, path: ($path | n)},
           environment: {docker_host: ($host | n), tls_verify: ($tls | n), cert_path: ($cert_path | n)},
           certificates: $certs,
           run: {exit_code: ($run_exit | n | if . == null then null else tonumber end), hello: $hello},
-          engine: {id: ($engine_id | n), server_version: ($engine_version | n)}}' >"$work/facts"
+          engine: {id: ($engine_id | n), server_version: ($engine_version | n)}}')
+    seal_facts "$_jks_facts_doc"
 )
 
 step_J16() (
@@ -3044,11 +3128,12 @@ step_J16() (
             *) denial_check engine_denied "$engine" "$reply" ;;
         esac
     fi
-    jq -n --argjson binary "$binary" --argjson variables "$variables" --arg engine "$engine" \
+    _jks_facts_doc=$(jq -n --argjson binary "$binary" --argjson variables "$variables" --arg engine "$engine" \
         --argjson attempted "$attempted" --argjson curl_found "$curl_found" --argjson reply "$reply" --argjson control "$control" \
         "$JQN"'{docker_binary: $binary, docker_variables: $variables, endpoint: ($engine | n),
           connection: {attempted: $attempted, curl_found: $curl_found, curl_exit: ($reply.curl_exit // null), http_code: ($reply.http_code // 0)},
-          resolver_control: $control}' >"$work/facts"
+          resolver_control: $control}')
+    seal_facts "$_jks_facts_doc"
 )
 
 main() {
@@ -3180,6 +3265,25 @@ main() {
     work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
     trap 'rm -rf "$work"' EXIT
     trap 'exit 70' INT TERM HUP
+    RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
+    RUN_KEY=${RUN_KEY%% *}
+    case $RUN_KEY in
+        '' | *[!0-9a-f]*) RUN_KEY= ;;
+    esac
+    [ "${#RUN_KEY}" -eq 64 ] || RUN_KEY=
+    RUN_SEED=
+    if [ -n "$RUN_KEY" ]; then
+        RUN_SEED=$(printf '%s' "$RUN_KEY" | sha256sum 2>/dev/null)
+        RUN_SEED=${RUN_SEED%% *}
+        case $RUN_SEED in
+            '' | *[!0-9a-f]*) RUN_KEY= ;;
+        esac
+        [ "${#RUN_SEED}" -eq 64 ] || RUN_KEY=
+    fi
+    if [ -z "$RUN_KEY" ] && [ "$mode" != host ]; then
+        echo "$PROBE: no key material for the step seals; refusing to run" >&2
+        exit 70
+    fi
     cat >"$work/bounded-copy.sh" <<'EOF'
 copy_source=$1
 copy_target=$2
@@ -3219,10 +3323,14 @@ if [ "$copy_bytes" -gt "$copy_cap" ]; then
 fi
 exit 0
 EOF
+    report_steps=
     for id in $ALL_STEPS; do
         selected "$id" || continue
         : >"$work/checks"
+        : >"$work/checks.tag"
         : >"$work/facts"
+        : >"$work/facts.tag"
+        _jks_chain=$RUN_SEED
         if [ "$mode" = host ]; then
             skip sandbox "not running in a sandbox (--host)"
         else
@@ -3230,7 +3338,12 @@ EOF
         fi
         finish "$id"
     done
-    cat "$work"/step.J* | jq -cMs --arg mode "$mode" --arg docker "$docker" --arg engine "$engine" \
+    for artifact in "$work"/step.*; do
+        [ -e "$artifact" ] || continue
+        echo "$PROBE: a foreign step artifact appeared; refusing to attest" >&2
+        exit 70
+    done
+    printf '%s' "$report_steps" | jq -cMs --arg mode "$mode" --arg docker "$docker" --arg engine "$engine" \
         --slurpfile spec "$spec" \
         "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $spec[0].target,
           mode: $mode, docker: $docker, engine: ($engine | n), steps: add}'

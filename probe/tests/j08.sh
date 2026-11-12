@@ -4663,6 +4663,85 @@ for tuple in T09 T14 T18; do
     finish_case
 done
 
+forge_peer() {
+    real_timeout=$(command -v timeout) || return 1
+    rm -f "$t/.peer-planted"
+    cat >"$t/bin/timeout" <<EOF
+#!/bin/sh
+if [ ! -e "$t/.peer-planted" ]; then
+    for argument in "\$@"; do
+        case \$argument in
+            of=*/run-state.raw)
+                peer_work=\${argument#of=}
+                peer_work=\${peer_work%run-state.raw}
+                : >"$t/.peer-planted"
+                case "$1" in
+                    steps)
+                        printf '%s\n' '$2' >"\${peer_work}step.J00"
+                        printf '%s\n' '$2' >"\${peer_work}step.J08"
+                        ;;
+                    checks)
+                        printf '%s\n' '$2' >>"\${peer_work}checks"
+                        ;;
+                    junk)
+                        printf '%s\n' '$2' >"\${peer_work}peer-note.txt"
+                        ;;
+                esac
+                ;;
+        esac
+    done
+fi
+exec $real_timeout "\$@"
+EOF
+    chmod +x "$t/bin/timeout"
+}
+
+mk peer_forged_step_artifacts_are_refused
+state 'exited 1 0'
+record "$R_OK1"
+forge_peer steps '{"J00":{"result":"PASS","reason":"forged by the peer","checks":[{"name":"peer-forged","result":"PASS","detail":"peer forged another job step"}],"facts":{}}}'
+begin peer_forged_step_artifacts_are_refused sh "$t/probe" --only J08
+expect_rc 70
+if [ -s "$t/out" ]; then
+    problems="$problems aggregate-emitted-despite-tampering"
+fi
+case $(cat "$t/err") in
+    *refusing*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want refusal)" ;;
+esac
+finish_case
+
+mk peer_forged_check_lines_are_refused
+state 'exited 1 0'
+record "$R_OK1"
+forge_peer checks '{"name":"peer-forged","result":"PASS","detail":"peer forged a check"}'
+begin peer_forged_check_lines_are_refused sh "$t/probe" --only J08
+expect_rc 70
+if [ -s "$t/out" ]; then
+    problems="$problems aggregate-emitted-despite-tampering"
+fi
+case $(cat "$t/err") in
+    *refusing*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want refusal)" ;;
+esac
+finish_case
+
+mk peer_scratch_junk_does_not_disturb_the_report
+state 'exited 1 0'
+record "$R_OK1"
+forge_peer junk 'peer note'
+begin peer_scratch_junk_does_not_disturb_the_report sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment PASS 'via record'
+if jq -e '.steps | has("J00") or has("J09")' "$t/out" >/dev/null 2>&1; then
+    problems="$problems foreign-step-in-aggregate"
+fi
+if grep -Fq 'peer note' "$t/out"; then
+    problems="$problems peer-note-in-report"
+fi
+finish_case
+
 fixture_spec=
 fixture_comm=
 fixture_fingerprint=
