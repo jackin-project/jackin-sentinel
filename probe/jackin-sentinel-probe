@@ -2694,7 +2694,10 @@ EOF
             auth_state=malformed
             auth_problem=1
         else
-            fields=$(auth_file_fields "$auth") || { fields='[]'; auth_problem=1; }
+            fields=$(auth_file_fields "$auth") || {
+                fields='[]'
+                auth_problem=1
+            }
         fi
         auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
             '{state: $state, path: $path, mode: $mode, fields: $fields}')
