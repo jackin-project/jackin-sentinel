@@ -645,6 +645,7 @@ agent_tool_evidence() {
     actual_provider=
     actual_model=
     actual_endpoint=
+    configs_stat_ok=true
     sandbox_endpoint=
     sandbox_conflict=false
     if [ "$EXPECTED_AGENT" = codex ]; then
@@ -688,6 +689,7 @@ EOF
         )
         tool_exit=$?
         if [ "$configs_pinned" = true ]; then
+            declared_configs_stat_unchanged || configs_stat_ok=false
             unpin_declared_configs
         fi
         events=$(jq -Rs '[split("\n")[] | select(length > 0) | fromjson?]' "$work/tool.out" 2>/dev/null) || events='[]'
@@ -731,7 +733,7 @@ EOF
         declared_use_snapshot=1
         declared_provider_config || actual_endpoint=
         declared_use_snapshot=
-        if [ -n "$actual_endpoint" ] && ! declared_configs_match_snapshot; then
+        if [ -n "$actual_endpoint" ] && { [ "$configs_stat_ok" != true ] || ! declared_configs_match_snapshot; }; then
             actual_endpoint=
         fi
     fi
@@ -763,8 +765,11 @@ read_bounded() {
             head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" 2>/dev/null || return 1
         fi
     else
-        jq -Rrsn --argjson n "$((read_cap + 1))" --rawfile src "$read_src" '$src | .[0:$n]' \
-            >"$read_dst" 2>/dev/null || return 1
+        if command -v dd >/dev/null 2>&1; then
+            dd if="$read_src" of="$read_dst" bs="$((read_cap + 1))" count=1 2>/dev/null || return 1
+        else
+            return 1
+        fi
     fi
     [ -f "$read_dst" ] || return 1
     if command -v wc >/dev/null 2>&1; then
@@ -816,7 +821,7 @@ declared_provider_config() {
         sed 's/\r$//' "$work/config.snapshot" >"$work/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                if ! python3 - "$work/config.normalized" >"$work/config.declared" <<'PY'
+                if ! python3 -I - "$work/config.normalized" >"$work/config.declared" <<'PY'
 import re
 import sys
 
@@ -830,13 +835,16 @@ key_re = re.compile(r'^("(?:[^"\\]|\\.)*"|\'[^\']*\'|[^:#\s][^:]*?)\s*:(?:[ \t]+
 
 
 def plain_root_scalars(text):
-    """Root-level scalars of a YAML block mapping (strict subset, no third-party code)."""
     root = {}
     lines = text.split("\n")
     i = 0
     while i < len(lines):
         line = lines[i]
         i += 1
+        if line.startswith("---") and line[3:4] in ("", " ", "\t"):
+            line = line[3:].lstrip(" \t")
+        elif line.rstrip() == "...":
+            continue
         if not line.strip() or line[0] in " \t" or line[0] == "#":
             continue
         match = key_re.match(line)
@@ -961,7 +969,7 @@ pin_declared_configs() {
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -f "$work/config.validated.$declared_index" ] || return 1
-        declared_mode=$(python3 -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_path" 2>/dev/null) || declared_mode=
+        declared_mode=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_path" 2>/dev/null) || declared_mode=
         case $declared_mode in
             '' | *[!0-7]*) declared_mode=0644 ;;
         esac
@@ -969,6 +977,7 @@ pin_declared_configs() {
         chmod 0644 "$declared_path" 2>/dev/null || true
         cat "$work/config.validated.$declared_index" >"$declared_path" || return 1
         chmod 0444 "$declared_path" || return 1
+        python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$declared_path" >"$work/config.stat.$declared_index" 2>/dev/null || return 1
         declared_index=$((declared_index + 1))
     done
     return 0
@@ -1002,6 +1011,20 @@ declared_configs_match_snapshot() {
     return 0
 }
 
+declared_configs_stat_unchanged() {
+    stat_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    stat_index=0
+    while [ "$stat_index" -lt "$stat_count" ]; do
+        stat_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$stat_index" '.behavior.credential.config_files[$i].path') || return 1
+        [ -n "$stat_path" ] || return 1
+        stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stat_path" 2>/dev/null) || return 1
+        stat_pinned=$(cat "$work/config.stat.$stat_index" 2>/dev/null) || return 1
+        [ "$stat_now" = "$stat_pinned" ] || return 1
+        stat_index=$((stat_index + 1))
+    done
+    return 0
+}
+
 provider_endpoint() {
     endpoint_file=$1
     endpoint_provider=$2
@@ -1011,7 +1034,7 @@ provider_endpoint() {
     esac
     endpoint_value=$(jq -Rrs --arg want "$endpoint_provider" \
         'def outline:
-    split("\n") as $lines
+    split("\n") | map(sub("\r$"; "")) as $lines
     | reduce range(0; $lines | length) as $i ({state: "out", skip: 0, out: [], code: "", lits: [], lit: null};
         ($lines[$i] | explode) as $cs
         | reduce range(0; $cs | length) as $j (.;
@@ -3729,8 +3752,12 @@ main() {
     [ -n "$SPEC_TARGET_JSON" ] || exit 65
     if command -v head >/dev/null 2>&1; then
         SPEC_JSON=$(head -c "$SPEC_BYTE_CAP" -- "$spec" 2>/dev/null) || exit 65
+    elif command -v dd >/dev/null 2>&1; then
+        dd if="$spec" of="$spec_dir/spec.capped" bs="$SPEC_BYTE_CAP" count=1 2>/dev/null || exit 65
+        SPEC_JSON=$(cat "$spec_dir/spec.capped" 2>/dev/null) || exit 65
     else
-        SPEC_JSON=$(jq -Rrsn --argjson n "$((SPEC_BYTE_CAP + 1))" --rawfile src "$spec" '$src | .[0:$n]' 2>/dev/null) || exit 65
+        echo "$PROBE: no bounded reader for the probe specification; refusing to run" >&2
+        exit 65
     fi
     [ -n "$SPEC_JSON" ] || exit 65
     SPEC_JSON=$(printf '%s\n' "$SPEC_JSON" | jq -c '.' 2>/dev/null) || exit 65
