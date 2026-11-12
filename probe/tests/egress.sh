@@ -1477,7 +1477,7 @@ mkdir -p "$t/sandbox/.codex"
 printf '%s\n' "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":\"\",\"id_token\":\"\"}}" >"$t/sandbox/.codex/auth.json"
 begin j09_the_agent_cannot_reach_the_attested_spec_snapshot step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
 expect agent_reaches_api PASS 'completed the declared tool'
-fact '.target.tuple' 'T01'
+jq -e '.target.tuple == "T01"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
 [ ! -s "$t/spec.seen" ] || problems="$problems agent-read-the-attested-spec"
 finish_case
 
