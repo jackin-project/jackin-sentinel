@@ -1410,7 +1410,7 @@ token_kinds() {
 }
 
 auth_file_fields() {
-    jq -cn --slurpfile parsed "$1" --slurpfile selected "$SPEC_SNAPSHOT" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+    printf '%s\n' "$SPEC_JSON" | jq -cn --slurpfile parsed "$1" --slurpfile selected /dev/stdin --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
         def pointer($name): $name | split("/") | map(select(length > 0));
         def kind($value; $jwt):
             if $value == null then "absent"
@@ -2203,8 +2203,8 @@ step_J07() (
     ensure_agent_exec
     process_checks
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
-    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --slurpfile expected "$spec_dir/expected.snapshot.json" '
+    complete=$(printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+        --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
@@ -2664,8 +2664,8 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --slurpfile expected "$spec_dir/expected.snapshot.json" '
+    complete=$(printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+        --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
@@ -3544,8 +3544,6 @@ main() {
     TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
     TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
     TOOL_OBSERVATION_EXPECTED=$(jq -c '[.behavior.prompt.tool.observation.directory_contains.entries[]]' "$spec") || exit 65
-    printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" >"$spec_dir/expected.snapshot.json" || exit 70
-    chmod 600 "$spec_dir/expected.snapshot.json" 2>/dev/null || :
     CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
     CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
     CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
@@ -3561,10 +3559,7 @@ main() {
         SPEC_JSON=$(jq -Rrsn --argjson n "$((SPEC_BYTE_CAP + 1))" --rawfile src "$spec" '$src | .[0:$n]' 2>/dev/null) || exit 65
     fi
     [ -n "$SPEC_JSON" ] || exit 65
-    SPEC_SNAPSHOT=$spec_dir/spec.snapshot.json
-    printf '%s\n' "$SPEC_JSON" >"$SPEC_SNAPSHOT" || exit 70
-    chmod 600 "$SPEC_SNAPSHOT" 2>/dev/null || :
-    SPEC_JSON=$(jq -c '.' "$SPEC_SNAPSHOT" 2>/dev/null) || exit 65
+    SPEC_JSON=$(printf '%s\n' "$SPEC_JSON" | jq -c '.' 2>/dev/null) || exit 65
     [ -n "$SPEC_JSON" ] || exit 65
     rm -f "$spec_dir/spec.snapshot" 2>/dev/null || exit 70
     spec=
