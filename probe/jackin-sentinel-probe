@@ -1056,12 +1056,12 @@ provider_endpoint() {
     | .out;
 . as $raw
 | outline as $o
-| [$o | to_entries[] | {i: .key, code: (.value.code | sub("^ +"; "") | sub(" +$"; "")), lits: .value.lits}] as $L
+| [$o | to_entries[] | {i: .key, code: (.value.code | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")), lits: .value.lits}] as $L
 | [$L[] | select((.code | startswith("[") and endswith("]")))] as $headers
 | [$headers[] | select(.code == ("[model_providers." + $want + "]"))] as $tables
 | (if ($tables | length) == 1 then ([$headers[] | select(.i > $tables[0].i) | .i] | .[0] // ([$L[] | .i] | length)) else 0 end) as $stop
-| [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^base_url *=")))] as $setters
-| [$setters[] | select((.code | sub("^base_url *= *"; "")) == "\u0001" and (.lits | length) == 1)] as $urls
+| [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^base_url[ \t]*=")))] as $setters
+| [$setters[] | select((.code | sub("^base_url[ \t]*=[ \t]*"; "")) == "\u0001" and (.lits | length) == 1)] as $urls
 | if ($tables | length) == 0 then ""
   elif ($tables | length) > 1 then "conflict"
   elif ($setters | length) > 1 then "conflict"
