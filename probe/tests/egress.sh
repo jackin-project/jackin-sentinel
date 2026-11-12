@@ -2084,5 +2084,18 @@ expect agent_reaches_api FAIL 'agent exec or tool evidence is incomplete (exit 0
 zai_model=
 finish_case
 
+mk t09_the_fallback_parser_decodes_yaml_escapes
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '#!/bin/sh\nexec %s -S "$@"\n' "$python_bin" >"$t/bin/python3"
+chmod +x "$t/bin/python3"
+printf '%s\n' 'note: "baseUrl: https://api.z.ai/api/anthropic"' 'baseUrl: "https://api.z.ai/api/anthrop\u0069c"' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'note: "baseUrl: https://api.z.ai/api/anthropic"' 'baseUrl: "https://api.z.ai/api/anthrop\u0069c"' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_the_fallback_parser_decodes_yaml_escapes step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

@@ -832,6 +832,37 @@ except ImportError:
 
 url_re = re.compile(r'^https?://[^\s"<>]+\Z')
 key_re = re.compile(r'^("(?:[^"\\]|\\.)*"|\'[^\']*\'|[^:#\s][^:]*?)\s*:(?:[ \t]+(.*))?$')
+ESCAPE_MAP = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\u0085", "_": "\u00a0", "L": "\u2028", "P": "\u2029"}
+
+
+def decode_escapes(text):
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        i += 1
+        if ch != "\\":
+            out.append(ch)
+            continue
+        if i >= len(text):
+            raise ValueError("trailing escape")
+        esc = text[i]
+        i += 1
+        if esc in ("x", "u", "U"):
+            width = {"x": 2, "u": 4, "U": 8}[esc]
+            digits = text[i:i + width]
+            if len(digits) != width:
+                raise ValueError("bad escape")
+            i += width
+            out.append(chr(int(digits, 16)))
+        elif esc == "\n":
+            while i < len(text) and text[i] in " \t":
+                i += 1
+        elif esc in ESCAPE_MAP:
+            out.append(ESCAPE_MAP[esc])
+        else:
+            raise ValueError("bad escape")
+    return "".join(out)
 
 
 def plain_root_scalars(text):
@@ -851,7 +882,7 @@ def plain_root_scalars(text):
         if match is None:
             raise ValueError("unsupported line")
         raw_key = match.group(1)
-        key = raw_key[1:-1] if raw_key[0] in "\"'" else raw_key
+        key = decode_escapes(raw_key[1:-1]) if raw_key[0] == '"' else (raw_key[1:-1] if raw_key[0] == "'" else raw_key)
         if key in root:
             raise ValueError("duplicate key")
         rest = match.group(2) or ""
@@ -891,7 +922,7 @@ def plain_root_scalars(text):
                             tail = buf[j:].strip()
                             if tail and not tail.startswith("#"):
                                 raise ValueError("trailing content")
-                            value = "".join(out)
+                            value = decode_escapes("".join(out))
                             break
                         out.append(ch)
                 if value is None:
