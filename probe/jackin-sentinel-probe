@@ -712,9 +712,6 @@ EOF
 $TOOL_OBSERVATION
 EOF
     fi
-    # The reported endpoint stays bound to the configuration that was
-    # validated before launch: a live file replaced while the child ran voids
-    # the evidence instead of certifying the remembered value.
     if [ "$EXPECTED_AGENT" = codex ]; then
         endpoint_value=$(provider_endpoint "$work/agent-home/config.toml" "$EXPECTED_PROVIDER" 2>/dev/null) || endpoint_value=conflict
         [ "$endpoint_value" = "$actual_endpoint" ] || sandbox_conflict=true
@@ -750,8 +747,6 @@ read_bounded() {
             head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" 2>/dev/null || return 1
         fi
     else
-        # The source is already verified to be a regular private file, so this
-        # bounded slice never blocks; the byte count below enforces the cap.
         jq -Rrsn --argjson n "$((read_cap + 1))" --rawfile src "$read_src" '$src | .[0:$n]' \
             >"$read_dst" 2>/dev/null || return 1
     fi
@@ -798,10 +793,6 @@ declared_provider_config() {
         sed -e 's/\r$//' -e 's/^[[:space:]]*[#;].*//' -e 's|^[[:space:]]*//.*||' -e 's/[[:space:]]#.*//' "$work/config.snapshot" >"$work/config.stripped" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                # Structural parse of the OMP YAML mapping: only one complete
-                # top-level baseUrl scalar counts, and block scalars, comments,
-                # quoted prose, invalid scalars and duplicate setters are all
-                # rejected instead of being searched for a URL.
                 declared_parsed=$(jq -Rrs --arg re '^https?://[^[:space:]"<>]+$' '
                     def ind($l): ($l | length) - ($l | sub("^ *"; "") | length);
                     split("\n") as $lines
@@ -3570,8 +3561,6 @@ main() {
         SPEC_JSON=$(jq -Rrsn --argjson n "$((SPEC_BYTE_CAP + 1))" --rawfile src "$spec" '$src | .[0:$n]' 2>/dev/null) || exit 65
     fi
     [ -n "$SPEC_JSON" ] || exit 65
-    # Keep the validated document in a private snapshot file so no invocation
-    # ever places it on the argument vector (execve E2BIG) or re-reads /tmp.
     SPEC_SNAPSHOT=$spec_dir/spec.snapshot.json
     printf '%s\n' "$SPEC_JSON" >"$SPEC_SNAPSHOT" || exit 70
     chmod 600 "$SPEC_SNAPSHOT" 2>/dev/null || :
