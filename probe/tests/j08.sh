@@ -861,12 +861,26 @@ environ 100 'OPENAI_API_KEY=sk-real-value-0123456789abcdef'
 record "$R_OK1"
 verify fail_proc_wins_over_record FAIL 'OPENAI_API_KEY' read
 
-mk pass_proc_wins_and_notes_disagreement
+mk fail_recorded_other_row_survives_the_proc_read
 state 'exited 1 0'
 proc_main
 environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
 record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY other\nagent OPENAI_API_KEY placeholder\n'
-verify pass_proc_wins_and_notes_disagreement PASS 'disagree' read
+begin fail_recorded_other_row_survives_the_proc_read sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment FAIL 'OPENAI_API_KEY'
+detail_contains environment 'disagree'
+fact '.start_record.state' read
+fact '.agent_environment.main' read
+finish_case
+
+mk fail_disagreement_between_record_and_proc_cannot_pass
+state 'exited 1 0'
+proc_main
+environ 100 'OPENAI_API_KEY=openshell:resolve:env:OPENAI_API_KEY'
+record 'jackin-env-kinds 2\nattempt 1\nmain OPENAI_API_KEY empty\nagent OPENAI_API_KEY placeholder\n'
+verify fail_disagreement_between_record_and_proc_cannot_pass FAIL 'disagree' read
 
 mk launch_env_symlink_fails_the_launch_env_check
 state 'exited 1 0'

@@ -2137,10 +2137,18 @@ settle() {
     record_rows "$1" | sort -u >"$work/rec.$1.tsv"
     settled=$2
     if [ "$2" = read ]; then
-        sort -u "$work/live.$1.tsv" >"$work/eff.$1.tsv"
         read_from="$read_from, the $1 environment (/proc)"
-        if [ "$3" -eq 1 ] && ! cmp -s "$work/eff.$1.tsv" "$work/rec.$1.tsv"; then
-            disagree="${disagree:+$disagree, }$1"
+        if [ "$3" -eq 1 ]; then
+            sort -u "$work/live.$1.tsv" "$work/rec.$1.tsv" >"$work/eff.$1.tsv"
+            conflicts=$(awk -F'\t' 'NR == FNR { live_kinds[$1] = live_kinds[$1] $2 ","; next }
+                { record_kinds[$1] = record_kinds[$1] $2 "," }
+                END { for (name in live_kinds) if (name in record_kinds && live_kinds[name] != record_kinds[name]) print name }' \
+                "$work/live.$1.tsv" "$work/rec.$1.tsv")
+            if [ -n "$conflicts" ]; then
+                disagree="${disagree:+$disagree, }$1"
+            fi
+        else
+            sort -u "$work/live.$1.tsv" >"$work/eff.$1.tsv"
         fi
     elif [ "$3" -eq 1 ]; then
         cp "$work/rec.$1.tsv" "$work/eff.$1.tsv"
@@ -2354,8 +2362,10 @@ EOF
         skip environment "the Codex environment is not known: the record at attempt $record_attempt holds no Codex environment"
     elif [ -n "$launch_problem" ]; then
         fail environment "the launch environment could not be read, so the credentials are unknown: $launch_problem"
+    elif [ -n "$disagree" ]; then
+        fail environment "every credential variable is a placeholder or empty, but the start record and /proc disagree for: $disagree"
     else
-        pass environment "every credential variable is a placeholder or empty, via record: $read_from${disagree:+; /proc wins where it disagrees: $disagree}"
+        pass environment "every credential variable is a placeholder or empty, via record: $read_from"
     fi
     if [ -f "$auth" ]; then
         if [ "$AUTH_REQUIRED" = absent ]; then
