@@ -3912,7 +3912,7 @@ main() {
     [ -n "$SPEC_JSON" ] || exit 65
     SPEC_JSON=$(printf '%s\n' "$SPEC_JSON" | jq -c '.' 2>/dev/null) || exit 65
     [ -n "$SPEC_JSON" ] || exit 65
-    rm -f "$spec_dir/spec.snapshot" 2>/dev/null || exit 70
+    rm -f "$spec_dir/spec.snapshot" "$spec_dir/spec.capped" 2>/dev/null || exit 70
     spec=
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"
