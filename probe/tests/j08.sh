@@ -486,12 +486,18 @@ fi
 exec 7<&-
 [ "$stat_fd_follow" = "$stat_file_id" ] || problems="$problems follow-target"
 [ "$stat_fd_nofollow" != "$stat_fd_follow" ] || problems="$problems descriptor-no-follow"
-[ "$stat_fd_nofollow" = "$stat_fd_host" ] || problems="$problems descriptor-entry-value"
 if [ "$stat_dialect" = bsd ]; then
+    [ "$stat_fd_nofollow" = "$stat_fd_host" ] || problems="$problems descriptor-entry-value"
     [ "${stat_fd_nofollow%% *}" != "${stat_fd_follow%% *}" ] || problems="$problems descriptor-device"
     [ "${stat_fd_host_follow##* }" = "${stat_fd_follow##* }" ] || problems="$problems host-follow-inode"
     [ "${stat_fd_host_follow%% *}" = "${stat_fd_nofollow%% *}" ] || problems="$problems host-follow-device"
 else
+    # A GNU/Linux descriptor entry is a procfs symlink whose inode number is
+    # allocated per process, so the entry's device is the only part of its
+    # identity that survives across the two stat processes; compare that
+    # instead of the platform-specific textual form of the entry.
+    [ "${stat_fd_nofollow%% *}" = "${stat_fd_host%% *}" ] || problems="$problems descriptor-entry-value"
+    [ "${stat_fd_nofollow%% *}" != "${stat_fd_follow%% *}" ] || problems="$problems descriptor-device"
     [ "$stat_fd_host_follow" = "$stat_fd_follow" ] || problems="$problems host-follow"
 fi
 contract_result
