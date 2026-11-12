@@ -2068,8 +2068,9 @@ host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_model=$(head -c 131072 /dev/zero | tr '\0' m)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
-cat >"$t/bad-bin/jq" <<EOF
+cat >"$t/bin/jq" <<EOF
 #!/bin/sh
+printf 'run\n' >>"$t/jq.ran"
 for a do
     if [ "\${#a}" -gt 65536 ]; then
         printf '%s\n' big >>"$t/args.seen"
@@ -2077,10 +2078,11 @@ for a do
 done
 exec "$scratch/tools/jq" "\$@"
 EOF
-chmod +x "$t/bad-bin/jq"
+chmod +x "$t/bin/jq"
 begin j09_the_expected_model_never_travels_on_the_argument_vector step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'agent exec or tool evidence is incomplete (exit 0)'
 [ ! -s "$t/args.seen" ] || problems="$problems expected-model-on-argv"
+[ -s "$t/jq.ran" ] || problems="$problems argv-checker-not-selected"
 zai_model=
 finish_case
 
@@ -2122,14 +2124,14 @@ host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 chmod 0600 "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"
-cat >"$t/bad-bin/chmod" <<EOF
+cat >"$t/bin/chmod" <<EOF
 #!/bin/sh
 if [ "\$1" = 0444 ] && [ "\$2" = "$t/sandbox/.omp/agent/models.yml" ]; then
     exit 1
 fi
 exec "$scratch/tools/chmod" "\$@"
 EOF
-chmod +x "$t/bad-bin/chmod"
+chmod +x "$t/bin/chmod"
 begin j09_a_pinning_abort_restores_the_declared_config_modes step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 for declared_mode_file in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
