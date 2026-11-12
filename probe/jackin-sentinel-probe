@@ -806,7 +806,7 @@ declared_provider_config() {
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$declared_path" ] || return 1
         declared_source=$declared_path
-        [ -z "${declared_use_snapshot-}" ] || declared_source=$work/config.validated.$declared_index
+        [ -z "${declared_use_snapshot-}" ] || declared_source=$spec_dir/config.validated.$declared_index
         read_bounded "$declared_source" "$spec_dir/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
         printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$spec_dir/config.required" 2>/dev/null || return 1
         while IFS= read -r declared_line; do
