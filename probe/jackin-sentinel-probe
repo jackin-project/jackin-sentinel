@@ -1262,7 +1262,16 @@ def outline:
 | outline as $o
 | [$o | to_entries[] | {i: .key, code: (.value.code | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")), lits: .value.lits}] as $L
 | [$L[] | select((.code | startswith("[") and endswith("]")))] as $headers
-| [$headers[] | select(.code == ("[model_providers." + $want + "]"))] as $tables
+| [$headers[] | .lits as $hl | .i as $hi
+    | (.code | sub("^\\["; "") | sub("\\]$"; "") | split(".")) as $segs
+    | (reduce range(0; $segs | length) as $si ({n: 0, keys: [], bad: false};
+        ($segs[$si] | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")) as $k
+        | if $k == "\u0001" then
+            (if .n < ($hl | length) then .keys += [$hl[.n]] | .n += 1 else .bad = true end)
+          elif (($k | length) == 0 or ($k | contains("\u0001"))) then .bad = true
+          else .keys += [$k] end))
+    | select((.bad | not) and .keys == ["model_providers", $want])
+    | {i: $hi, keys: .keys}] as $tables
 | (if ($tables | length) == 1 then ([$headers[] | select(.i > $tables[0].i) | .i] | .[0] // ([$L[] | .i] | length)) else 0 end) as $stop
 | [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^(base_url|\u0001)[ \t]*=")) and (if (.code | startswith("\u0001")) then ((.lits | length) >= 1 and .lits[0] == "base_url") else true end))] as $setters
 | [$setters[] | select((.code | sub("^(base_url|\u0001)[ \t]*=[ \t]*"; "")) == "\u0001") | select((if (.code | startswith("\u0001")) then (.lits | length) == 2 else (.lits | length) == 1 end))] as $urls
