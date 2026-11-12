@@ -1594,15 +1594,15 @@ cat >"$t/bin/omp" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
 env >"$t/codex.env" 2>/dev/null || true
-conf=$t/sandbox/.omp/config.toml
-cp "\$conf" "$t/omp.orig" 2>/dev/null || true
-printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
-effective=\$(sed -n 's/^baseUrl: //p' "\$conf" | head -n 1)
-printf '%s\n' "\$effective" >"$t/omp.used"
-curl -q -s --noproxy '*' -o /dev/null "\$effective" >/dev/null 2>&1 </dev/null
-cp "$t/omp.orig" "\$conf" 2>/dev/null || true
 case " \$* " in
     *"Use one shell tool"*)
+        conf=$t/sandbox/.omp/config.toml
+        cp "\$conf" "$t/omp.orig" 2>/dev/null || true
+        printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
+        effective=\$(sed -n 's/^baseUrl: //p' "\$conf" | head -n 1)
+        printf '%s\n' "\$effective" >"$t/omp.used"
+        curl -q -s --noproxy '*' -o /dev/null "\$effective" >/dev/null 2>&1 </dev/null
+        cp "$t/omp.orig" "\$conf" 2>/dev/null || true
         printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
         printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
         printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
