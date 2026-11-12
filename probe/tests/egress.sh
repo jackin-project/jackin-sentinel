@@ -2063,5 +2063,26 @@ expect engine_denied SKIP 'no --engine endpoint'
 fact '.resolver_control' 'null'
 finish_case
 
+mk j09_the_expected_model_never_travels_on_the_argument_vector
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_model=$(head -c 131072 /dev/zero | tr '\0' m)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bad-bin/jq" <<EOF
+#!/bin/sh
+for a do
+    if [ "\${#a}" -gt 65536 ]; then
+        printf '%s\n' big >>"$t/args.seen"
+    fi
+done
+exec "$scratch/tools/jq" "\$@"
+EOF
+chmod +x "$t/bad-bin/jq"
+begin j09_the_expected_model_never_travels_on_the_argument_vector step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'agent exec or tool evidence is incomplete (exit 0)'
+[ ! -s "$t/args.seen" ] || problems="$problems expected-model-on-argv"
+zai_model=
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
