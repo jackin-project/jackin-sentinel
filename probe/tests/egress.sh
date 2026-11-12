@@ -1662,11 +1662,28 @@ host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 mv "$scratch/tools/head" "$scratch/head.save"
+mv "$scratch/tools/dd" "$scratch/dd.save"
+cat >"$scratch/tools/dd" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$t/dd.log"
+case " \$* " in
+    *"count=1"*) ;;
+    *) printf 'unbounded\n' >>"$t/dd.log" ;;
+esac
+exec "$scratch/dd.save" "\$@"
+EOF
+chmod +x "$scratch/tools/dd"
 begin t09_a_headless_run_still_streams_a_bounded_config step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+grep -q 'bs=1048577 count=1' "$t/dd.log" 2>/dev/null || problems="$problems bounded-reader-cap-not-observed"
+grep -q 'bs=1048576 count=1' "$t/dd.log" 2>/dev/null || problems="$problems bounded-spec-read-not-observed"
+if grep -q 'unbounded' "$t/dd.log" 2>/dev/null; then
+    problems="$problems unbounded-read-observed"
+fi
 finish_case
 mv "$scratch/head.save" "$scratch/tools/head"
+mv "$scratch/dd.save" "$scratch/tools/dd"
 
 mk t09_a_run_without_any_bounded_reader_is_refused
 host_key=synthetic-T09-host-key-0123456789
