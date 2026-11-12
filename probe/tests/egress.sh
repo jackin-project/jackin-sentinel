@@ -1374,6 +1374,15 @@ begin t14_a_missing_declared_provider_config_is_not_bound step_J09 '' ANTHROPIC_
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 finish_case
 
+mk t09_a_commented_contract_url_is_not_the_effective_endpoint
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' '# baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+begin t09_a_commented_contract_url_is_not_the_effective_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
 mk t18_a_second_provider_table_is_not_a_conflict
 host_key=synthetic-T18-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
