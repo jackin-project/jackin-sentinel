@@ -1565,6 +1565,16 @@ begin t09_an_indented_nested_base_url_is_not_the_root_key step_J09 '' ZAI_API_KE
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 finish_case
 
+mk t09_a_crlf_config_is_parsed_normalized
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf 'baseUrl: https://api.z.ai/api/anthropic\r\ncredentialEnv: ZAI_API_KEY\r\ndefault: zai/glm-5.3\r\n' >"$t/sandbox/.omp/config.toml"
+printf 'baseUrl: https://api.z.ai/api/anthropic\r\napi: anthropic-messages\r\napiKey: ZAI_API_KEY\r\n' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_crlf_config_is_parsed_normalized step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
 mk j04_an_oversized_target_model_still_emits_the_report
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
@@ -1575,14 +1585,26 @@ jq -e '.target.model | length == 200000' "$t/out" >/dev/null 2>&1 || problems="$
 zai_model=
 finish_case
 
-mk t09_a_crlf_config_is_parsed_normalized
-host_key=synthetic-T09-host-key-0123456789
+mk t18_a_quote_run_terminator_is_not_an_early_close
+host_key=synthetic-T18-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
-zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
-printf 'baseUrl: https://api.z.ai/api/anthropic\r\ncredentialEnv: ZAI_API_KEY\r\ndefault: zai/glm-5.3\r\n' >"$t/sandbox/.omp/config.toml"
-printf 'baseUrl: https://api.z.ai/api/anthropic\r\napi: anthropic-messages\r\napiKey: ZAI_API_KEY\r\n' >"$t/sandbox/.omp/agent/models.yml"
-begin t09_a_crlf_config_is_parsed_normalized step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
-expect agent_reaches_api PASS 'completed the declared tool'
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = '''z''''
+note = '''
+base_url = "https://api.z.ai/api/v1"
+'''
+base_url = 'http://127.0.0.1:9/v1'
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+begin t18_a_quote_run_terminator_is_not_an_early_close step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
 finish_case
 
 for selected_step in J07 J09; do

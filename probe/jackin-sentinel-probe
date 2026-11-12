@@ -872,11 +872,17 @@ provider_endpoint() {
                        (if $c == "'"'"'" then .state = "out" | .code += "\u0001" | .lits += [.lit] | .lit = null
                         else .lit += $c end)
                    elif .state == "mlb" then
-                       (if $t3 == "\"\"\"" then .state = "out" | .skip = 2 | .code += "   " | .lits += [.lit] | .lit = null
+                       (if $t3 == "\"\"\"" then
+                            ([$cs[$j:][]] | implode | capture("^(?<run>\"*)").run | length) as $run
+                            | .state = "out" | .skip = ($run - 1) | .code += (" " * $run)
+                            | .lit += ("\"" * ($run - 3)) | .lits += [.lit] | .lit = null
                         elif $c == "\\" then .skip = 1 | .lit += $c
                         else .lit += $c end)
                    else
-                       (if $t3 == "'"'"''"'"''"'"'" then .state = "out" | .skip = 2 | .code += "   " | .lits += [.lit] | .lit = null
+                       (if $t3 == "'"'"''"'"''"'"'" then
+                            ([$cs[$j:][]] | implode | capture("^(?<run>'"'"'*)").run | length) as $run
+                            | .state = "out" | .skip = ($run - 1) | .code += (" " * $run)
+                            | .lit += ("'"'"'" * ($run - 3)) | .lits += [.lit] | .lit = null
                         else .lit += $c end)
                    end)
             end)
