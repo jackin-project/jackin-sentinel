@@ -44,6 +44,8 @@ SCAN_MAX_FILES=20000
 SCAN_DEADLINE_SECONDS=300
 SCAN_ERR_MAX=65536
 AGENT_HOME_MAX_BYTES=1048576
+CONFIG_BYTE_CAP=1048576
+SPEC_BYTE_CAP=1048576
 SCAN_GREP_SECONDS=20
 LOG_BYTE_CAP=1048576
 LOG_READ_SECONDS=10
@@ -654,6 +656,10 @@ agent_tool_evidence() {
         else
             sandbox_conflict=true
         fi
+    else
+        if declared_provider_config; then
+            actual_endpoint=$PROVIDER_URL
+        fi
     fi
     tool_workdir=
     if [ "$launch_kind" != none ]; then
@@ -718,17 +724,55 @@ EOF
                  workdir: $workdir, observation: $observation}}'
 }
 
-copy_bounded() {
-    copy_src=$1
-    copy_dst=$2
-    [ -f "$copy_src" ] || return 1
-    timeout 10 head -c $((AGENT_HOME_MAX_BYTES + 1)) -- "$copy_src" >"$copy_dst" || return 1
-    [ -f "$copy_dst" ] || return 1
-    copy_bytes=$(wc -c <"$copy_dst" 2>/dev/null | tr -d '[:space:]') || return 1
-    case $copy_bytes in
+read_bounded() {
+    read_src=$1
+    read_dst=$2
+    read_cap=$3
+    [ -f "$read_src" ] || return 1
+    if [ -L "$read_src" ]; then
+        return 1
+    fi
+    timeout 10 head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" || return 1
+    [ -f "$read_dst" ] || return 1
+    read_bytes=$(wc -c <"$read_dst" 2>/dev/null | tr -d '[:space:]') || return 1
+    case $read_bytes in
         '' | *[!0-9]*) return 1 ;;
     esac
-    [ "$copy_bytes" -le "$AGENT_HOME_MAX_BYTES" ] || return 1
+    [ "$read_bytes" -le "$read_cap" ] || return 1
+    [ -f "$read_src" ] || return 1
+    if [ -L "$read_src" ]; then
+        return 1
+    fi
+    return 0
+}
+
+copy_bounded() {
+    read_bounded "$1" "$2" "$AGENT_HOME_MAX_BYTES"
+}
+
+declared_provider_config() {
+    declared_count=$(jq -r '.behavior.credential.config_files // [] | length' "$spec") || return 1
+    [ "$declared_count" -ge 1 ] || return 1
+    declared_url=false
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path' "$spec") || return 1
+        [ -n "$declared_path" ] || return 1
+        read_bounded "$declared_path" "$work/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
+        jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' "$spec" >"$work/config.required" 2>/dev/null || return 1
+        while IFS= read -r declared_line; do
+            [ -n "$declared_line" ] || continue
+            grep -Fq -- "$declared_line" "$work/config.snapshot" || return 1
+        done <"$work/config.required"
+        jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]' "$spec" >"$work/config.forbidden" 2>/dev/null || return 1
+        while IFS= read -r declared_line; do
+            [ -n "$declared_line" ] || continue
+            grep -Fq -- "$declared_line" "$work/config.snapshot" && return 1
+        done <"$work/config.forbidden"
+        grep -Fq -- "$PROVIDER_URL" "$work/config.snapshot" && declared_url=true
+        declared_index=$((declared_index + 1))
+    done
+    [ "$declared_url" = true ] || return 1
 }
 
 provider_endpoint() {
@@ -744,7 +788,8 @@ provider_endpoint() {
         | if ($tables | length) == 0 then ""
         elif ($tables | length) > 1 then "conflict"
         else
-            [$lines[$tables[0] + 1:][] | select(test("^[[:space:]]*\\[") | not)] as $body
+            ([$lines | to_entries[] | select(.key > $tables[0] and (.value | test("^[[:space:]]*\\["))) | .key] | .[0] // ($lines | length)) as $stop
+            | [$lines[$tables[0] + 1:$stop][]] as $body
             | [$body[] | select(test("^[[:space:]]*base_url[[:space:]]*="))] as $setters
             | [$body[] | try (capture("^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"(?<u>[^\"]*)\"[[:space:]]*$").u)] as $urls
             | if ($urls | length) > 1 or ($setters | length) != ($urls | length) then "conflict"
@@ -2057,20 +2102,16 @@ step_J07() (
     ensure_agent_exec
     process_checks
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
-    codex_target=false
-    [ "$EXPECTED_AGENT" = codex ] && codex_target=true
     complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --argjson codex "$codex_target" '
+        --arg endpoint "$PROVIDER_URL" --argjson expected "$TOOL_OBSERVATION_EXPECTED" '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
-        ($codex == false or (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint)))) and
+        (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
-        .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
-    endpoint_mismatch=false
-    if [ "$codex_target" = true ]; then
-        endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
-            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
-             (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
-    fi
+        .tool.exit_code == 0 and .tool.workdir == $workdir and
+        ([.tool.observation[]] as $obs | $expected | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
+    endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
+        '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
     if [ "$attempted" = true ]; then
         if [ "$complete" = true ]; then
             pass agent_exec "codex exec answered the fixed prompt and completed the declared tool"
@@ -2522,20 +2563,16 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    codex_target=false
-    [ "$EXPECTED_AGENT" = codex ] && codex_target=true
     complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --argjson codex "$codex_target" '
+        --arg endpoint "$PROVIDER_URL" --argjson expected "$TOOL_OBSERVATION_EXPECTED" '
         .answered == true and .actual_provider == $provider and .actual_model == $model and
-        ($codex == false or (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint)))) and
+        (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
-        .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
-    endpoint_mismatch=false
-    if [ "$codex_target" = true ]; then
-        endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
-            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
-             (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
-    fi
+        .tool.exit_code == 0 and .tool.workdir == $workdir and
+        ([.tool.observation[]] as $obs | $expected | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
+    endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
+        '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
     if [ "$(jq -r '.attempted' "$work/agent_exec.json")" = true ]; then
         if [ "$complete" = true ]; then
             pass agent_reaches_api "codex exec answered and completed the declared tool"
@@ -3330,6 +3367,33 @@ main() {
         echo "$PROBE: --spec must name a regular private probe specification" >&2
         exit 65
     fi
+    work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
+    trap 'rm -rf "$work"' EXIT
+    trap 'exit 70' INT TERM HUP
+    RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
+    RUN_KEY=${RUN_KEY%% *}
+    case $RUN_KEY in
+        '' | *[!0-9a-f]*) RUN_KEY= ;;
+    esac
+    [ "${#RUN_KEY}" -eq 64 ] || RUN_KEY=
+    RUN_SEED=
+    if [ -n "$RUN_KEY" ]; then
+        RUN_SEED=$(printf '%s' "$RUN_KEY" | sha256sum 2>/dev/null)
+        RUN_SEED=${RUN_SEED%% *}
+        case $RUN_SEED in
+            '' | *[!0-9a-f]*) RUN_KEY= ;;
+        esac
+        [ "${#RUN_SEED}" -eq 64 ] || RUN_KEY=
+    fi
+    if [ -z "$RUN_KEY" ] && [ "$mode" != host ]; then
+        echo "$PROBE: no key material for the step seals; refusing to run" >&2
+        exit 70
+    fi
+    if ! read_bounded "$spec" "$work/spec.snapshot" "$SPEC_BYTE_CAP"; then
+        echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
+        exit 65
+    fi
+    spec=$work/spec.snapshot
     if ! jq -e '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
@@ -3374,6 +3438,7 @@ main() {
     TOOL_KIND=$(jq -r '.behavior.prompt.tool.kind' "$spec") || exit 65
     TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
     TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
+    TOOL_OBSERVATION_EXPECTED=$(printf '%s\n' "$TOOL_OBSERVATION" | jq -Rn '[inputs | select(length > 0) | @base64d]') || exit 65
     CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
     CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
     CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
@@ -3388,28 +3453,6 @@ main() {
         fi
     fi
     [ "$mode" = host ] || require_sandbox
-    work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
-    trap 'rm -rf "$work"' EXIT
-    trap 'exit 70' INT TERM HUP
-    RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
-    RUN_KEY=${RUN_KEY%% *}
-    case $RUN_KEY in
-        '' | *[!0-9a-f]*) RUN_KEY= ;;
-    esac
-    [ "${#RUN_KEY}" -eq 64 ] || RUN_KEY=
-    RUN_SEED=
-    if [ -n "$RUN_KEY" ]; then
-        RUN_SEED=$(printf '%s' "$RUN_KEY" | sha256sum 2>/dev/null)
-        RUN_SEED=${RUN_SEED%% *}
-        case $RUN_SEED in
-            '' | *[!0-9a-f]*) RUN_KEY= ;;
-        esac
-        [ "${#RUN_SEED}" -eq 64 ] || RUN_KEY=
-    fi
-    if [ -z "$RUN_KEY" ] && [ "$mode" != host ]; then
-        echo "$PROBE: no key material for the step seals; refusing to run" >&2
-        exit 70
-    fi
     cat >"$work/bounded-copy.sh" <<'EOF'
 copy_source=$1
 copy_target=$2

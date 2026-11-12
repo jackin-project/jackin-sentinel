@@ -160,10 +160,12 @@ zai_spec() {
          .behavior.provider.accepted_body = null |
          if $adapter == "t09-omp-zai-v1" then
              .behavior.credential.auth_file.path = ($sandbox + "/.omp/auth.json") |
-             .behavior.credential.auth_file.fields = [{"name":"/zai/type","kind":{"literal":{"value":"api_key"}}},{"name":"/zai/key","kind":"placeholder"}]
+             .behavior.credential.auth_file.fields = [{"name":"/zai/type","kind":{"literal":{"value":"api_key"}}},{"name":"/zai/key","kind":"placeholder"}] |
+             .behavior.credential.config_files = [{"path":($sandbox + "/.omp/config.toml"),"required_state":"present","mode":"600","required_text":["baseUrl: https://api.z.ai/api/anthropic","credentialEnv: ZAI_API_KEY","default: zai/glm-5.3"],"forbidden_text":["https://api.z.ai/api/coding/paas/v4"]},{"path":($sandbox + "/.omp/agent/models.yml"),"required_state":"present","mode":"600","required_text":["baseUrl: https://api.z.ai/api/anthropic","api: anthropic-messages","apiKey: ZAI_API_KEY"],"forbidden_text":["https://api.z.ai/api/coding/paas/v4"]}]
          elif $adapter == "t14-claude-zai-v1" then
              .behavior.credential.auth_file.path = ($sandbox + "/.claude/.credentials.json") |
-             .behavior.credential.auth_file.fields = [{"name":"/ANTHROPIC_API_KEY","kind":"placeholder"}]
+             .behavior.credential.auth_file.fields = [{"name":"/ANTHROPIC_API_KEY","kind":"placeholder"}] |
+             .behavior.credential.config_files = [{"path":($sandbox + "/.claude/settings.json"),"required_state":"present","mode":"600","required_text":["{\"env\":{\"ANTHROPIC_BASE_URL\":\"https://api.z.ai/api/anthropic\"}}"],"forbidden_text":["ANTHROPIC_AUTH_TOKEN","ZAI_API_KEY"]}]
          else
              .behavior.credential.auth_file.path = ($sandbox + "/.codex/auth.json") |
              .behavior.credential.auth_file.fields = []
@@ -247,6 +249,45 @@ case " \$* " in
 esac
 echo "$1"
 exit $2
+EOF
+    chmod +x "$t/bin/codex"
+}
+
+codex_says_partial_observation() {
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+    chmod +x "$t/bin/codex"
+}
+
+codex_says_spec_mutator() {
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+printf 'corrupted' >>"$t/spec"
+echo ready
+exit 0
 EOF
     chmod +x "$t/bin/codex"
 }
@@ -1211,6 +1252,17 @@ zai_case() {
     answer "$OUTSIDE" 7 000
     answer "$METADATA" 7 000
     answer "$zai_provider_url" 7 000
+    case $zai_adapter in
+        t09-omp-zai-v1)
+            mkdir -p "$t/sandbox/.omp/agent"
+            printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+            printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+            ;;
+        t14-claude-zai-v1)
+            mkdir -p "$t/sandbox/.claude"
+            printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic"}}' >"$t/sandbox/.claude/settings.json"
+            ;;
+    esac
 }
 
 for tuple in T09 T14 T18; do
@@ -1302,6 +1354,87 @@ expect provider_no_credential PASS 'refused the connection'
 fact '.agent_exec | "\(.attempted) \(.credential)"' 'false none'
 expect_codex_not_run
 expect_never_sent "$host_key"
+finish_case
+
+mk t09_a_redirected_live_provider_config_is_not_bound
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+begin t09_a_redirected_live_provider_config_is_not_bound step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk t14_a_missing_declared_provider_config_is_not_bound
+host_key=synthetic-T14-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t14-claude-zai-v1 claude claude '2.1.311 (Claude Code)' Bash ANTHROPIC_AUTH_TOKEN https://api.z.ai/api/anthropic present "$fingerprint"
+rm -f "$t/sandbox/.claude/settings.json"
+begin t14_a_missing_declared_provider_config_is_not_bound step_J09 '' ANTHROPIC_AUTH_TOKEN=openshell:resolve:env:ANTHROPIC_AUTH_TOKEN
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk t18_a_second_provider_table_is_not_a_conflict
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+
+[model_providers.other]
+name = "Other"
+base_url = "http://127.0.0.1:9/v1"
+MOCKCONF
+begin t18_a_second_provider_table_is_not_a_conflict step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+for selected_step in J07 J09; do
+    if [ "$selected_step" = J07 ]; then
+        step_name=j07
+        check_name=agent_exec
+    else
+        step_name=j09
+        check_name=agent_reaches_api
+    fi
+    case_name="${step_name}_a_partial_tool_observation_is_not_complete"
+    mk "$case_name"
+    codex_says_partial_observation
+    if [ "$selected_step" = J09 ]; then
+        with_curl
+        answer "$OUTSIDE" 7 000
+        answer "$METADATA" 7 000
+        answer "$PROVIDER" 7 000
+    fi
+    mkdir -p "$t/sandbox/.codex"
+    printf '%s\n' "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":\"\",\"id_token\":\"\"}}" >"$t/sandbox/.codex/auth.json"
+    begin "$case_name" "step_$selected_step" '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+    expect "$check_name" FAIL 'agent exec or tool evidence is incomplete (exit 0)'
+    fact '.agent_exec.tool.observation | length' '1'
+    fact '.agent_exec.tool.observation[0]' 'AGENTS.md'
+    finish_case
+done
+
+mk j09_a_spec_rewritten_midrun_cannot_change_the_report
+codex_says_spec_mutator
+with_curl
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+mkdir -p "$t/sandbox/.codex"
+printf '%s\n' "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\",\"refresh_token\":\"\",\"id_token\":\"\"}}" >"$t/sandbox/.codex/auth.json"
+begin j09_a_spec_rewritten_midrun_cannot_change_the_report step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+expect agent_reaches_api PASS 'completed the declared tool'
+jq -e '.target.tuple == "T01" and .target.adapter == "t01-codex-v1" and .target.spec_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
 finish_case
 
 for tuple in T09 T14 T18; do
