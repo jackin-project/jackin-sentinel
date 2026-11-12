@@ -11,7 +11,7 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
-for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp sha256sum cut sort; do
+for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head od mkdir cp chmod sha256sum cut sort python3; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
     else
@@ -1584,6 +1584,31 @@ zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/
 begin j04_an_oversized_target_model_still_emits_the_report step_J04 ''
 jq -e '.target.model | length == 200000' "$t/out" >/dev/null 2>&1 || problems="$problems target-model-not-in-report"
 zai_model=
+finish_case
+
+mk t09_a_quoted_key_root_base_url_is_the_effective_endpoint
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/sandbox/.omp/config.toml" <<'MOCKCONF'
+note: 'declared
+baseUrl: https://api.z.ai/api/anthropic
+credentialEnv: ZAI_API_KEY
+default: zai/glm-5.3'
+"baseUrl": http://127.0.0.1:9/v1
+credentialEnv: ZAI_API_KEY
+default: zai/glm-5.3
+MOCKCONF
+cat >"$t/sandbox/.omp/agent/models.yml" <<'MOCKCONF'
+note: 'declared
+baseUrl: https://api.z.ai/api/anthropic
+'
+"baseUrl": http://127.0.0.1:9/v1
+api: anthropic-messages
+apiKey: ZAI_API_KEY
+MOCKCONF
+begin t09_a_quoted_key_root_base_url_is_the_effective_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 finish_case
 
 mk t18_a_quote_run_terminator_is_not_an_early_close

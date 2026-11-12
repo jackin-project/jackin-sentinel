@@ -794,31 +794,43 @@ declared_provider_config() {
         sed 's/\r$//' "$work/config.snapshot" >"$work/config.normalized" 2>/dev/null || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                declared_parsed=$(jq -Rrs --arg re '^https?://[^[:space:]"<>]+$' '
-                    def ind($l): ($l | length) - ($l | sub("^ *"; "") | length);
-                    split("\n") as $lines
-                    | reduce range(0; $lines | length) as $i ({block: -1, vals: [], bad: 0};
-                        ($lines[$i]) as $l
-                        | (ind($l)) as $n
-                        | if .block >= 0 and (($l | test("^\\s*$")) or $n > .block) then .
-                          else
-                            .block = -1
-                            | (if ($l | test("^ *[A-Za-z0-9_.-]+ *: *[|>][0-9]*[+-]? *(#.*)?$")) then .block = $n
-                               elif ($n == 0 and ($l | test("^baseUrl *:"))) then
-                                  ($l | capture("^baseUrl *: *(?<rest>.*)$").rest
-                                   | sub("(^ +| +$)"; "")
-                                   | if test("^#") then ""
-                                     elif test("^\\u0022[^\\u0022]*\\u0022$") then capture("^\\u0022(?<v>[^\\u0022]*)\\u0022$").v
-                                     elif test("^\\u0027[^\\u0027]*\\u0027$") then capture("^\\u0027(?<v>[^\\u0027]*)\\u0027$").v
-                                     else sub(" + #.*$"; "") end) as $v
-                                  | if ($v | test("^\\s*$")) or ($v | test($re) | not) then .bad += 1
-                                    else .vals += [$v] end
-                               else . end)
-                          end)
-                    | if .bad > 0 or (.vals | length) != 1 then {ok: false}
-                      else {ok: true, url: .vals[0]} end' \
-                    "$work/config.normalized" 2>/dev/null) || return 1
-                declared_parsed=$(printf '%s' "$declared_parsed" | jq -r 'if .ok then .url else empty end' 2>/dev/null) || return 1
+                declared_parsed=$(python3 - "$work/config.normalized" <<'PY'
+import re
+import sys
+
+import yaml
+
+url_re = re.compile(r'^https?://[^[:space:]"<>]+$')
+
+
+class Loader(yaml.SafeLoader):
+    pass
+
+
+def construct_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise ValueError("duplicate key")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        doc = yaml.load(handle, Loader=Loader)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(doc, dict) or "baseUrl" not in doc:
+    raise SystemExit(1)
+value = doc["baseUrl"]
+if not isinstance(value, str) or url_re.match(value) is None:
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY
+                ) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             t14-claude-zai-v1)
