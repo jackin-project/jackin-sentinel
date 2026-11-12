@@ -2086,6 +2086,29 @@ expect agent_reaches_api FAIL 'agent exec or tool evidence is incomplete (exit 0
 zai_model=
 finish_case
 
+mk j09_a_hostile_tmp_spec_dir_cannot_swap_the_expected_model
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_model=glm-5.3-unreported
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mv "$t/bin/omp" "$t/bin/omp.real"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+for d in /tmp/jackin-sentinel-probe-spec.*; do
+    if [ -d "\$d" ]; then
+        printf '%s' glm-5.3 >"\$d/expected.model" 2>/dev/null || true
+        printf '%s\n' "\$d" >>"$t/tampered"
+    fi
+done
+exec "$t/bin/omp.real" "\$@"
+EOF
+chmod +x "$t/bin/omp"
+begin j09_a_hostile_tmp_spec_dir_cannot_swap_the_expected_model step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'agent exec or tool evidence is incomplete (exit 0)'
+[ -s "$t/tampered" ] || problems="$problems hostile-write-not-observed"
+finish_case
+zai_model=
+
 mk t09_the_fallback_parser_decodes_yaml_escapes
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)

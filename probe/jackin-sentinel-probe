@@ -1176,7 +1176,7 @@ stage_provider_config() {
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
     printf '%s\n' "$SPEC_JSON" | jq -r --arg path "${AUTH_FILE%/*}/config.toml" --arg provider "$EXPECTED_PROVIDER" \
-        --rawfile model "$spec_dir/expected.model" --arg endpoint "$PROVIDER_URL" '
+        --rawfile model /dev/fd/3 --arg endpoint "$PROVIDER_URL" '
         [.behavior.credential.config_files // [] | .[] | select(.path == $path) | (.required_text // [])[]] as $lines
         | ([$lines[] | select(test("^model_provider[[:space:]]*=")) | capture("^model_provider[[:space:]]*=[[:space:]]*\"(?<v>[^\"]*)\"[[:space:]]*$").v]) as $wired
         | if any($lines[]; test("^[[:space:]]*\\[") or test("[[:cntrl:]]")) then empty
@@ -1184,10 +1184,12 @@ stage_provider_config() {
         else
             ([$lines[] | select(test("^(model|model_provider)[[:space:]]*="))]) as $top
             | ([$lines[] | select(test("^(model|model_provider)[[:space:]]*=") | not)]) as $table
-            | (if ($top | length) == 0 then ["model = " + ($model | tojson), "model_provider = " + ($provider | tojson)] else $top end) as $top
+            | (if ($top | length) == 0 then ["model = " + (($model | rtrimstr("\n")) | tojson), "model_provider = " + ($provider | tojson)] else $top end) as $top
             | (if ($table | length) == 0 then ["name = " + ($provider | tojson), "base_url = " + ($endpoint | tojson)] else $table end) as $table
             | $top[], "", "[model_providers." + $provider + "]", $table[]
-        end' >"$stage_target" 2>/dev/null || return 1
+        end' >"$stage_target" 2>/dev/null 3<<EOF_JKS_EXPECTED_MODEL || return 1
+$EXPECTED_MODEL
+EOF_JKS_EXPECTED_MODEL
     [ -s "$stage_target" ] || return 1
 }
 
@@ -2476,13 +2478,17 @@ step_J07() (
     ensure_agent_exec
     process_checks
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
-    complete=$(printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model "$spec_dir/expected.model" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
-        .answered == true and .actual_provider == $provider and .actual_model == $model and
+    complete=$(
+        printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+            --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
+        .answered == true and .actual_provider == $provider and .actual_model == ($model | rtrimstr("\n")) and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and
-        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json" 3<<EOF_JKS_EXPECTED_MODEL
+$EXPECTED_MODEL
+EOF_JKS_EXPECTED_MODEL
+    )
     endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
         '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
          (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
@@ -2940,13 +2946,17 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    complete=$(printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model "$spec_dir/expected.model" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
-        .answered == true and .actual_provider == $provider and .actual_model == $model and
+    complete=$(
+        printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+            --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
+        .answered == true and .actual_provider == $provider and .actual_model == ($model | rtrimstr("\n")) and
         (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
         .tool.exit_code == 0 and .tool.workdir == $workdir and
-        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json")
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' "$work/agent_exec.json" 3<<EOF_JKS_EXPECTED_MODEL
+$EXPECTED_MODEL
+EOF_JKS_EXPECTED_MODEL
+    )
     endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
         '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
          (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
@@ -3825,7 +3835,6 @@ main() {
     CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
     EXPECTED_PROVIDER=$(jq -r '.target.provider' "$spec") || exit 65
     EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
-    printf '%s' "$EXPECTED_MODEL" >"$spec_dir/expected.model" || exit 70
     EXPECTED_AGENT=$(jq -r '.target.agent' "$spec") || exit 65
     ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
     SPEC_TARGET_JSON=$(jq -c '.target' "$spec") || exit 65
