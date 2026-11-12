@@ -1224,6 +1224,35 @@ jwt_listed() {
             reduce (inputs | verdict) as $v ("none";
                 if . == "error" or $v == "error" then "error" elif . == "hit" or $v == "hit" then "hit" else "none" end)'
 }
+json_refresh() {
+    case $(head -c 512 -- "$1" 2>/dev/null | tr -d '[:space:]' | head -c 1) in
+        '{' | '[') ;;
+        *)
+            printf none
+            return
+            ;;
+    esac
+    json_out=$(timeout "$SCAN_GREP_SECONDS" jq -r --arg placeholder "$PLACEHOLDER_RE" '
+        [.. | objects | to_entries[]
+         | select(.key == "refresh_token")
+         | .value
+         | select(type == "string")
+         | select(length > 0)
+         | select(test($placeholder + "\\z") | not)]
+        | if length > 0 then "hit" else empty end' "$1" 2>/dev/null)
+    json_rc=$?
+    case $json_rc in
+        0)
+            if [ -n "$json_out" ]; then
+                printf hit
+            else
+                printf none
+            fi
+            ;;
+        124) printf error ;;
+        *) printf none ;;
+    esac
+}
 scan_count=$(cat "$SCAN_COUNT" 2>/dev/null) || scan_count=0
 case $scan_count in
     '' | *[!0-9]*) scan_count=0 ;;
@@ -1272,7 +1301,16 @@ for file; do
         timeout "$SCAN_GREP_SECONDS" grep -azqE -e "$LEAK_RT" "$snapshot"
         candidate=$?
         if [ "$candidate" -eq 1 ]; then
+            json_verdict=$(json_refresh "$file")
             rm -f "$snapshot"
+            case $json_verdict in
+                hit)
+                    emit leak "$file" "token-shaped string"
+                    ;;
+                error)
+                    emit unscanned "$file" "json decode timed out"
+                    ;;
+            esac
             continue
         fi
     fi
@@ -1297,6 +1335,14 @@ for file; do
         *) jwt=error ;;
     esac
     rt=$(listed "$LEAK_RT" "$LEAK_RT_SAFE" "$snapshot")
+    if [ "$rt" != hit ]; then
+        json=$(json_refresh "$file")
+        if [ "$json" = hit ]; then
+            rt=hit
+        elif [ "$json" = error ]; then
+            rt=error
+        fi
+    fi
     rm -f "$snapshot"
     if [ "$sk" -eq 0 ] || [ "$jwt" = hit ] || [ "$rt" = hit ]; then
         emit leak "$file" "token-shaped string"
@@ -1325,7 +1371,7 @@ EOF
     else
         {
             timeout "$scan_remaining" env "SCAN_GREP_SECONDS=$SCAN_GREP_SECONDS" "LEAK_SK=$LEAK_SK" "LEAK_JWT=$LEAK_JWT" "LEAK_JWT_SAFE=$LEAK_JWT_SAFE" \
-                "LEAK_RT=$LEAK_RT" "LEAK_RT_SAFE=$LEAK_RT_SAFE" \
+                "LEAK_RT=$LEAK_RT" "LEAK_RT_SAFE=$LEAK_RT_SAFE" "PLACEHOLDER_RE=$PLACEHOLDER_RE" \
                 "SCAN_MAX_FILES=$SCAN_MAX_FILES" "SCAN_DEADLINE_SECONDS=$SCAN_DEADLINE_SECONDS" \
                 "SCAN_CAP=$((SCAN_MAX_KIB * 1024))" \
                 "SCAN_WORK=$work" \
@@ -1747,7 +1793,7 @@ EOF
     elif [ "$sums_rc" -ne 0 ]; then
         fail files "the project inventory failed with status $sums_rc: $(head -c 512 "$work/inventory.err" 2>/dev/null | head -n 3 | tr '\n' ';')"
     elif [ -s "$work/oversized" ]; then
-        fail files "a file is over the $PROJECT_FILE_MAX_BYTES byte cap: $(head -n 3 "$work/oversized" | tr '\n' ' ')"
+        fail files "the inventory is incomplete: a file is over the $PROJECT_FILE_MAX_BYTES byte cap: $(head -n 3 "$work/oversized" | tr '\n' ' ')"
     elif [ -s "$work/errors" ]; then
         fail files "$total files hashed, but some could not be read: $(head -n 3 "$work/errors" | tr '\n' ';')"
     elif [ "$total" -gt 0 ]; then
@@ -2514,7 +2560,7 @@ EOF
     elif [ "$refs_known" = true ]; then
         pass refs "$(printf '%s' "$branches" | jq 'length') local branches"
     else
-        fail refs "git for-each-ref failed or reported a broken ref: $(head -n 3 "$work/refs.err" 2>/dev/null | tr '\n' ';')"
+        fail refs "git for-each-ref failed or reported a broken ref, so the branches and stash facts are unknown: $(head -n 3 "$work/refs.err" 2>/dev/null | tr '\n' ';')"
     fi
     jq -n --arg project "$PROJECT" --argjson work_tree "$work_tree" --arg branch "$branch" --arg head "$head" \
         --argjson branches "$branches" --argjson clean "$clean" --argjson stash "$stash" \
@@ -3094,7 +3140,7 @@ main() {
         fi
     fi
     [ "$mode" = host ] || require_sandbox
-    work=$(mktemp -d) || exit 70
+    work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
     trap 'rm -rf "$work"' EXIT
     trap 'exit 70' INT TERM HUP
     cat >"$work/bounded-copy.sh" <<'EOF'

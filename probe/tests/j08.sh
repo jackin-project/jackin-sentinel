@@ -1084,6 +1084,52 @@ fact '.leaks | length' 0
 fact '.leak_count' 0
 finish_case
 
+mk file_scan_flags_an_escaped_refresh_token_key_without_disclosing_it
+state waiting
+record "$R_W0"
+escaped_refresh=$(printf '%s%s' 'escaped-' 'token-value-0123456789')
+printf '%s\n' "{\"refresh\\u005ftoken\":\"$escaped_refresh\"}" >"$t/sandbox/escaped-session.json"
+report file_scan_flags_an_escaped_refresh_token_key_without_disclosing_it
+expect file_scan FAIL "leak-$(printf '%s' "$t/sandbox/escaped-session.json" | sha256sum | cut -c1-12)"
+fact '.leaks | length' 1
+fact '.leak_count' 1
+if grep -Fq "$escaped_refresh" "$t/out"; then
+    problems="$problems report-disclosed-refresh-token"
+fi
+finish_case
+
+mk file_scan_reports_a_scan_budget_exhaustion
+state waiting
+record "$R_W0"
+seam SCAN_MAX_FILES 3
+mkdir -p "$t/sandbox/flood"
+for flood_index in 1 2 3 4 5 6; do
+    printf 'clean\n' >"$t/sandbox/flood/clean.$flood_index"
+done
+report file_scan_reports_a_scan_budget_exhaustion
+expect file_scan FAIL 'the scan budget of 3 entries is exhausted'
+finish_case
+
+mk file_scan_stops_the_scan_at_the_deadline
+state waiting
+record "$R_W0"
+seam SCAN_DEADLINE_SECONDS 1
+printf 'clean\n' >"$t/sandbox/slow-token.txt"
+mkdir -p "$t/bin"
+real_grep=$(command -v grep)
+cat >"$t/bin/grep" <<EOF
+#!/bin/sh
+for last; do :; done
+case \$last in
+    *slow-token.txt) sleep 3 ;;
+esac
+exec "$real_grep" "\$@"
+EOF
+chmod +x "$t/bin/grep"
+report file_scan_stops_the_scan_at_the_deadline
+expect file_scan FAIL 'the scan did not finish: the scan deadline of 1 seconds expired'
+finish_case
+
 mk file_scan_flags_token_in_file_over_two_mebibytes
 state waiting
 record "$R_W0"
@@ -2729,6 +2775,18 @@ else
     setup_failed j13_a_broken_ref_fails_the_refs_check
 fi
 
+mk j13_a_broken_ref_reports_that_the_ref_facts_are_unknown
+if git_project; then
+    echo garbage >"$t/sandbox/project/.git/refs/heads/other"
+    begin j13_a_broken_ref_reports_that_the_ref_facts_are_unknown sh "$t/probe" --only J13
+    expect_rc 0
+    expect_report J13 sandbox
+    expect refs FAIL 'facts are unknown'
+    finish_case
+else
+    setup_failed j13_a_broken_ref_reports_that_the_ref_facts_are_unknown
+fi
+
 mk j13_branches_are_listed_when_the_refs_are_readable
 if git_project; then
     begin j13_branches_are_listed_when_the_refs_are_readable sh "$t/probe" --only J13
@@ -3514,6 +3572,43 @@ if git_project; then
     finish_case
 else
     setup_failed j05_a_file_over_the_byte_cap_fails_the_files_check
+fi
+
+mk j05_an_oversized_project_file_fails_the_inventory
+if git_project; then
+    printf a >"$t/sandbox/project/plain.txt"
+    python3 -c 'import sys; f = open(sys.argv[1], "wb"); f.truncate(314572800)' "$t/sandbox/project/large.sparse"
+    begin j05_an_oversized_project_file_fails_the_inventory sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files FAIL 'inventory is incomplete'
+    finish_case
+else
+    setup_failed j05_an_oversized_project_file_fails_the_inventory
+fi
+
+mk j05_ignores_an_inherited_tmpdir_inside_the_project
+if git_project; then
+    printf a >"$t/sandbox/project/plain.txt"
+    printf b >"$t/sandbox/project/second.txt"
+    real_mktemp=$(command -v mktemp)
+    mkdir -p "$t/bin"
+    cat >"$t/bin/mktemp" <<EOF
+#!/bin/sh
+if [ "\$#" -eq 1 ] && [ "\$1" = -d ] && [ -n "\${TMPDIR-}" ]; then
+    exec "$real_mktemp" -d "\$TMPDIR/tmp.XXXXXX"
+fi
+exec "$real_mktemp" "\$@"
+EOF
+    chmod +x "$t/bin/mktemp"
+    begin j05_ignores_an_inherited_tmpdir_inside_the_project env TMPDIR="$t/sandbox/project" sh "$t/probe" --only J05
+    expect_rc 0
+    expect_report J05 sandbox
+    expect files PASS '2 files'
+    fact '[.files[].path] | sort | join(",")' 'plain.txt,second.txt'
+    finish_case
+else
+    setup_failed j05_ignores_an_inherited_tmpdir_inside_the_project
 fi
 
 mk j15_runs_the_hello_world_image_by_digest
