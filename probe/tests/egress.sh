@@ -2097,5 +2097,25 @@ expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
 finish_case
 
+mk t18_a_basic_string_escape_is_decoded_before_comparison
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/\u00761"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+begin t18_a_basic_string_escape_is_decoded_before_comparison step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

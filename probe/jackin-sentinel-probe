@@ -1064,7 +1064,28 @@ provider_endpoint() {
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
     endpoint_value=$(jq -Rrs --arg want "$endpoint_provider" \
-        'def outline:
+        'def toml_unesc:
+  explode
+  | reduce .[] as $c ({o: "", s: 0, h: "", n: 0};
+      if .s == 0 then
+        (if $c == 92 then .s = 1 else .o += ([$c] | implode) end)
+      elif .s == 1 then
+        (if $c == 117 then .s = 2 | .h = "" | .n = 4
+         elif $c == 85 then .s = 2 | .h = "" | .n = 8
+         elif ([98, 116, 110, 102, 114, 34, 92] | index($c)) == null then .s = -1
+         else .o += (if $c == 98 then "\b" elif $c == 116 then "\t" elif $c == 110 then "\n" elif $c == 102 then "\f" elif $c == 114 then "\r" elif $c == 34 then "\"" else "\\" end) | .s = 0 end)
+      elif .s == 2 then
+        ("0123456789abcdef" | index(([$c] | implode | ascii_downcase))) as $v
+        | if $v == null then .s = -1
+          else .h += ([$c] | implode) | .n -= 1
+            | if .n == 0 then
+                .s = 0
+                | .o += ([.h | explode | reduce .[] as $d (0; . * 16 + ("0123456789abcdef" | index(([$d] | implode | ascii_downcase))))] | implode)
+              else . end
+          end
+      else . end)
+  | if .s == 0 then .o else null end;
+def outline:
     split("\n") | map(sub("\r$"; "")) as $lines
     | reduce range(0; $lines | length) as $i ({state: "out", skip: 0, out: [], code: "", lits: [], lit: null};
         ($lines[$i] | explode) as $cs
@@ -1083,7 +1104,7 @@ provider_endpoint() {
                         elif $c == "#" then .skip = ($cs | length) - $j - 1 | .code += " "
                         else .code += $c end)
                    elif .state == "bs" then
-                       (if $c == "\"" then .state = "out" | .code += "\u0001" | .lits += [.lit] | .lit = null
+                       (if $c == "\"" then .state = "out" | .code += "\u0001" | .lits += [(.lit | toml_unesc)] | .lit = null
                         elif $c == "\\" then .skip = 1 | .lit += $c
                         else .lit += $c end)
                    elif .state == "ls" then
@@ -1093,7 +1114,7 @@ provider_endpoint() {
                        (if $t3 == "\"\"\"" then
                             ([$cs[$j:][]] | implode | capture("^(?<run>\"*)").run | length) as $run
                             | .state = "out" | .skip = ($run - 1) | .code += (" " * $run)
-                            | .lit += ("\"" * ($run - 3)) | .lits += [.lit] | .lit = null
+                            | .lit += ("\"" * ($run - 3)) | .lits += [(.lit | toml_unesc)] | .lit = null
                         elif $c == "\\" then .skip = 1 | .lit += $c
                         else .lit += $c end)
                    else
