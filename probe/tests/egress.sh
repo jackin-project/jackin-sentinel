@@ -133,12 +133,13 @@ zai_spec() {
     auth_state=$8
     fingerprint=$9
     PROVIDER=$provider_url
+    printf '%s' "${zai_model:-glm-5.3}" >"$t/zai.model"
     # shellcheck disable=SC2016
     "$scratch/tools/jq" \
         --arg adapter "$adapter" --arg agent "$agent" --arg comm "$comm" --arg version "$version" \
         --arg kind "$kind" --arg env_name "$env_name" --arg provider_url "$provider_url" \
         --arg auth_state "$auth_state" --arg fingerprint "$fingerprint" --arg workdir "$t/sandbox/project" \
-        --arg binary "$t/bin/$agent" --arg sandbox "$t/sandbox" --arg model "${zai_model:-glm-5.3}" \
+        --arg binary "$t/bin/$agent" --arg sandbox "$t/sandbox" --rawfile model "$t/zai.model" \
         '.target.tuple = ($adapter[0:3] | ascii_upcase) |
          .target.adapter = $adapter |
          .target.agent = $agent |
