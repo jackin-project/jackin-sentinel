@@ -917,6 +917,28 @@ def plain_root_scalars(text):
             continue
         if not line.strip() or line[0] in " \t" or line[0] == "#":
             continue
+        flow = 0
+        quote_ch = ""
+        esc = False
+        for ch in line:
+            if quote_ch == "'":
+                if ch == "'":
+                    quote_ch = ""
+                continue
+            if quote_ch == "\"":
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == "\"":
+                    quote_ch = ""
+                continue
+            if ch in "'\"":
+                quote_ch = ch
+            elif ch in "{}[]":
+                flow = 1
+        if flow:
+            raise ValueError("flow collection")
         match = key_re.match(line)
         if match is None:
             raise ValueError("unsupported line")
