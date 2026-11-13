@@ -4839,5 +4839,174 @@ fixture_spec=
 fixture_comm=
 fixture_fingerprint=
 
+launch_env_record() {
+    state 'exited 1 0'
+    record "$R_OK1"
+}
+
+launch_env_series() {
+    path=$1
+    first=$2
+    count=$3
+    physical_line_bytes=$4
+    python3 - "$path" "$first" "$count" "$physical_line_bytes" <<'PY'
+import sys
+
+path, first, count, physical_line_bytes = sys.argv[1:]
+first = int(first)
+count = int(count)
+physical_line_bytes = int(physical_line_bytes)
+line_bytes = physical_line_bytes - 1
+with open(path, "wb") as output:
+    for index in range(first, first + count):
+        name = f"TOKEN_{index:03d}"
+        prefix = f"export {name}='"
+        placeholder_prefix = "openshell:resolve:env:"
+        value_size = line_bytes - len(prefix) - 1
+        if value_size < len(placeholder_prefix):
+            raise SystemExit(2)
+        value = placeholder_prefix + "X" * (value_size - len(placeholder_prefix))
+        line = prefix + value + "'"
+        if len(line) != line_bytes:
+            raise SystemExit(3)
+        output.write(line.encode() + b"\n")
+PY
+}
+
+launch_env_small_files() {
+    directory=$1
+    count=$2
+    python3 - "$directory" "$count" <<'PY'
+import os
+import sys
+
+directory, count = sys.argv[1:]
+count = int(count)
+for index in range(count):
+    name = f"TOKEN_{index:03d}"
+    path = os.path.join(directory, f"env-{index:03d}")
+    with open(path, "wb") as output:
+        output.write(f"export {name}='openshell:resolve:env:{name}'\n".encode())
+PY
+}
+
+mk j08_launch_environment_exact_file_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 8 131072
+report j08_launch_environment_exact_file_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 8
+finish_case
+
+mk j08_launch_environment_over_file_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 8 131072
+printf '%s\n' "export TOKEN_008='openshell:resolve:env:TOKEN_008'" >>"$t/sandbox/.jackin/env-000"
+report j08_launch_environment_over_file_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+mk j08_launch_environment_exact_aggregate_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8 131072
+done
+report j08_launch_environment_exact_aggregate_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 64
+finish_case
+
+mk j08_launch_environment_over_aggregate_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8 131072
+done
+printf '%s\n' "export TOKEN_064='openshell:resolve:env:TOKEN_064'" >"$t/sandbox/.jackin/env-008"
+report j08_launch_environment_over_aggregate_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+mk j08_launch_environment_exact_line_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 1 131073
+report j08_launch_environment_exact_line_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 1
+finish_case
+
+mk j08_launch_environment_over_line_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 1 131074
+report j08_launch_environment_over_line_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+for count in 128 129; do
+    case_name=j08_launch_environment_${count}_files
+    mk "$case_name"
+    launch_env_record
+    mkdir -p "$t/sandbox/.jackin"
+    launch_env_small_files "$t/sandbox/.jackin" "$count"
+    report "$case_name"
+    if [ "$count" -eq 128 ]; then
+        expect environment PASS 'every credential variable is a placeholder'
+        fact '.environment | map(select(.source == "launch_env")) | length' 128
+    else
+        expect environment FAIL 'exceed bounded limits'
+    fi
+    finish_case
+done
+
+mk j08_launch_environment_malformed_file_cannot_be_hidden_by_a_placeholder
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$t/sandbox/.jackin/env-000"
+printf '%s\n' 'malformed' >"$t/sandbox/.jackin/env-001"
+report j08_launch_environment_malformed_file_cannot_be_hidden_by_a_placeholder
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+for kind in symlink_regular symlink_fifo direct_fifo; do
+    case_name=j08_launch_environment_${kind}_is_rejected
+    mk "$case_name"
+    launch_env_record
+    mkdir -p "$t/sandbox/.jackin"
+    target=$t/launch-target
+    case $kind in
+        symlink_regular)
+            printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$target"
+            ln -s "$target" "$t/sandbox/.jackin/env-000"
+            ;;
+        symlink_fifo)
+            mkfifo "$target"
+            ln -s "$target" "$t/sandbox/.jackin/env-000"
+            ;;
+        direct_fifo)
+            mkfifo "$t/sandbox/.jackin/env-000"
+            ;;
+    esac
+    report "$case_name"
+    expect environment FAIL 'exceed bounded limits'
+    fact '.environment | map(select(.source == "launch_env")) | length' 0
+    case $kind in
+        symlink_regular)
+            [ "$(cat "$target")" = "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" ] || problems="$problems launch-target-changed"
+            [ "$(readlink "$t/sandbox/.jackin/env-000")" = "$target" ] || problems="$problems launch-symlink-changed"
+            ;;
+        symlink_fifo)
+            [ -p "$target" ] || problems="$problems launch-target-fifo-changed"
+            [ "$(readlink "$t/sandbox/.jackin/env-000")" = "$target" ] || problems="$problems launch-symlink-changed"
+            ;;
+        direct_fifo) [ -p "$t/sandbox/.jackin/env-000" ] || problems="$problems launch-fifo-changed" ;;
+    esac
+    finish_case
+done
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
