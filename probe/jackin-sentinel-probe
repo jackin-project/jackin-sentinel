@@ -1236,6 +1236,7 @@ pin_declared_configs() {
     PIN_MODES=
     PIN_IDS=
     PIN_STATS=
+    PIN_DIRS=
     pin_declared_configs_run || {
         unpin_declared_configs
         return 1
@@ -1258,28 +1259,53 @@ pin_declared_configs_run() {
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 data = sys.stdin.buffer.read()
+parent, name = os.path.split(path)
+if not name:
+    raise SystemExit(1)
+if not parent:
+    parent = "."
 try:
-    handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-except FileNotFoundError:
-    sys.stdout.write("absent\nabsent\n")
-    raise SystemExit(0)
+    dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
 except OSError:
     raise SystemExit(1)
+mode = None
+dir_mode = None
+frozen = False
+written = False
 try:
-    opened = os.fstat(handle)
-    if not stat.S_ISREG(opened.st_mode):
-        raise SystemExit(1)
-    named = os.lstat(path)
-    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
-        raise SystemExit(1)
-    mode = stat.S_IMODE(opened.st_mode)
-    sys.stdout.write("%o\n%d %d %d %d %d\n" % (mode, opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
-    sys.stdout.flush()
-    os.fchmod(handle, 0o644)
-finally:
-    os.close(handle)
-try:
-    writer = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+    dirst = os.fstat(dirfd)
+    dir_mode = stat.S_IMODE(dirst.st_mode)
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except FileNotFoundError:
+        sys.stdout.write("absent\nabsent\n")
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(handle)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(1)
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise SystemExit(1)
+        mode = stat.S_IMODE(opened.st_mode)
+        sys.stdout.write("%o\n%d %d %d %d %d\n" % (mode, opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
+        sys.stdout.flush()
+    finally:
+        os.close(handle)
+    os.fchmod(dirfd, dir_mode & ~0o222)
+    frozen = True
+    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    try:
+        opened = os.fstat(handle)
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(1)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise SystemExit(1)
+        os.fchmod(handle, 0o644)
+    finally:
+        os.close(handle)
+    writer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
     try:
         opened = os.fstat(writer)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
@@ -1292,26 +1318,53 @@ try:
         final = os.fstat(writer)
     finally:
         os.close(writer)
+    written = True
+    sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
+    sys.stdout.write("%o %d %d\n" % (dir_mode, dirst.st_dev, dirst.st_ino))
+    raise SystemExit(0)
+except SystemExit as ex:
+    if ex.code and mode is not None and not written:
+        try:
+            restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            try:
+                os.fchmod(restorer, mode)
+            finally:
+                os.close(restorer)
+        except OSError:
+            pass
+    raise
 except BaseException:
-    restorer = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        os.fchmod(restorer, mode)
-    finally:
-        os.close(restorer)
+    if mode is not None and not written:
+        try:
+            restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            try:
+                os.fchmod(restorer, mode)
+            finally:
+                os.close(restorer)
+        except OSError:
+            pass
     raise SystemExit(1)
-sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
-raise SystemExit(0)
+finally:
+    if frozen and not written:
+        try:
+            os.fchmod(dirfd, dir_mode)
+        except OSError:
+            pass
+    os.close(dirfd)
 ' "$declared_path" 2>/dev/null)
         declared_rc=$?
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
         declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 3p)
+        declared_dir=$(printf '%s\n' "$declared_pin" | sed -n 4p)
         if [ "$declared_mode" = absent ]; then
             PIN_MODES="${PIN_MODES}absent
 "
             PIN_IDS="${PIN_IDS}absent
 "
             PIN_STATS="${PIN_STATS}absent
+"
+            PIN_DIRS="${PIN_DIRS}absent
 "
             return 1
         fi
@@ -1329,6 +1382,11 @@ raise SystemExit(0)
             '' | *[!0-9\ ]*) declared_stat= ;;
         esac
         PIN_STATS="${PIN_STATS}${declared_stat}
+"
+        case $declared_dir in
+            '' | *[!0-9\ ]*) declared_dir= ;;
+        esac
+        PIN_DIRS="${PIN_DIRS}${declared_dir}
 "
         [ "$declared_rc" -eq 0 ] || return 1
         [ -n "$declared_stat" ] || return 1
@@ -1352,6 +1410,7 @@ unpin_declared_configs() {
             *)
                 declared_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((declared_index + 1))p")
                 declared_ident=$(printf '%s\n' "$PIN_IDS" | sed -n "$((declared_index + 1))p")
+                declared_dir=$(printf '%s\n' "$PIN_DIRS" | sed -n "$((declared_index + 1))p")
                 python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 mode = int(sys.argv[2], 8)
@@ -1365,26 +1424,48 @@ try:
     want_ino = int(fields[1])
 except ValueError:
     raise SystemExit(0)
+dirfields = sys.argv[5].split()
+parent, name = os.path.split(path)
+if not name:
+    raise SystemExit(0)
+if not parent:
+    parent = "."
 try:
-    named = os.lstat(path)
+    dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
 except OSError:
     raise SystemExit(0)
-if not stat.S_ISREG(named.st_mode):
-    raise SystemExit(0)
 try:
-    handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-except OSError:
-    raise SystemExit(0)
-try:
-    opened = os.fstat(handle)
-    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+    try:
+        dirst = os.fstat(dirfd)
+        if len(dirfields) < 3:
+            raise OSError
+        if (dirst.st_dev, dirst.st_ino) != (int(dirfields[1]), int(dirfields[2])):
+            raise OSError
+        os.fchmod(dirfd, int(dirfields[0], 8))
+    except OSError:
+        pass
+    try:
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except OSError:
         raise SystemExit(0)
-    if (opened.st_dev, opened.st_ino) != (want_dev, want_ino):
+    if not stat.S_ISREG(named.st_mode):
         raise SystemExit(0)
-    os.fchmod(handle, mode)
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except OSError:
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(handle)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise SystemExit(0)
+        if (opened.st_dev, opened.st_ino) != (want_dev, want_ino):
+            raise SystemExit(0)
+        os.fchmod(handle, mode)
+    finally:
+        os.close(handle)
 finally:
-    os.close(handle)
-' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" 2>/dev/null || true
+    os.close(dirfd)
+' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" "$declared_dir" 2>/dev/null || true
                 ;;
         esac
         declared_index=$((declared_index + 1))
@@ -1392,6 +1473,7 @@ finally:
     PIN_MODES=
     PIN_IDS=
     PIN_STATS=
+    PIN_DIRS=
     return 0
 }
 

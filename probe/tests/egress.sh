@@ -1763,6 +1763,52 @@ expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoin
 fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 http://127.0.0.1:9/v1'
 finish_case
 
+mk t18_a_directory_entry_swap_during_the_launch_is_blocked
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+conf=$t/sandbox/.codex/config.toml
+if rm -f "\$conf" 2>/dev/null; then
+    : >"$t/swap.ok"
+    {
+        printf '%s\n' 'model = "glm-5.3"' 'model_provider = "zai"' '' '[model_providers.zai]' 'name = "Z.AI"' 'base_url = "http://127.0.0.1:9/v1"' 'env_key = "ZAI_API_KEY"' 'wire_api = "responses"'
+    } >"\$conf" 2>/dev/null || true
+    chmod 644 "\$conf" 2>/dev/null || true
+fi
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin t18_a_directory_entry_swap_during_the_launch_is_blocked step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+if [ -e "$t/swap.ok" ]; then
+    problems="$problems entry-swap-not-blocked"
+fi
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
 mk t09_an_indented_nested_base_url_is_not_the_root_key
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
