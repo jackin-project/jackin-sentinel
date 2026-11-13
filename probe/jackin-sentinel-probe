@@ -4234,7 +4234,7 @@ main() {
     declared_use_snapshot=
     if declared_provider_config; then
         prompt_configs_validated=true
-        if pin_declared_configs; then
+        if [ "$mode" != host ] && pin_declared_configs; then
             prompt_configs_pinned=true
         fi
     fi

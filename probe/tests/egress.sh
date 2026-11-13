@@ -2751,5 +2751,31 @@ expect agent_exec FAIL 'the provider endpoint is not the contract endpoint https
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 finish_case
 
+mk t18_a_host_dry_run_does_not_pin_the_declared_config
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+total=$((total + 1))
+problems=
+name=t18_a_host_dry_run_does_not_pin_the_declared_config
+prepare_probe || problems="$problems setup failure"
+if [ -z "$problems" ]; then
+    zai_spec "$zai_adapter" "$zai_agent" "$zai_comm" "$zai_version" "$zai_kind" "$zai_env_name" "$zai_provider_url" "$zai_auth_state" "$zai_fingerprint" || problems="$problems spec failure"
+fi
+host_config=$t/sandbox/.codex/config.toml
+stat_before=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$host_config" 2>/dev/null)
+mode_before=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$host_config" 2>/dev/null)
+bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY sh "$t/probe" --host --only J09
+execute_rc=$?
+cp "$scratch/bounded.out" "$t/out"
+cp "$scratch/bounded.err" "$t/err"
+if [ "$execute_rc" -eq 0 ]; then :; else problems="$problems exit=[$execute_rc](want [0])"; fi
+jq -e '.schema == 3 and .mode == "host" and (.steps | keys) == ["J09"]' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape"
+stat_after=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$host_config" 2>/dev/null)
+mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$host_config" 2>/dev/null)
+[ "$stat_before" = "$stat_after" ] || problems="$problems the-host-config-was-mutated"
+[ "$mode_before" = "$mode_after" ] || problems="$problems the-host-config-mode-changed=$mode_after(want $mode_before)"
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
