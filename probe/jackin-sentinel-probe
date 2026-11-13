@@ -809,7 +809,7 @@ capture_bounded() {
     _jks_capture=
     _jks_capture=$(
         exec 9<"$1" 2>/dev/null || exit 1
-        RB_FD=9 RB_SRC=$1 RB_CAP=$2 python3 -I -c 'import os, stat, sys
+        RB_FD=9 RB_SRC=$1 RB_CAP=$2 RB_LEN=$3 python3 -I -c 'import os, stat, sys
 handle = os.fstat(int(os.environ["RB_FD"]))
 if not stat.S_ISREG(handle.st_mode):
     raise SystemExit(1)
@@ -817,6 +817,8 @@ named = os.lstat(os.environ["RB_SRC"])
 if (handle.st_dev, handle.st_ino) != (named.st_dev, named.st_ino):
     raise SystemExit(1)
 if handle.st_size > int(os.environ["RB_CAP"]):
+    raise SystemExit(1)
+if b"\x00" in os.pread(int(os.environ["RB_FD"]), min(handle.st_size, int(os.environ["RB_LEN"])), 0):
     raise SystemExit(1)
 ' 2>/dev/null || exit 1
         cb_raw=$(
