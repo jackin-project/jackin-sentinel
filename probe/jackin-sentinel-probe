@@ -1492,6 +1492,7 @@ stage_agent_home() {
 }
 
 agent_exec_seal() {
+    [ -n "$RUN_KEY" ] || return 1
     _jks_agent_exec_seal=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
     _jks_agent_exec_seal=${_jks_agent_exec_seal%% *}
     printf '%s\n' "$_jks_agent_exec_seal" >"$work/agent_exec.seal" || return 1
@@ -4131,12 +4132,17 @@ main() {
     chmod 700 "$spec_dir" 2>/dev/null || :
     trap 'unpin_declared_configs; rm -rf "$work" "$spec_dir"' EXIT
     trap 'exit 70' INT TERM HUP
-    RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
-    RUN_KEY=${RUN_KEY%% *}
+    RUN_KEY=
+    if head -c 32 /dev/urandom >"$work/run.entropy" 2>/dev/null; then
+        RUN_KEY=$(sha256sum <"$work/run.entropy" 2>/dev/null)
+        RUN_KEY=${RUN_KEY%% *}
+    fi
+    rm -f "$work/run.entropy" 2>/dev/null || :
     case $RUN_KEY in
         '' | *[!0-9a-f]*) RUN_KEY= ;;
     esac
     [ "${#RUN_KEY}" -eq 64 ] || RUN_KEY=
+    [ "$RUN_KEY" != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ] || RUN_KEY=
     RUN_SEED=
     if [ -n "$RUN_KEY" ]; then
         RUN_SEED=$(printf '%s' "$RUN_KEY" | sha256sum 2>/dev/null)

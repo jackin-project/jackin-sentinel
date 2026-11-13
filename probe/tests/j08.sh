@@ -4835,6 +4835,26 @@ if grep -Fq 'peer note' "$t/out"; then
 fi
 finish_case
 
+mk known_no_head_run_key_is_refused
+real_head=$(command -v head) || exit 70
+cat >"$t/bin/head" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*) exit 1 ;;
+esac
+exec "$real_head" "\$@"
+EOF
+chmod +x "$t/bin/head"
+state 'exited 1 0'
+record "$R_OK1"
+begin known_no_head_run_key_is_refused sh "$t/probe" --only J08
+expect_rc 70
+case $(cat "$t/err") in
+    *'no key material'*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want no-key refusal)" ;;
+esac
+finish_case
+
 fixture_spec=
 fixture_comm=
 fixture_fingerprint=
