@@ -5109,6 +5109,39 @@ expect environment FAIL 'exceed bounded limits'
 fact '.environment | map(select(.source == "launch_env")) | length' 0
 finish_case
 
+launch_env_escaped_series() {
+    path=$1
+    first=$2
+    count=$3
+    python3 - "$path" "$first" "$count" <<'PY'
+import sys
+
+path, first, count = sys.argv[1:]
+first = int(first)
+count = int(count)
+with open(path, "wb") as output:
+    for index in range(first, first + count):
+        name = f"TOKEN_{index:03d}"
+        line = "export " + name + "='a" + "'\\''a" * 26210 + "b'"
+        if len(line) != 131071:
+            raise SystemExit(2)
+        output.write(line.encode() + b"\n")
+PY
+}
+
+case_bound=20
+mk j08_launch_environment_large_escaped_value_parses_within_bound
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_escaped_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8
+done
+report j08_launch_environment_large_escaped_value_parses_within_bound
+expect launch_env PASS '8 launch environment file(s) read'
+expect environment FAIL 'not a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 64
+finish_case
+
 j07_launcher_agent_exec_fixtures() {
     auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
     {
@@ -5199,6 +5232,7 @@ expect_rc 0
 expect_report J07 sandbox
 fact '.launcher_identity' null
 finish_case
+
 
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

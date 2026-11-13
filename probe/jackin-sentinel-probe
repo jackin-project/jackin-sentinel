@@ -50,6 +50,7 @@ LOG_READ_SECONDS=10
 LAUNCH_ENV_MAX_LINE_BYTES=131072
 LAUNCH_ENV_MAX_FILES=128
 LAUNCH_ENV_TOTAL_MAX_BYTES=8388608
+LAUNCH_ENV_PARSE_SECONDS=20
 PROJECT_FILE_MAX_BYTES=67108864
 PROJECT_TOTAL_MAX_BYTES=536870912
 PROJECT_HASH_SECONDS=300
@@ -1452,9 +1453,10 @@ launch_env_classifications() {
             return 1
             ;;
     esac
-    LC_ALL=C awk -v max_line="$LAUNCH_ENV_MAX_LINE_BYTES" -v status_file="$launch_parse_status" '
+    # shellcheck disable=SC2016
+    LC_ALL=C timeout "$LAUNCH_ENV_PARSE_SECONDS" awk -v max_line="$LAUNCH_ENV_MAX_LINE_BYTES" -v status_file="$launch_parse_status" '
         function reject() { invalid = 1 }
-        function parse(line,    rest, equal, name, quoted, position, close_at, value, single, slash, scan) {
+        function parse(line,    rest, equal, name, quoted, single, slash, count, i) {
             single = sprintf("%c", 39)
             slash = sprintf("%c", 92)
             if (substr(line, 1, 7) != "export ") return 0
@@ -1465,29 +1467,16 @@ launch_env_classifications() {
             if (name !~ /^[A-Za-z_][A-Za-z0-9_]*$/ || name ~ /^JACKIN_/) return 0
             quoted = substr(rest, equal + 1)
             if (substr(quoted, 1, 1) != single) return 0
-            position = 2
-            value = ""
-            while (position <= length(quoted)) {
-                close_at = 0
-                for (scan = position; scan <= length(quoted); scan++) {
-                    if (substr(quoted, scan, 1) == single) {
-                        close_at = scan
-                        break
-                    }
-                }
-                if (close_at == 0) return 0
-                value = value substr(quoted, position, close_at - position)
-                position = close_at + 1
-                if (position == length(quoted) + 1) {
-                    parsed_name = name
-                    parsed_value = value
-                    return 1
-                }
-                if (substr(quoted, position, 3) != slash single single) return 0
-                value = value single
-                position += 3
+            count = split(quoted, parts, single)
+            if (count < 3 || count % 3 != 0) return 0
+            if (parts[count] != "") return 0
+            for (i = 3; i < count; i += 3) {
+                if (parts[i] != slash) return 0
+                if (parts[i + 1] != "") return 0
             }
-            return 0
+            parsed_name = name
+            part_count = count
+            return 1
         }
         {
             if (length($0) > max_line) reject()
@@ -1498,7 +1487,12 @@ launch_env_classifications() {
             }
             if (previous != "" && parsed_name <= previous) reject()
             previous = parsed_name
-            printf "%s=%s%c", parsed_name, parsed_value, 0
+            printf "%s=", parsed_name
+            for (i = 2; i < part_count; i += 3) {
+                if (i > 2) printf "%c", 39
+                printf "%s", parts[i]
+            }
+            printf "%c", 0
         }
         END {
             printf "%s\n", invalid ? 1 : 0 > status_file
