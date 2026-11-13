@@ -2130,6 +2130,8 @@ apiKey: ZAI_API_KEY
 MOCKCONF
 begin t09_a_quoted_key_root_base_url_is_the_effective_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+fact '.agent_exec.actual_endpoint' 'http://127.0.0.1:9/v1'
+expect_codex_not_run
 finish_case
 
 mk t18_a_quote_run_terminator_is_not_an_early_close
@@ -2152,6 +2154,31 @@ wire_api = "responses"
 MOCKCONF
 begin t18_a_quote_run_terminator_is_not_an_early_close step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
+fact '.agent_exec.sandbox_endpoint' 'http://127.0.0.1:9/v1'
+expect_codex_not_run
+finish_case
+
+mk t09_a_redirected_declared_pair_is_refused_before_launch
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' '# baseUrl: https://api.z.ai/api/anthropic' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' '# baseUrl: https://api.z.ai/api/anthropic' 'baseUrl: http://127.0.0.1:9/v1' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_redirected_declared_pair_is_refused_before_launch step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+fact '.agent_exec.actual_endpoint' 'http://127.0.0.1:9/v1'
+expect_codex_not_run
+finish_case
+
+mk t09_an_embedded_nul_config_is_rejected
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf 'baseUrl: https://api.z.ai/api/anthropic\0\n' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >>"$t/sandbox/.omp/config.toml"
+begin t09_an_embedded_nul_config_is_rejected step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the launches were refused because the declared configuration was not validated and pinned'
+expect_codex_not_run
 finish_case
 
 for selected_step in J07 J09; do
