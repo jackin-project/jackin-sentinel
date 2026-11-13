@@ -4777,6 +4777,9 @@ for tuple in T09 T14 T18; do
     not_disclosed "$export_key"
     finish_case
 done
+fixture_spec=
+fixture_comm=
+fixture_fingerprint=
 
 forge_peer() {
     real_timeout=$(command -v timeout) || return 1
