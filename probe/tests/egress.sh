@@ -11,9 +11,32 @@ trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
 mkdir "$scratch/tools"
+python_bin=$(command -v python3) || {
+    echo "FAIL setup: python3 is not installed"
+    exit 70
+}
+case "$python_bin" in
+    /*) ;;
+    *)
+        python_dir=${python_bin%/*}
+        python_name=${python_bin##*/}
+        [ "$python_dir" != "$python_bin" ] || python_dir=.
+        python_dir=$(cd "$python_dir" && pwd -P) || exit 70
+        python_bin=$python_dir/$python_name
+        ;;
+esac
+python_real=$("$python_bin" -c 'import sys; sys.stdout.write(sys.executable)' 2>/dev/null) || python_real=
+case "$python_real" in
+    /*) ;;
+    *) python_real= ;;
+esac
+[ -n "$python_real" ] && [ -x "$python_real" ] || python_real=$python_bin
+python_bin=$python_real
 for tool in sh base64 jq sed tr cat env awk grep mktemp rm wc head dd od mkdir cp chmod sha256sum cut sort python3; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
+    elif [ "$tool" = python3 ]; then
+        found=$python_bin
     else
         found=$(command -v "$tool") || {
             echo "FAIL setup: $tool is not installed"
@@ -89,6 +112,10 @@ mk() {
 prepare_probe() {
     fixture_path=$t/bin:$scratch/tools
     sed -e "s#/sandbox#$t/sandbox#g" -e "s#^AGENT_BIN=.*#AGENT_BIN=$t/bin/codex#" "$probe" >"$t/probe.impl"
+    if [ -n "${case_spec_dir-}" ]; then
+        sed -e "s#/tmp/jackin-sentinel-probe-spec.XXXXXX#$case_spec_dir.XXXXXX#g" "$t/probe.impl" >"$t/probe.next" || return 1
+        mv "$t/probe.next" "$t/probe.impl" || return 1
+    fi
     if grep -q '^SANDBOX_PATH=' "$t/probe.impl"; then
         sed "s#^SANDBOX_PATH=.*#SANDBOX_PATH=$fixture_path#" "$t/probe.impl" >"$t/probe.next" || return 1
         mv "$t/probe.next" "$t/probe.impl" || return 1
@@ -684,17 +711,6 @@ PLACEHOLDER_SHOWN='openshel*********************************OKEN'
 API_PLACEHOLDER=openshell:resolve:env:OPENAI_API_KEY
 API_PLACEHOLDER_SHOWN='openshel************************_KEY'
 HOSTILE_TOKEN=synthetic-hostile-home-token-0123456789
-python_bin=$(command -v python3) || exit 70
-case "$python_bin" in
-    /*) ;;
-    *)
-        python_dir=${python_bin%/*}
-        python_name=${python_bin##*/}
-        [ "$python_dir" != "$python_bin" ] || python_dir=.
-        python_dir=$(cd "$python_dir" && pwd -P) || exit 70
-        python_bin=$python_dir/$python_name
-        ;;
-esac
 INJECTED="$PLACEHOLDER
 X-Exfil: FAKE-REAL-SECRET-0123456789"
 INJECTED_JSON='openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN\nX-Exfil: FAKE-REAL-SECRET-0123456789'
@@ -1298,6 +1314,14 @@ for selected_step in J07 J09; do
     expect_codex_not_run
     finish_case
 done
+
+collect_descendants() {
+    descendants=
+    for tree_child in $(pgrep -P "$1" 2>/dev/null); do
+        collect_descendants "$tree_child"
+        descendants="$descendants $tree_child"
+    done
+}
 
 zai_case() {
     zai_adapter=$1
@@ -2103,7 +2127,7 @@ finish_case
 mk j09_the_expected_model_never_travels_on_the_argument_vector
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
-zai_model=$(head -c 131072 /dev/zero | tr '\0' m)
+zai_model=$(head -c 100000 /dev/zero | tr '\0' m)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 cat >"$t/bin/jq" <<EOF
 #!/bin/sh
@@ -2455,17 +2479,19 @@ while [ ! -f "$t/tool.ran" ] && kill -0 "$probe_pid" 2>/dev/null && [ "$ticks" -
     ticks=$((ticks + 1))
 done
 sleep 0.2
-kill_tree() {
-    for tree_child in $(pgrep -P "$1" 2>/dev/null); do
-        kill_tree "$tree_child"
-    done
-    kill -TERM "$1" 2>/dev/null
-}
-kill_tree "$probe_pid"
+collect_descendants "$probe_pid"
+kill -TERM "$probe_pid" 2>/dev/null
+kill_status=$?
+for tree_child in $descendants; do
+    kill -TERM "$tree_child" 2>/dev/null
+done
 wait "$probe_pid" 2>/dev/null
+probe_status=$?
 name=t09_pinned_modes_restored_when_the_probe_is_signalled
 problems=
 total=$((total + 1))
+[ "$kill_status" -eq 0 ] || problems="$problems the-probe-signal-failed"
+[ "$probe_status" -eq 70 ] || problems="$problems the-probe-exit=$probe_status(want 70)"
 mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
 mode_after_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
 [ "$mode_after" = "$mode_before" ] || problems="$problems config-mode=$mode_after(want $mode_before)"
@@ -2477,12 +2503,12 @@ mk t09_a_detached_helper_cannot_forge_the_final_evidence
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
-printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
 cat >"$t/bin/omp" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
 if [ -n "\${CODEX_HOME-}" ]; then
     d=\${CODEX_HOME%/*}
+    printf '%s\n' forged >>"$t/forged.ran"
     ( while [ -d "\$d" ]; do
         printf '%s\n' '{"attempted":true,"credential":"static_key","exit_code":0,"answered":true,"output_bytes":4,"actual_provider":"zai","actual_model":"glm-5.3","actual_endpoint":"https://api.z.ai/api/anthropic","sandbox_endpoint":"https://api.z.ai/api/anthropic","tool":{"kind":"bash","attempted":true,"succeeded":true,"exit_code":0,"workdir":"$t/sandbox/project","observation":["AGENTS.md Dockerfile instructions jackin.role.toml probe tests"]}}' >"\$d/agent_exec.json" 2>/dev/null
     done ) >/dev/null 2>&1 &
@@ -2505,15 +2531,17 @@ got_result=$(jq -r '.steps[].checks[] | select(.name == "agent_reaches_api") | .
 got_detail=$(jq -r '.steps[].checks[] | select(.name == "agent_reaches_api") | .detail' "$t/out" 2>/dev/null)
 [ "$got_result" = FAIL ] || problems="$problems agent_reaches_api=$got_result(want FAIL)"
 case $got_detail in
-    *'not authentic'* | *'not the contract endpoint'*) ;;
-    *) problems="$problems agent_reaches_api.detail=[$got_detail](want not-authentic-or-endpoint)" ;;
+    *'not authentic'*) ;;
+    *) problems="$problems agent_reaches_api.detail=[$got_detail](want not-authentic)" ;;
 esac
+[ -s "$t/forged.ran" ] || problems="$problems the-detached-helper-never-ran"
 finish_case
 
 mk t09_an_agent_owned_snapshot_cannot_rewrite_the_validated_config
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+case_spec_dir="$t/spec-dir"
 cat >"$t/bin/omp" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
@@ -2522,7 +2550,7 @@ case " \$* " in
         (
             attack=0
             target=
-            for d in /tmp/jackin-sentinel-probe-spec.*; do
+            for d in "$t"/spec-dir.*; do
                 if [ -d "\$d" ]; then
                     target=\$d
                     break
@@ -2550,6 +2578,7 @@ begin t09_an_agent_owned_snapshot_cannot_rewrite_the_validated_config step_J09 '
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
 [ -s "$t/tampered" ] || problems="$problems attack-fixture-never-ran"
+case_spec_dir=
 finish_case
 
 mk t09_a_pin_records_the_real_mode_and_restores_exactly_that
@@ -2557,15 +2586,17 @@ host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 chmod 0600 "$t/sandbox/.omp/config.toml"
-cat >"$t/bin/python3" <<EOF
+mv "$t/bin/omp" "$t/bin/omp.real"
+cat >"$t/bin/omp" <<EOF
 #!/bin/sh
-case " \$* " in
-    *O_WRONLY*) exit 1 ;;
-esac
-exec "$python_bin" "\$@"
+python3 -I -c 'import os, sys; sys.stdout.write("%o\n" % (os.stat(sys.argv[1]).st_mode & 0o7777))' "$t/sandbox/.omp/config.toml" >"$t/mode.during" 2>/dev/null || :
+exec "$t/bin/omp.real" "\$@"
 EOF
-chmod +x "$t/bin/python3"
+chmod +x "$t/bin/omp"
 begin t09_a_pin_records_the_real_mode_and_restores_exactly_that step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+mode_during=$(cat "$t/mode.during" 2>/dev/null)
+[ "$mode_during" = 444 ] || problems="$problems pinned-mode=[$mode_during](want [444])"
 mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
 [ "$mode_after" = 600 ] || problems="$problems config-mode-after=[$mode_after](want [600])"
 finish_case

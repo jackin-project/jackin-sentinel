@@ -14,9 +14,31 @@ fixture_comm=
 fixture_fingerprint=
 
 mkdir -p "$scratch/tools" "$scratch/shim"
+python_bin=$(command -v python3) || {
+    echo "FAIL setup: python3 is not installed"
+    exit 70
+}
+case "$python_bin" in
+    /*) ;;
+    *)
+        python_dir=${python_bin%/*}
+        python_name=${python_bin##*/}
+        [ "$python_dir" != "$python_bin" ] || python_dir=.
+        python_dir=$(cd "$python_dir" && pwd -P) || exit 70
+        python_bin=$python_dir/$python_name
+        ;;
+esac
+python_real=$("$python_bin" -c 'import sys; sys.stdout.write(sys.executable)' 2>/dev/null) || python_real=
+case "$python_real" in
+    /*) ;;
+    *) python_real= ;;
+esac
+[ -n "$python_real" ] && [ -x "$python_real" ] || python_real=$python_bin
 for tool in awk basename base64 cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
+    elif [ "$tool" = python3 ]; then
+        found=$python_real
     else
         found=$(command -v "$tool") || {
             echo "FAIL setup: $tool is not installed"
@@ -4853,6 +4875,105 @@ case $(cat "$t/err") in
     *'no key material'*) ;;
     *) problems="$problems stderr=[$(cat "$t/err")](want no-key refusal)" ;;
 esac
+finish_case
+
+mk pin_write_failure_restores_the_original_mode
+real_python3_probe=$(command -v python3) || exit 70
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's/os\.ftruncate(writer, 0)/raise SystemExit(1)/')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_probe" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "http://127.0.0.1:9/v1"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_write_failure_restores_the_original_mode sh "$t/probe" --only J07
+expect_rc 0
+restored_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$restored_mode" != 600 ]; then
+    problems="$problems config-mode=$restored_mode(want 600 restored)"
+fi
+finish_case
+
+mk cleanup_restores_only_the_pinned_identity
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+if command -v mise >/dev/null 2>&1; then
+    real_jq_case=$(mise which jq) || exit 70
+else
+    real_jq_case=$(command -v jq) || exit 70
+fi
+cat >"$t/bin/jq" <<EOF
+#!/bin/sh
+: >"$t/jq-ran"
+if [ ! -e "$t/replaced" ] && [ -f "$t/sandbox/.codex/config.toml" ]; then
+    current_mode=\$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+    if [ "\$current_mode" = 444 ]; then
+        : >"$t/replaced"
+        rm -f "$t/sandbox/.codex/config.toml"
+        printf 'replacement\n' >"$t/sandbox/.codex/config.toml"
+        chmod 644 "$t/sandbox/.codex/config.toml"
+    fi
+fi
+exec "$real_jq_case" "\$@"
+EOF
+chmod +x "$t/bin/jq"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin cleanup_restores_only_the_pinned_identity sh "$t/probe" --only J07
+if [ ! -e "$t/jq-ran" ]; then
+    problems="$problems jq-never-ran"
+fi
+if [ ! -e "$t/replaced" ]; then
+    problems="$problems replacement-never-happened"
+fi
+replaced_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$replaced_mode" != 644 ]; then
+    problems="$problems replacement-mode=$replaced_mode(want 644 untouched)"
+fi
 finish_case
 
 fixture_spec=
