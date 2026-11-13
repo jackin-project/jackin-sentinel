@@ -807,10 +807,10 @@ copy_bounded() {
 }
 
 capture_bounded() {
+    _jks_capture=
     _jks_capture=$(
         exec 9<"$1" 2>/dev/null || exit 1
-        cb_size=$(
-            RB_FD=9 RB_SRC=$1 RB_CAP=$2 python3 -I -c 'import os, stat, sys
+        RB_FD=9 RB_SRC=$1 RB_CAP=$2 python3 -I -c 'import os, stat, sys
 handle = os.fstat(int(os.environ["RB_FD"]))
 if not stat.S_ISREG(handle.st_mode):
     raise SystemExit(1)
@@ -819,27 +819,28 @@ if (handle.st_dev, handle.st_ino) != (named.st_dev, named.st_ino):
     raise SystemExit(1)
 if handle.st_size > int(os.environ["RB_CAP"]):
     raise SystemExit(1)
-sys.stdout.write("%d" % handle.st_size)
-' 2>/dev/null
-        ) || exit 1
+' 2>/dev/null || exit 1
         cb_raw=$(
             if command -v head >/dev/null 2>&1; then
                 if command -v timeout >/dev/null 2>&1; then
-                    timeout 10 head -c "$3" -- /dev/fd/9 || exit 1
+                    timeout 10 head -c "$3" <&9 || exit 1
                 else
-                    head -c "$3" -- /dev/fd/9 || exit 1
+                    head -c "$3" <&9 || exit 1
                 fi
             elif command -v dd >/dev/null 2>&1; then
-                dd if=/dev/fd/9 bs="$3" count=1 2>/dev/null || exit 1
+                dd bs="$3" count=1 <&9 2>/dev/null || exit 1
             else
                 exit 1
             fi
             printf x
         ) || exit 1
         cb_raw=${cb_raw%x}
-        cb_len=$(printf '%s' "$cb_raw" | wc -c | tr -d '[:space:]') || exit 1
+        if command -v wc >/dev/null 2>&1; then
+            cb_len=$(printf '%s' "$cb_raw" | wc -c | tr -d '[:space:]') || exit 1
+        else
+            cb_len=$(printf '%s' "$cb_raw" | python3 -I -c 'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))' 2>/dev/null) || exit 1
+        fi
         [ -n "$cb_len" ] || exit 1
-        [ "$cb_len" = "$cb_size" ] 2>/dev/null || exit 1
         [ "$cb_len" -le "$2" ] 2>/dev/null || exit 1
         printf '%s' "$cb_raw"
         printf x
