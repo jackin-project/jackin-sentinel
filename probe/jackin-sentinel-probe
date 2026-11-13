@@ -1123,6 +1123,7 @@ PY_JKS_YAML_CODE
 
 pin_declared_configs() {
     PIN_MODES=
+    PIN_IDS=
     PIN_STATS=
     pin_declared_configs_run || {
         unpin_declared_configs
@@ -1177,6 +1178,7 @@ try:
         while view:
             view = view[os.write(writer, view):]
         os.fchmod(writer, 0o444)
+        final = os.fstat(writer)
     finally:
         os.close(writer)
 except BaseException:
@@ -1186,13 +1188,17 @@ except BaseException:
     finally:
         os.close(restorer)
     raise SystemExit(1)
+sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
 raise SystemExit(0)
 ' "$declared_path" 2>/dev/null)
         declared_rc=$?
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
-        declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 2p)
+        declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
+        declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 3p)
         if [ "$declared_mode" = absent ]; then
             PIN_MODES="${PIN_MODES}absent
+"
+            PIN_IDS="${PIN_IDS}absent
 "
             PIN_STATS="${PIN_STATS}absent
 "
@@ -1201,14 +1207,20 @@ raise SystemExit(0)
         case $declared_mode in
             '' | *[!0-7]*) return 1 ;;
         esac
-        case $declared_stat in
+        case $declared_id in
             '' | *[!0-9\ ]*) return 1 ;;
         esac
         PIN_MODES="${PIN_MODES}${declared_mode}
 "
+        PIN_IDS="${PIN_IDS}${declared_id}
+"
+        case $declared_stat in
+            '' | *[!0-9\ ]*) declared_stat= ;;
+        esac
         PIN_STATS="${PIN_STATS}${declared_stat}
 "
         [ "$declared_rc" -eq 0 ] || return 1
+        [ -n "$declared_stat" ] || return 1
         declared_index=$((declared_index + 1))
     done
     return 0
@@ -1228,11 +1240,14 @@ unpin_declared_configs() {
             '' | *[!0-7]*) ;;
             *)
                 declared_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((declared_index + 1))p")
+                declared_ident=$(printf '%s\n' "$PIN_IDS" | sed -n "$((declared_index + 1))p")
                 python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 mode = int(sys.argv[2], 8)
 fields = sys.argv[3].split()
-if len(fields) != 5:
+if len(fields) < 2:
+    fields = sys.argv[4].split()
+if len(fields) < 2:
     raise SystemExit(0)
 try:
     want_dev = int(fields[0])
@@ -1258,12 +1273,13 @@ try:
     os.fchmod(handle, mode)
 finally:
     os.close(handle)
-' "$declared_path" "$declared_mode" "$declared_pinned" 2>/dev/null || true
+' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" 2>/dev/null || true
                 ;;
         esac
         declared_index=$((declared_index + 1))
     done
     PIN_MODES=
+    PIN_IDS=
     PIN_STATS=
     return 0
 }

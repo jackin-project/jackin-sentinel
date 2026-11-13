@@ -4937,26 +4937,23 @@ auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TO
     printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
 } >"$t/sandbox/.codex/config.toml"
 chmod 600 "$t/sandbox/.codex/config.toml"
-if command -v mise >/dev/null 2>&1; then
-    real_jq_case=$(mise which jq) || exit 70
-else
-    real_jq_case=$(command -v jq) || exit 70
-fi
-cat >"$t/bin/jq" <<EOF
-#!/bin/sh
-: >"$t/jq-ran"
-if [ ! -e "$t/replaced" ] && [ -f "$t/sandbox/.codex/config.toml" ]; then
-    current_mode=\$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
-    if [ "\$current_mode" = 444 ]; then
-        : >"$t/replaced"
-        rm -f "$t/sandbox/.codex/config.toml"
-        printf 'replacement\n' >"$t/sandbox/.codex/config.toml"
-        chmod 644 "$t/sandbox/.codex/config.toml"
-    fi
-fi
-exec "$real_jq_case" "\$@"
-EOF
-chmod +x "$t/bin/jq"
+(
+    swap_ticks=0
+    while [ "$swap_ticks" -lt 400 ]; do
+        current_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+        if [ "$current_mode" = 444 ]; then
+            rm -f "$t/sandbox/.codex/config.toml"
+            printf 'replacement\n' >"$t/sandbox/.codex/config.toml"
+            chmod 644 "$t/sandbox/.codex/config.toml"
+            : >"$t/replaced"
+            exit 0
+        fi
+        sleep 0.05
+        swap_ticks=$((swap_ticks + 1))
+    done
+    exit 0
+) &
+swap_pid=$!
 cat >"$t/bin/codex" <<EOF
 #!/bin/sh
 echo ready
@@ -4964,9 +4961,7 @@ exit 0
 EOF
 chmod +x "$t/bin/codex"
 begin cleanup_restores_only_the_pinned_identity sh "$t/probe" --only J07
-if [ ! -e "$t/jq-ran" ]; then
-    problems="$problems jq-never-ran"
-fi
+wait "$swap_pid" 2>/dev/null
 if [ ! -e "$t/replaced" ]; then
     problems="$problems replacement-never-happened"
 fi
