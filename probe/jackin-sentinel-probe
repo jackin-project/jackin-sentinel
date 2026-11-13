@@ -649,6 +649,7 @@ agent_tool_evidence() {
     actual_model=
     actual_endpoint=
     configs_stat_ok=true
+    configs_pinned=false
     sandbox_endpoint=
     sandbox_conflict=false
     if [ "$EXPECTED_AGENT" = codex ]; then
@@ -676,19 +677,20 @@ agent_tool_evidence() {
         done <<EOF
 $TOOL_ARGV
 EOF
-        configs_pinned=false
-        if [ "${prompt_configs_pinned-}" = true ]; then
+        if [ "${prompt_configs_validated-}" = true ] && [ "${prompt_configs_pinned-}" = true ]; then
             configs_pinned=true
-        elif [ "$EXPECTED_AGENT" != codex ] && [ -n "$actual_endpoint" ]; then
-            actual_endpoint=
         fi
-        (
-            ulimit -f 128
-            cd "$PROJECT" || exit 1
-            sanitize_launch_environment || exit 1
-            CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
-        )
-        tool_exit=$?
+        if [ "$configs_pinned" = true ]; then
+            (
+                ulimit -f 128
+                cd "$PROJECT" || exit 1
+                sanitize_launch_environment || exit 1
+                CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
+            )
+            tool_exit=$?
+        else
+            tool_exit=126
+        fi
         if [ "$configs_pinned" = true ]; then
             declared_configs_stat_unchanged || configs_stat_ok=false
             unpin_declared_configs
@@ -732,7 +734,10 @@ EOF
             stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$work/agent-home/config.toml" 2>/dev/null) || stage_stat_now=
             [ -n "$stage_config_stat" ] && [ "$stage_stat_now" = "$stage_config_stat" ] || sandbox_conflict=true
         fi
-        if [ "$configs_pinned" = true ] && { [ "$configs_stat_ok" != true ] || ! declared_configs_match_snapshot; }; then
+        if [ "$configs_pinned" != true ]; then
+            actual_endpoint=
+            sandbox_conflict=true
+        elif [ "$configs_stat_ok" != true ] || ! declared_configs_match_snapshot; then
             actual_endpoint=
         fi
     elif [ -n "$actual_endpoint" ]; then
@@ -1458,6 +1463,11 @@ EOF
         launch_kind=api_key
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
+    fi
+    if [ "${prompt_configs_validated-}" != true ] || [ "${prompt_configs_pinned-}" != true ]; then
+        config_gate_refused=1
+        launch_kind=none
+        why="codex exec was not run: the declared configuration was not validated and pinned"
     fi
     if [ "$launch_kind" != none ] && ! (sanitize_launch_environment); then
         launch_kind=none
@@ -2663,6 +2673,8 @@ EOF_JKS_AGENT_EXEC
         else
             fail agent_exec "agent exec or tool evidence is incomplete (exit $ae_exit)"
         fi
+    elif [ "${config_gate_refused-}" = 1 ]; then
+        fail agent_exec "the provider endpoint is not the contract endpoint $PROVIDER_URL; the launches were refused because the declared configuration was not validated and pinned"
     else
         skip agent_exec "$(cat "$work/agent_exec.why")"
     fi
@@ -3158,6 +3170,8 @@ EOF_JKS_AGENT_EXEC
             else
                 fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $ae_exit)"
             fi
+        elif [ "${config_gate_refused-}" = 1 ]; then
+            fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL; the launches were refused because the declared configuration was not validated and pinned"
         else
             skip agent_reaches_api "$(cat "$work/agent_exec.why")"
         fi

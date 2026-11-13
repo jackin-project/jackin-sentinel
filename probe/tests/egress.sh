@@ -77,6 +77,9 @@ mk() {
     t=$scratch/$1
     rm -rf "$t"
     mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox/project" "$t/tmp"
+    mkdir -p "$t/sandbox/.codex"
+    printf '%s\n' 'model = "gpt-6.1-sol"' 'model_provider = "codex"' '' '[model_providers.codex]' 'name = "codex"' 'base_url = "https://chatgpt.com/backend-api/models"' >"$t/sandbox/.codex/config.toml"
+    chmod 0600 "$t/sandbox/.codex/config.toml"
     : >"$t/table"
     : >"$t/curl.log"
     PROVIDER=https://chatgpt.com/backend-api/models
@@ -1070,7 +1073,7 @@ mk j09_environment_only_credentials_launch_with_the_contract_provider_config
 with_curl
 codex_says 'ready' 0
 mkdir -p "$t/sandbox/.codex"
-printf '%s\n' 'model = "synthetic-config-model"' >"$t/sandbox/.codex/config.toml"
+printf '%s\n' 'model = "synthetic-config-model"' 'model_provider = "codex"' '' '[model_providers.codex]' 'name = "codex"' 'base_url = "https://chatgpt.com/backend-api/models"' >"$t/sandbox/.codex/config.toml"
 hostile_codex_home
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
@@ -1309,6 +1312,11 @@ zai_case() {
         t14-claude-zai-v1)
             mkdir -p "$t/sandbox/.claude"
             printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic"}}' >"$t/sandbox/.claude/settings.json"
+            ;;
+        t18-codex-zai-v1)
+            mkdir -p "$t/sandbox/.codex"
+            printf '%s\n' 'model = "glm-5.3"' 'model_provider = "zai"' '' '[model_providers.zai]' 'name = "Z.AI"' 'base_url = "https://api.z.ai/api/v1"' 'env_key = "ZAI_API_KEY"' 'wire_api = "responses"' >"$t/sandbox/.codex/config.toml"
+            chmod 0600 "$t/sandbox/.codex/config.toml"
             ;;
     esac
 }
@@ -2187,6 +2195,7 @@ EOF
 chmod +x "$t/bin/chmod"
 begin j09_a_pinning_abort_restores_the_declared_config_modes step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+[ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
 for declared_mode_file in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
     declared_mode_after=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_mode_file" 2>/dev/null)
     [ "$declared_mode_after" = 600 ] || problems="$problems mode-after-run=[$declared_mode_after](want [600])"
