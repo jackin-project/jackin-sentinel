@@ -441,7 +441,7 @@ EOF
 }
 
 start_interpreter_line() {
-    shebang_line=$(sed -n '1p' "$START_BIN" 2>/dev/null) || return 1
+    shebang_line=$(head -c 256 "$START_BIN" 2>/dev/null | sed -n 1p) || return 1
     case $shebang_line in
         '#!'*) ;;
         *) return 1 ;;
@@ -465,7 +465,7 @@ proc_launcher_identity_record() {
     record_uid_pre=${6-}
     record_comm_pre=${7-}
     [ -n "$record_interpreter" ] || return 1
-    record_resolved=$(readlink -f "$record_interpreter" 2>/dev/null) || return 1
+    record_resolved=$(physical_path "$record_interpreter") || return 1
     record_exe=$(readlink "/proc/$record_pid/exe" 2>/dev/null) || return 1
     case $record_exe in
         /*) ;;
@@ -474,7 +474,8 @@ proc_launcher_identity_record() {
     case $record_exe in
         *' (deleted)') return 1 ;;
     esac
-    [ "$record_exe" = "$record_resolved" ] || return 1
+    record_exe_path=$(physical_path "$record_exe") || return 1
+    [ "$record_exe_path" = "$record_resolved" ] || return 1
     record_uid=$(proc_uid "$record_pid") || record_uid=
     record_comm=$(proc_comm "$record_pid") || record_comm=
     record_before=$(proc_stat "$record_pid") || return 1
@@ -536,7 +537,8 @@ proc_script_identity() {
     script_interp=$(printf '%s\n' "${script_head#\#!}" | awk '{print $1}')
     [ -n "$script_interp" ] || return 1
     script_interp_path=$(physical_path "$script_interp") || return 1
-    [ "$identity_exe" = "$script_interp_path" ] || return 1
+    identity_exe_path=$(physical_path "$identity_exe") || return 1
+    [ "$identity_exe_path" = "$script_interp_path" ] || return 1
     script_interp_arg=$(printf '%s\n' "${script_head#\#!}" | awk '{print $2}')
     if [ -n "$script_interp_arg" ]; then
         proc_argv_matches "$script_pid" 0 "$script_interp" || return 1
@@ -2505,6 +2507,7 @@ step_J08() (
     fi
     env -0 | credential_variables probe >>"$work/variables.tsv"
     launch_files=0
+    launch_inputs=0
     launch_bytes=0
     launch_env_valid=true
     launch_bad=
@@ -2514,13 +2517,14 @@ step_J08() (
             if [ "$file" = "$JACKIN_DIR/env-*" ] && ! grep -Fxq -- 'env-*' "$work/launch.ls"; then
                 continue
             fi
+            if [ "$launch_inputs" -ge "$LAUNCH_ENV_MAX_FILES" ]; then
+                launch_env_valid=false
+                break
+            fi
+            launch_inputs=$((launch_inputs + 1))
             if [ -L "$file" ] || [ ! -f "$file" ]; then
                 launch_bad="$launch_bad ${file##*/}"
                 continue
-            fi
-            if [ "$launch_files" -ge "$LAUNCH_ENV_MAX_FILES" ]; then
-                launch_env_valid=false
-                break
             fi
             remaining_bytes=$((LAUNCH_ENV_TOTAL_MAX_BYTES - launch_bytes))
             if [ "$remaining_bytes" -lt 0 ]; then
