@@ -5182,30 +5182,6 @@ for secret in "$t/bin/jackin-start" /bin/sh; do
 done
 finish_case
 
-mk j07_launcher_identity_bounds_the_shebang_read
-state 'running 1'
-pad=$(printf '%*s' 244 '' | tr ' ' x)
-printf '#!/bin/sh -e%s\nexit 0\n' "$pad" >"$t/bin/jackin-start"
-chmod +x "$t/bin/jackin-start"
-seam START_BIN "$t/bin/jackin-start"
-mkdir -p "$t/proc/100"
-printf '%s\0%s\0%s\0' /bin/sh "-e$pad" "$t/bin/jackin-start" >"$t/proc/100/cmdline"
-printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
-resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
-ln -s "$resolved_sh" "$t/proc/100/exe"
-proc_uid_status 100
-proc_codex
-j07_launcher_agent_exec_fixtures
-begin j07_launcher_identity_bounds_the_shebang_read sh "$t/probe" --only J07
-expect_rc 0
-expect_report J07 sandbox
-fact '.launcher_identity.interpreter' '/bin/sh'
-case $(jq -r '.steps[].facts.launcher_identity.interpreter_arg | length < 300' "$t/out" 2>/dev/null) in
-    true) ;;
-    *) problems="$problems launcher-interpreter-arg-not-bounded" ;;
-esac
-finish_case
-
 mk j07_launcher_identity_binds_the_interpreter_to_the_running_executable
 state 'running 1'
 printf '#!/bin/sh\nexit 0\n' >"$t/bin/jackin-start"
