@@ -668,6 +668,9 @@ agent_tool_evidence() {
         fi
     fi
     tool_workdir=
+    if [ "${prompt_configs_validated-}" = true ] && [ "${prompt_configs_pinned-}" = true ]; then
+        configs_pinned=true
+    fi
     if [ "$launch_kind" != none ]; then
         set --
         while IFS= read -r encoded; do
@@ -677,9 +680,6 @@ agent_tool_evidence() {
         done <<EOF
 $TOOL_ARGV
 EOF
-        if [ "${prompt_configs_validated-}" = true ] && [ "${prompt_configs_pinned-}" = true ]; then
-            configs_pinned=true
-        fi
         if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ]; then
             (
                 ulimit -f 128
