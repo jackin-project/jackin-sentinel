@@ -680,7 +680,7 @@ EOF
         if [ "${prompt_configs_validated-}" = true ] && [ "${prompt_configs_pinned-}" = true ]; then
             configs_pinned=true
         fi
-        if [ "$configs_pinned" = true ]; then
+        if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ]; then
             (
                 ulimit -f 128
                 cd "$PROJECT" || exit 1
@@ -1760,7 +1760,7 @@ EOF
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
     fi
-    if [ "${prompt_configs_validated-}" != true ] || [ "${prompt_configs_pinned-}" != true ]; then
+    if [ "${prompt_configs_validated-}" != true ] || [ "${prompt_configs_pinned-}" != true ] || [ "${declared_effective-}" != "$PROVIDER_URL" ]; then
         config_gate_refused=1
         launch_kind=none
         why="codex exec was not run: the declared configuration was not validated and pinned"
@@ -1769,7 +1769,7 @@ EOF
         launch_kind=none
         why="codex exec was not run: the probe could not build a sanitized environment for the launch"
     fi
-    if [ "$launch_kind" = none ]; then
+    if [ "$launch_kind" = none ] && [ "${prompt_configs_pinned-}" != true ]; then
         rm -rf "$work/agent-home" 2>/dev/null
     fi
     printf '%s' "$why" >"$work/agent_exec.why"
