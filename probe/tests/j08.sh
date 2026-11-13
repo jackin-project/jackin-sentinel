@@ -4939,9 +4939,15 @@ auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TO
 chmod 600 "$t/sandbox/.codex/config.toml"
 (
     swap_ticks=0
-    while [ "$swap_ticks" -lt 400 ]; do
+    pinned_seen=
+    while [ "$swap_ticks" -lt 600 ]; do
         current_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
-        if [ "$current_mode" = 444 ]; then
+        if [ -z "$pinned_seen" ]; then
+            if [ "$current_mode" != 600 ] && [ -n "$current_mode" ]; then
+                pinned_seen=1
+                printf '%s\n' "$current_mode" >"$t/observed.mode"
+            fi
+        elif [ "$current_mode" = 600 ]; then
             rm -f "$t/sandbox/.codex/config.toml"
             printf 'replacement\n' >"$t/sandbox/.codex/config.toml"
             chmod 644 "$t/sandbox/.codex/config.toml"
@@ -4956,6 +4962,15 @@ chmod 600 "$t/sandbox/.codex/config.toml"
 swap_pid=$!
 cat >"$t/bin/codex" <<EOF
 #!/bin/sh
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
 echo ready
 exit 0
 EOF
@@ -4969,6 +4984,12 @@ replaced_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat
 if [ "$replaced_mode" != 644 ]; then
     problems="$problems replacement-mode=$replaced_mode(want 644 untouched)"
 fi
+observed_mode=$(cat "$t/observed.mode" 2>/dev/null)
+if [ "$observed_mode" != 400 ]; then
+    problems="$problems pinned-mode=[$observed_mode](want [400])"
+fi
+expect_rc 0
+expect agent_exec PASS 'completed the declared tool'
 finish_case
 
 fixture_spec=
