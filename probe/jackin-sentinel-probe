@@ -693,7 +693,6 @@ EOF
         fi
         if [ "$configs_pinned" = true ]; then
             declared_configs_stat_unchanged || configs_stat_ok=false
-            unpin_declared_configs
         fi
         events=$(jq -Rs '[split("\n")[] | select(length > 0) | fromjson?]' "$work/tool.out" 2>/dev/null) || events='[]'
         actual_provider=$(printf '%s' "$events" | jq -r '[.. | objects | .provider? // .provider_name? // .model_provider? // empty | select(type == "string" and length > 0)] | .[0] // ""')
