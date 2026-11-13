@@ -1405,7 +1405,6 @@ unpin_declared_configs() {
         declared_mode=$(printf '%s\n' "$PIN_MODES" | sed -n "$((declared_index + 1))p")
         case $declared_mode in
             absent)
-                rm -f "$declared_path" 2>/dev/null
                 ;;
             '' | *[!0-7]*) ;;
             *)
