@@ -893,22 +893,20 @@ sys.stdout.write(str(len(collected)))
 }
 
 root_toml_selection() {
-    jq -Rrs '
-      def vals:
-        split("\n")
-        | map(sub("\r$"; ""))
-        | (to_entries | map(select(.value | test("^[[:space:]]*\\["))) | .[0].key) as $stop
-        | .[0:($stop // length)] as $root
-        | ($root | map(select(contains("\"\"\""))) | length) as $mlines
-        | ($root | map(try capture("^[[:space:]]*(?<k>[A-Za-z0-9_-]+|\"[^\"]*\")[[:space:]]*=[[:space:]]*(?<r>.*)$") catch null)) as $matches
-        | [$matches[] | select(. != null) | {k: (.k | gsub("\""; "")), r: .r}] as $kv
-        | [$kv[] | select(.k == "model" or .k == "model_provider")] as $sel
-        | if $mlines > 0 then empty
-          elif ([$sel[].k] | length) != ([$sel[].k] | unique | length) then empty
-          else [$sel[] | {key: .k, value: (try (.r | capture("^\"(?<s>[^\"]*)\"[[:space:]]*(#.*)?$") | .s) catch null)} | select(.value != null)] | from_entries
-          end;
-      vals
-    ' 2>/dev/null
+    python3 -I -c 'import json, sys, tomllib
+try:
+    doc = tomllib.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(doc, dict):
+    raise SystemExit(1)
+out = {}
+for key in ("model", "model_provider"):
+    value = doc.get(key)
+    if isinstance(value, str):
+        out[key] = value
+sys.stdout.write(json.dumps(out))
+' 2>/dev/null
 }
 
 declared_provider_config() {
