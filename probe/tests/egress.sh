@@ -2752,6 +2752,33 @@ expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
 finish_case
 
+mk t09_an_indented_flow_decoy_is_not_certified
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+exec "$python_bin" -S "\$@"
+EOF
+chmod +x "$t/bin/python3"
+cat >"$t/sandbox/.omp/config.toml" <<'MOCKCONF'
+baseUrl: https://api.z.ai/api/anthropic
+note:
+  nested: [
+    baseUrl: "https://api.z.ai/api/anthropic"
+  ]
+outer:
+  inner: { note: [
+    baseUrl: "https://api.z.ai/api/anthropic"
+  ] })
+credentialEnv: ZAI_API_KEY
+default: zai/glm-5.3
+MOCKCONF
+begin t09_an_indented_flow_decoy_is_not_certified step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+[ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
+finish_case
+
 mk t18_a_dotted_provider_assignment_is_the_endpoint
 host_key=synthetic-T18-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)

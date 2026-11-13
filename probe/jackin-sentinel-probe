@@ -900,6 +900,33 @@ def decode_escapes(text):
     return "".join(out)
 
 
+def flow_collection_line(line):
+    quote_ch = ""
+    esc = False
+    at_sep = False
+    for ch in line:
+        if quote_ch == "'":
+            if ch == "'":
+                quote_ch = ""
+            continue
+        if quote_ch == "\"":
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                quote_ch = ""
+            continue
+        if ch == "#" and at_sep:
+            return False
+        if ch in "'\"":
+            quote_ch = ch
+        elif ch in "{}[]":
+            return True
+        at_sep = ch in " \t"
+    return False
+
+
 def plain_root_scalars(text):
     root = {}
     lines = text.split("\n")
@@ -915,34 +942,12 @@ def plain_root_scalars(text):
                 continue
         elif line.split("#", 1)[0].rstrip() == "...":
             continue
-        if not line.strip() or line[0] in " \t" or line[0] == "#":
+        if not line.strip() or line[0] == "#":
             continue
-        flow = 0
-        quote_ch = ""
-        esc = False
-        at_sep = False
-        for ch in line:
-            if quote_ch == "'":
-                if ch == "'":
-                    quote_ch = ""
-                continue
-            if quote_ch == "\"":
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == "\"":
-                    quote_ch = ""
-                continue
-            if ch == "#" and at_sep:
-                break
-            if ch in "'\"":
-                quote_ch = ch
-            elif ch in "{}[]":
-                flow = 1
-            at_sep = ch in " \t"
-        if flow:
+        if flow_collection_line(line):
             raise ValueError("flow collection")
+        if line[0] in " \t":
+            continue
         match = key_re.match(line)
         if match is None:
             raise ValueError("unsupported line")
@@ -1061,6 +1066,8 @@ def plain_root_scalars(text):
         else:
             value = rest
             while i < len(lines) and lines[i] and lines[i][0] in " \t" and not lines[i].lstrip().startswith("#"):
+                if flow_collection_line(lines[i]):
+                    raise ValueError("flow collection")
                 value += " " + lines[i].strip()
                 i += 1
         root[key] = value
