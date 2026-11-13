@@ -806,6 +806,25 @@ copy_bounded() {
     read_bounded "$1" "$2" "$AGENT_HOME_MAX_BYTES"
 }
 
+root_toml_selection() {
+    jq -Rrs '
+      def vals:
+        split("\n")
+        | map(sub("\r$"; ""))
+        | (to_entries | map(select(.value | test("^[[:space:]]*\\["))) | .[0].key) as $stop
+        | .[0:($stop // length)] as $root
+        | ($root | map(select(contains("\"\"\""))) | length) as $mlines
+        | ($root | map(try capture("^[[:space:]]*(?<k>[A-Za-z0-9_-]+|\"[^\"]*\")[[:space:]]*=[[:space:]]*(?<r>.*)$") catch null)) as $matches
+        | [$matches[] | select(. != null) | {k: (.k | gsub("\""; "")), r: .r}] as $kv
+        | [$kv[] | select(.k == "model" or .k == "model_provider")] as $sel
+        | if $mlines > 0 then empty
+          elif ([$sel[].k] | length) != ([$sel[].k] | unique | length) then empty
+          else [$sel[] | {key: .k, value: (try (.r | capture("^\"(?<s>[^\"]*)\"[[:space:]]*(#.*)?$") | .s) catch null)} | select(.value != null)] | from_entries
+          end;
+      vals
+    ' 2>/dev/null
+}
+
 declared_provider_config() {
     declared_effective=
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
@@ -1114,6 +1133,12 @@ PY_JKS_YAML_CODE
             t01-codex-v1 | t18-codex-zai-v1)
                 declared_parsed=$(printf '%s' "$_jks_norm" | provider_endpoint - "$EXPECTED_PROVIDER" 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
+                declared_root=$(printf '%s' "$_jks_norm" | root_toml_selection 2>/dev/null) || return 1
+                [ -n "$declared_root" ] || return 1
+                declared_root_provider=$(printf '%s' "$declared_root" | jq -r '.model_provider // ""' 2>/dev/null) || return 1
+                [ "$declared_root_provider" = "$EXPECTED_PROVIDER" ] || return 1
+                declared_root_model=$(printf '%s' "$declared_root" | jq -r '.model // ""' 2>/dev/null) || return 1
+                [ "$declared_root_model" = "$EXPECTED_MODEL" ] || return 1
                 ;;
             *) return 1 ;;
         esac

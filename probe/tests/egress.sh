@@ -1100,7 +1100,7 @@ mk j09_environment_only_credentials_launch_with_the_contract_provider_config
 with_curl
 codex_says 'ready' 0
 mkdir -p "$t/sandbox/.codex"
-printf '%s\n' 'model = "synthetic-config-model"' 'model_provider = "codex"' '' '[model_providers.codex]' 'name = "codex"' 'base_url = "https://chatgpt.com/backend-api/models"' >"$t/sandbox/.codex/config.toml"
+printf '%s\n' 'model = "gpt-6.1-sol"' 'model_provider = "codex"' '' '[model_providers.codex]' 'name = "codex"' 'base_url = "https://chatgpt.com/backend-api/models"' >"$t/sandbox/.codex/config.toml"
 hostile_codex_home
 answer "$OUTSIDE" 7 000
 answer "$METADATA" 7 000
@@ -1598,6 +1598,71 @@ MOCKCONF
 begin t18_a_provider_header_inside_a_multiline_string_is_not_a_table step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+mk t18_a_root_provider_other_is_not_the_contract_provider
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "other"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+
+[model_providers.other]
+name = "Other"
+base_url = "http://127.0.0.1:9/v1"
+MOCKCONF
+chmod 0600 "$t/sandbox/.codex/config.toml"
+begin t18_a_root_provider_other_is_not_the_contract_provider step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
+finish_case
+
+mk t18_a_root_model_other_is_not_the_contract_model
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "other-model"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+chmod 0600 "$t/sandbox/.codex/config.toml"
+begin t18_a_root_model_other_is_not_the_contract_model step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
+finish_case
+
+mk t18_a_commented_model_is_not_the_root_model
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+# model = "glm-5.3"
+model = "other-model"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+chmod 0600 "$t/sandbox/.codex/config.toml"
+begin t18_a_commented_model_is_not_the_root_model step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
 finish_case
 
 mk t09_an_indented_nested_base_url_is_not_the_root_key
