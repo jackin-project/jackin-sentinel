@@ -4923,6 +4923,104 @@ if [ "$restored_mode" != 600 ]; then
 fi
 finish_case
 
+mk pin_rollback_leaves_a_recreated_absent_path_untouched
+real_python3_absent=$(command -v python3) || exit 70
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's/handle = os\.open(name, os\.O_RDONLY | os\.O_NOFOLLOW, dir_fd=dirfd)/raise FileNotFoundError/')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_absent" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_rollback_leaves_a_recreated_absent_path_untouched sh "$t/probe" --only J07
+expect_rc 0
+if [ ! -e "$t/sandbox/.codex/config.toml" ]; then
+    problems="$problems rollback-deleted-the-recreated-path"
+fi
+absent_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$absent_mode" != 600 ]; then
+    problems="$problems recreated-mode=$absent_mode(want 600 untouched)"
+fi
+finish_case
+
+mk pin_failed_write_restorer_skips_a_replaced_identity
+real_python3_replace=$(command -v python3) || exit 70
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's@os\.ftruncate(writer, 0)@os.rename(name, name + ".moved") or os.close(os.open(name, os.O_CREAT | os.O_WRONLY, 0o644)) or os.chmod(name, 0o644) or (_ for _ in ()).throw(SystemExit(1))@')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_replace" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_failed_write_restorer_skips_a_replaced_identity sh "$t/probe" --only J07
+expect_rc 0
+if [ ! -e "$t/sandbox/.codex/config.toml.moved" ]; then
+    problems="$problems original-identity-not-preserved"
+fi
+replaced_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$replaced_mode" != 644 ]; then
+    problems="$problems replacement-mode=$replaced_mode(want 644 untouched)"
+fi
+finish_case
+
 mk cleanup_restores_only_the_pinned_identity
 state 'running 1'
 proc_main
