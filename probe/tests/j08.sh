@@ -4870,6 +4870,15 @@ esac
 exec "$real_head" "\$@"
 EOF
 chmod +x "$t/bin/head"
+real_python3_entropy=$(command -v python3) || exit 70
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*) exit 1 ;;
+esac
+exec "$real_python3_entropy" "\$@"
+EOF
+chmod +x "$t/bin/python3"
 state 'exited 1 0'
 record "$R_OK1"
 begin known_no_head_run_key_is_refused sh "$t/probe" --only J08
