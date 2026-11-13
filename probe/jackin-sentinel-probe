@@ -1328,7 +1328,9 @@ except SystemExit as ex:
         try:
             restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
             try:
-                os.fchmod(restorer, mode)
+                restored = os.fstat(restorer)
+                if (restored.st_dev, restored.st_ino) == (named.st_dev, named.st_ino):
+                    os.fchmod(restorer, mode)
             finally:
                 os.close(restorer)
         except OSError:
@@ -1339,7 +1341,9 @@ except BaseException:
         try:
             restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
             try:
-                os.fchmod(restorer, mode)
+                restored = os.fstat(restorer)
+                if (restored.st_dev, restored.st_ino) == (named.st_dev, named.st_ino):
+                    os.fchmod(restorer, mode)
             finally:
                 os.close(restorer)
         except OSError:
