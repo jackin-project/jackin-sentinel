@@ -1809,6 +1809,46 @@ fi
 expect agent_reaches_api PASS 'completed the declared tool'
 finish_case
 
+mk t18_a_pinned_private_config_is_not_world_readable
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+
+[model_providers.zai]
+name = "Z.AI"
+base_url = "https://api.z.ai/api/v1"
+env_key = "ZAI_API_KEY"
+wire_api = "responses"
+MOCKCONF
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+python3 -c 'import os, sys; sys.stdout.write("%o\\n" % (os.stat(sys.argv[1]).st_mode & 0o7777))' "$t/sandbox/.codex/config.toml" >"$t/observed.mode" 2>/dev/null || true
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin t18_a_pinned_private_config_is_not_world_readable step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+observed_mode=$(cat "$t/observed.mode" 2>/dev/null)
+if [ "$observed_mode" != 400 ]; then
+    problems="$problems pinned-mode=[$observed_mode](want [400])"
+fi
+finish_case
+
 mk t09_an_indented_nested_base_url_is_not_the_root_key
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)

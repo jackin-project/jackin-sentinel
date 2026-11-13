@@ -1302,7 +1302,7 @@ try:
             raise SystemExit(1)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise SystemExit(1)
-        os.fchmod(handle, 0o644)
+        os.fchmod(handle, mode | 0o200)
     finally:
         os.close(handle)
     writer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
@@ -1314,7 +1314,7 @@ try:
         view = memoryview(data)
         while view:
             view = view[os.write(writer, view):]
-        os.fchmod(writer, 0o444)
+        os.fchmod(writer, mode & ~0o222)
         final = os.fstat(writer)
     finally:
         os.close(writer)
