@@ -764,39 +764,42 @@ read_bounded() {
     read_src=$1
     read_dst=$2
     read_cap=$3
-    [ -f "$read_src" ] || return 1
-    if [ -L "$read_src" ]; then
-        return 1
-    fi
-    read_bytes=
-    if command -v head >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 10 head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" 2>/dev/null || return 1
+    (
+        exec 9<"$read_src" 2>/dev/null || exit 1
+        RB_FD=9 RB_SRC=$read_src python3 -I -c 'import os, stat, sys
+handle = os.fstat(int(os.environ["RB_FD"]))
+if not stat.S_ISREG(handle.st_mode):
+    raise SystemExit(1)
+named = os.lstat(os.environ["RB_SRC"])
+if (handle.st_dev, handle.st_ino) != (named.st_dev, named.st_ino):
+    raise SystemExit(1)
+' 2>/dev/null || exit 1
+        read_bytes=
+        if command -v head >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1; then
+                timeout 10 head -c $((read_cap + 1)) -- /dev/fd/9 >"$read_dst" 2>/dev/null || exit 1
+            else
+                head -c $((read_cap + 1)) -- /dev/fd/9 >"$read_dst" 2>/dev/null || exit 1
+            fi
         else
-            head -c $((read_cap + 1)) -- "$read_src" >"$read_dst" 2>/dev/null || return 1
+            if command -v dd >/dev/null 2>&1; then
+                dd if=/dev/fd/9 of="$read_dst" bs="$((read_cap + 1))" count=1 2>/dev/null || exit 1
+            else
+                exit 1
+            fi
         fi
-    else
-        if command -v dd >/dev/null 2>&1; then
-            dd if="$read_src" of="$read_dst" bs="$((read_cap + 1))" count=1 2>/dev/null || return 1
+        [ -f "$read_dst" ] || exit 1
+        if command -v wc >/dev/null 2>&1; then
+            read_bytes=$(wc -c <"$read_dst" 2>/dev/null | tr -d '[:space:]') || exit 1
         else
-            return 1
+            read_bytes=$(jq -Rrn --rawfile d "$read_dst" '$d | utf8bytelength' 2>/dev/null) || exit 1
         fi
-    fi
-    [ -f "$read_dst" ] || return 1
-    if command -v wc >/dev/null 2>&1; then
-        read_bytes=$(wc -c <"$read_dst" 2>/dev/null | tr -d '[:space:]') || return 1
-    else
-        read_bytes=$(jq -Rrn --rawfile d "$read_dst" '$d | utf8bytelength' 2>/dev/null) || return 1
-    fi
-    case $read_bytes in
-        '' | *[!0-9]*) return 1 ;;
-    esac
-    [ "$read_bytes" -le "$read_cap" ] || return 1
-    [ -f "$read_src" ] || return 1
-    if [ -L "$read_src" ]; then
-        return 1
-    fi
-    return 0
+        case $read_bytes in
+            '' | *[!0-9]*) exit 1 ;;
+        esac
+        [ "$read_bytes" -le "$read_cap" ] || exit 1
+        exit 0
+    )
 }
 
 copy_bounded() {
@@ -1099,7 +1102,7 @@ pin_declared_configs() {
 }
 
 pin_declared_configs_run() {
-    command -v chmod >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
@@ -1110,16 +1113,58 @@ pin_declared_configs_run() {
             *) return 1 ;;
         esac
         [ -n "$_jks_vcfg_sel" ] || return 1
-        declared_mode=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_path" 2>/dev/null) || return 1
+        declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+data = sys.stdin.buffer.read()
+try:
+    handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+except FileNotFoundError:
+    sys.stdout.write("absent\nabsent\n")
+    raise SystemExit(0)
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(handle)
+    if not stat.S_ISREG(opened.st_mode):
+        raise SystemExit(1)
+    named = os.lstat(path)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    mode = stat.S_IMODE(opened.st_mode)
+    os.fchmod(handle, 0o644)
+finally:
+    os.close(handle)
+writer = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+try:
+    opened = os.fstat(writer)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    os.ftruncate(writer, 0)
+    view = memoryview(data)
+    while view:
+        view = view[os.write(writer, view):]
+    os.fchmod(writer, 0o444)
+    final = os.fstat(writer)
+finally:
+    os.close(writer)
+sys.stdout.write("%o\n" % mode)
+sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
+' "$declared_path" 2>/dev/null) || return 1
+        declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
+        declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 2p)
+        if [ "$declared_mode" = absent ]; then
+            PIN_MODES="${PIN_MODES}absent
+"
+            PIN_STATS="${PIN_STATS}absent
+"
+            return 1
+        fi
         case $declared_mode in
             '' | *[!0-7]*) return 1 ;;
         esac
+        [ -n "$declared_stat" ] || return 1
         PIN_MODES="${PIN_MODES}${declared_mode}
 "
-        chmod 0644 "$declared_path" 2>/dev/null || true
-        printf '%s' "$_jks_vcfg_sel" >"$declared_path" || return 1
-        chmod 0444 "$declared_path" || return 1
-        declared_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$declared_path" 2>/dev/null) || return 1
         PIN_STATS="${PIN_STATS}${declared_stat}
 "
         declared_index=$((declared_index + 1))
@@ -1135,15 +1180,38 @@ unpin_declared_configs() {
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 0
         declared_mode=$(printf '%s\n' "$PIN_MODES" | sed -n "$((declared_index + 1))p")
         case $declared_mode in
-            '' | *[!0-7]*)
-                declared_index=$((declared_index + 1))
-                continue
+            absent)
+                rm -f "$declared_path" 2>/dev/null
+                ;;
+            '' | *[!0-7]*) ;;
+            *)
+                python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+mode = int(sys.argv[2], 8)
+try:
+    named = os.lstat(path)
+except OSError:
+    raise SystemExit(0)
+if not stat.S_ISREG(named.st_mode):
+    raise SystemExit(0)
+try:
+    handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+except OSError:
+    raise SystemExit(0)
+try:
+    opened = os.fstat(handle)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(0)
+    os.fchmod(handle, mode)
+finally:
+    os.close(handle)
+' "$declared_path" "$declared_mode" 2>/dev/null || true
                 ;;
         esac
-        chmod "$declared_mode" "$declared_path" 2>/dev/null || true
         declared_index=$((declared_index + 1))
     done
     PIN_MODES=
+    PIN_STATS=
     return 0
 }
 
@@ -1176,9 +1244,21 @@ declared_configs_stat_unchanged() {
     while [ "$stat_index" -lt "$stat_count" ]; do
         stat_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$stat_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$stat_path" ] || return 1
-        stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stat_path" 2>/dev/null) || return 1
         stat_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((stat_index + 1))p")
         [ -n "$stat_pinned" ] || return 1
+        if [ "$stat_pinned" = absent ]; then
+            if [ -e "$stat_path" ] || [ -L "$stat_path" ]; then
+                return 1
+            fi
+            stat_index=$((stat_index + 1))
+            continue
+        fi
+        stat_now=$(python3 -I -c 'import os, stat, sys
+handle = os.lstat(sys.argv[1])
+if not stat.S_ISREG(handle.st_mode):
+    raise SystemExit(1)
+sys.stdout.write("%d %d %d %d %d" % (handle.st_dev, handle.st_ino, handle.st_size, handle.st_mtime_ns, handle.st_ctime_ns))
+' "$stat_path" 2>/dev/null) || return 1
         [ "$stat_now" = "$stat_pinned" ] || return 1
         stat_index=$((stat_index + 1))
     done

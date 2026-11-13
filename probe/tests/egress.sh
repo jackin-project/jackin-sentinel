@@ -2185,14 +2185,14 @@ host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 chmod 0600 "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"
-cat >"$t/bin/chmod" <<EOF
+cat >"$t/bin/python3" <<EOF
 #!/bin/sh
-if [ "\$1" = 0444 ] && [ "\$2" = "$t/sandbox/.omp/agent/models.yml" ]; then
-    exit 1
-fi
-exec "$scratch/tools/chmod" "\$@"
+case " \$* " in
+    *agent/models.yml*) exit 1 ;;
+esac
+exec "$python_bin" "\$@"
 EOF
-chmod +x "$t/bin/chmod"
+chmod +x "$t/bin/python3"
 begin j09_a_pinning_abort_restores_the_declared_config_modes step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 [ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
@@ -2539,7 +2539,7 @@ chmod 0600 "$t/sandbox/.omp/config.toml"
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 case " \$* " in
-    *st_mode*) exit 1 ;;
+    *O_WRONLY*) exit 1 ;;
 esac
 exec "$python_bin" "\$@"
 EOF
@@ -2588,6 +2588,48 @@ chmod +x "$t/bin/codex"
 begin t18_the_sandbox_codex_config_is_pinned_like_the_others step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
 [ -s "$t/attack.seen" ] || problems="$problems attack-fixture-never-ran"
+finish_case
+
+mk t18_an_absent_declared_codex_config_is_not_attested
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+rm -f "$t/sandbox/.codex/config.toml"
+begin t18_an_absent_declared_codex_config_is_not_attested step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
+[ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
+[ ! -e "$t/sandbox/.codex/config.toml" ] || problems="$problems the-absent-configuration-was-created"
+finish_case
+
+mk t14_a_the_rollback_does_not_chmod_a_replacement_of_the_configuration
+host_key=synthetic-T14-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t14-claude-zai-v1 claude claude '2.1.311 (Claude Code)' Bash ANTHROPIC_AUTH_TOKEN https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0600 "$t/sandbox/.claude/settings.json"
+printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"https://api.z.ai/api/anthropic"}}' >"$t/decoy.json"
+chmod 0644 "$t/decoy.json"
+cat >"$t/bin/claude" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+rm -f "$t/sandbox/.claude/settings.json"
+python3 -c 'import os, sys; os.symlink(sys.argv[1], sys.argv[2])' "$t/decoy.json" "$t/sandbox/.claude/settings.json"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_use","name":"Bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","is_error":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/claude"
+begin t14_a_the_rollback_does_not_chmod_a_replacement_of_the_configuration step_J09 '' ANTHROPIC_AUTH_TOKEN=openshell:resolve:env:ANTHROPIC_AUTH_TOKEN
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+decoy_mode=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/decoy.json" 2>/dev/null)
+[ "$decoy_mode" = 644 ] || problems="$problems the-replacement-mode-changed=[$decoy_mode](want [644])"
 finish_case
 
 echo "$total cases, $failures failed"
