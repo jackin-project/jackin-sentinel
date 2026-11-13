@@ -1646,8 +1646,10 @@ agent_exec_seal() {
 agent_exec_verified() {
     [ -f "$work/agent_exec.json" ] && [ -f "$work/agent_exec.seal" ] || return 1
     [ -n "$RUN_KEY" ] || return 1
-    _jks_agent_exec_doc=$(cat "$work/agent_exec.json" 2>/dev/null) || return 1
-    _jks_agent_exec_want=$(cat "$work/agent_exec.seal" 2>/dev/null) || return 1
+    capture_bounded "$work/agent_exec.json" "$CONFIG_BYTE_CAP" "$((CONFIG_BYTE_CAP + 1))" || return 1
+    _jks_agent_exec_doc=$(printf '%s' "$_jks_capture")
+    capture_bounded "$work/agent_exec.seal" 256 257 || return 1
+    _jks_agent_exec_want=$(printf '%s' "$_jks_capture")
     _jks_agent_exec_got=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
     _jks_agent_exec_got=${_jks_agent_exec_got%% *}
     [ "$_jks_agent_exec_got" = "$_jks_agent_exec_want" ]
