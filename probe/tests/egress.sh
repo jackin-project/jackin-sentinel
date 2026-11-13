@@ -2700,5 +2700,20 @@ expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoin
 [ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
 finish_case
 
+mk t09_a_commented_flow_marker_is_not_a_flow_collection
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+exec "$python_bin" -S "\$@"
+EOF
+chmod +x "$t/bin/python3"
+printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic # {primary}' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+begin t09_a_commented_flow_marker_is_not_a_flow_collection step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

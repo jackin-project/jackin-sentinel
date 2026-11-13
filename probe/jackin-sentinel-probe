@@ -920,6 +920,7 @@ def plain_root_scalars(text):
         flow = 0
         quote_ch = ""
         esc = False
+        at_sep = False
         for ch in line:
             if quote_ch == "'":
                 if ch == "'":
@@ -933,10 +934,13 @@ def plain_root_scalars(text):
                 elif ch == "\"":
                     quote_ch = ""
                 continue
+            if ch == "#" and at_sep:
+                break
             if ch in "'\"":
                 quote_ch = ch
             elif ch in "{}[]":
                 flow = 1
+            at_sep = ch in " \t"
         if flow:
             raise ValueError("flow collection")
         match = key_re.match(line)
