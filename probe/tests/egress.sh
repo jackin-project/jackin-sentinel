@@ -1733,6 +1733,36 @@ begin t18_a_multiline_literal_cannot_forge_the_root_selection step_J09 '' ZAI_AP
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1; the launches were refused because the declared configuration was not validated and pinned'
 finish_case
 
+mk t18_an_inline_provider_table_is_the_provider_table
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+model_providers = { zai = { name = "Z.AI", base_url = "https://api.z.ai/api/v1", env_key = "ZAI_API_KEY", wire_api = "responses" } }
+MOCKCONF
+begin t18_an_inline_provider_table_is_the_provider_table step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
+mk t18_an_inline_provider_table_redirect_is_not_the_contract_endpoint
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+mkdir -p "$t/sandbox/.codex"
+cat >"$t/sandbox/.codex/config.toml" <<'MOCKCONF'
+model = "glm-5.3"
+model_provider = "zai"
+model_providers.zai = { name = "Z.AI", base_url = "http://127.0.0.1:9/v1", env_key = "ZAI_API_KEY", wire_api = "responses" }
+MOCKCONF
+begin t18_an_inline_provider_table_redirect_is_not_the_contract_endpoint step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/v1'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 http://127.0.0.1:9/v1'
+finish_case
+
 mk t09_an_indented_nested_base_url_is_not_the_root_key
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)

@@ -1470,128 +1470,36 @@ provider_endpoint() {
     case $endpoint_provider in
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
-    endpoint_value=$(jq -Rrs --arg want "$endpoint_provider" \
-        'def toml_unesc:
-  explode
-  | reduce .[] as $c ({o: "", s: 0, h: "", n: 0, f: 0};
-      if .s == 0 then
-        (if .f == 1 then (if ([9, 10, 13, 32] | index($c)) == null then .f = 0 | .o += ([$c] | implode) else . end)
-         elif $c == 92 then .s = 1 else .o += ([$c] | implode) end)
-      elif .s == 3 then
-        (if $c == 10 then .s = 0 | .f = 1
-         elif $c == 9 or $c == 32 then .
-         else .s = -1 end)
-      elif .s == 1 then
-        (if $c == 117 then .s = 2 | .h = "" | .n = 4
-         elif $c == 85 then .s = 2 | .h = "" | .n = 8
-         elif $c == 10 then .s = 0 | .f = 1
-         elif $c == 9 or $c == 32 then .s = 3
-         elif ([98, 116, 110, 102, 114, 34, 92] | index($c)) == null then .s = -1
-         else .o += (if $c == 98 then "\b" elif $c == 116 then "\t" elif $c == 110 then "\n" elif $c == 102 then "\f" elif $c == 114 then "\r" elif $c == 34 then "\"" else "\\" end) | .s = 0 end)
-      elif .s == 2 then
-        ("0123456789abcdef" | index(([$c] | implode | ascii_downcase))) as $v
-        | if $v == null then .s = -1
-          else .h += ([$c] | implode) | .n -= 1
-            | if .n == 0 then
-                .s = 0
-                | .o += ([.h | explode | reduce .[] as $d (0; . * 16 + ("0123456789abcdef" | index(([$d] | implode | ascii_downcase))))] | implode)
-              else . end
-          end
-      else . end)
-  | if .s == 0 then .o else null end;
-def outline:
-    split("\n") | map(sub("\r$"; "")) as $lines
-    | reduce range(0; $lines | length) as $i ({state: "out", skip: 0, drop: 0, out: [], code: "", lits: [], lit: null, fresh: false};
-        ($lines[$i] | explode) as $cs
-        | reduce range(0; $cs | length) as $j (.;
-            if .skip > 0 then
-                .skip -= 1
-                | (if .drop > 0 then .drop -= 1
-                    elif .lit != null then .lit += ([$cs[$j]] | implode)
-                    else .code += " " end)
-            else
-                (([$cs[$j], ($cs[$j + 1] // -1), ($cs[$j + 2] // -1)] | map(if . == -1 then "" else ([.] | implode) end) | join("")) as $t3
-                 | ([$cs[$j]] | implode) as $c
-                 | if .state == "out" then
-                       (if $t3 == "\"\"\"" then .state = "mlb" | .skip = 2 | .drop = 2 | .code += "   " | .lit = "" | .fresh = true
-                        elif $t3 == "'"'"''"'"''"'"'" then .state = "mll" | .skip = 2 | .drop = 2 | .code += "   " | .lit = "" | .fresh = true
-                        elif $c == "\"" then .state = "bs" | .code += " " | .lit = ""
-                        elif $c == "'"'"'" then .state = "ls" | .code += " " | .lit = ""
-                        elif $c == "#" then .skip = ($cs | length) - $j - 1 | .code += " "
-                        else .code += $c end)
-                   elif .state == "bs" then
-                       (if $c == "\"" then .state = "out" | .code += "\u0001" | .lits += [(.lit | toml_unesc)] | .lit = null
-                        elif $c == "\\" then .skip = 1 | .lit += $c
-                        else .lit += $c end)
-                   elif .state == "ls" then
-                       (if $c == "'"'"'" then .state = "out" | .code += "\u0001" | .lits += [.lit] | .lit = null
-                        else .lit += $c end)
-                   elif .state == "mlb" then
-                       (if $t3 == "\"\"\"" then
-                            ([$cs[$j:][]] | implode | capture("^(?<run>\"*)").run | length) as $run
-                            | .state = "out" | .skip = ($run - 1) | .code += ("\u0001" + (" " * ($run - 1)))
-                            | .lit += ("\"" * ($run - 3)) | .lits += [(.lit | toml_unesc)] | .lit = null | .fresh = false
-                        elif $c == "\\" then .skip = 1 | .lit += $c
-                        else .lit += $c end)
-                   else
-                       (if $t3 == "'"'"''"'"''"'"'" then
-                            ([$cs[$j:][]] | implode | capture("^(?<run>'"'"'*)").run | length) as $run
-                            | .state = "out" | .skip = ($run - 1) | .code += ("\u0001" + (" " * ($run - 1)))
-                            | .lit += ("'"'"'" * ($run - 3)) | .lits += [.lit] | .lit = null | .fresh = false
-                        else .lit += $c end)
-                   end)
-            end)
-        | (if .lit == null then (.out += [{code: .code, lits: .lits}] | .code = "" | .lits = [])
-            elif .fresh and (.lit | length) == 0 then .fresh = false
-            else .lit += "\n" | .fresh = false end)
-        | .skip = 0 | .drop = 0)
-    | .out;
-def dotted($segs_want):
-    .lits as $lits
-    | (.code | split("=")) as $eq
-    | if ($eq | length) != 2 then null
-      elif (($eq[1] | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")) != "\u0001") then null
-      else
-        (($eq[0] | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")) | split(".") | map(sub("^[ \t]+"; "") | sub("[ \t]+$"; ""))) as $segs
-        | if ($segs | length) != ($segs_want | length) then null
-          else
-            (reduce $segs[] as $s ({n: 0, ok: true, keys: []};
-                if ($s | length) == 1 and ($s | contains("\u0001")) then
-                    (if .n < ($lits | length) then .keys += [$lits[.n]] | .n += 1 else .ok = false end)
-                elif ($s | contains("\u0001")) then .ok = false
-                else .keys += [$s] end)) as $p
-            | if ($p.ok | not) or ($p.keys != $segs_want) then null
-              elif $p.n < ($lits | length) then {value: $lits[$p.n]}
-              else null end
-          end
-      end;
-. as $raw
-| outline as $o
-| [$o | to_entries[] | {i: .key, code: (.value.code | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")), lits: .value.lits}] as $L
-| [$L[] | select((.code | startswith("[") and endswith("]")))] as $headers
-| [$headers[] | .lits as $hl | .i as $hi
-    | (.code | sub("^\\["; "") | sub("\\]$"; "") | split(".")) as $segs
-    | (reduce range(0; $segs | length) as $si ({n: 0, keys: [], bad: false};
-        ($segs[$si] | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")) as $k
-        | if $k == "\u0001" then
-            (if .n < ($hl | length) then .keys += [$hl[.n]] | .n += 1 else .bad = true end)
-          elif (($k | length) == 0 or ($k | contains("\u0001"))) then .bad = true
-          else .keys += [$k] end))
-    | select((.bad | not))
-    | {i: $hi, keys: .keys}] as $pheaders
-| [$pheaders[] | select(.keys == ["model_providers", $want])] as $tables
-| (if ($tables | length) == 1 then ([$headers[] | select(.i > $tables[0].i) | .i] | .[0] // ([$L[] | .i] | length)) else 0 end) as $stop
-| [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^(base_url|\u0001)[ \t]*=")) and (if (.code | startswith("\u0001")) then ((.lits | length) >= 1 and .lits[0] == "base_url") else true end))] as $setters
-| [$setters[] | select((.code | sub("^(base_url|\u0001)[ \t]*=[ \t]*"; "")) == "\u0001") | select((if (.code | startswith("\u0001")) then (.lits | length) == 2 else (.lits | length) == 1 end))] as $urls
-| (([$pheaders[].i] | min) // ($L | length)) as $root_end
-| [$L[] | select(.i < $root_end) | dotted(["model_providers", $want, "base_url"]) | select(. != null)] as $root_dots
-| [$pheaders[] | select(.keys == ["model_providers"]) | .i as $hi | ([$pheaders[] | select(.i > $hi) | .i] | .[0] // ($L | length)) as $rstop | [$L[] | select(.i > $hi and .i < $rstop) | dotted([$want, "base_url"]) | select(. != null)][]] as $rel_dots
-| ($root_dots + $rel_dots) as $dots
-| if ($tables | length) > 1 then "conflict"
-  elif (($setters | length) + ($dots | length)) > 1 then "conflict"
-  elif ($setters | length) == 1 then (if ($urls | length) == 1 then $setters[0].lits[-1] else "conflict" end)
-  elif ($dots | length) == 1 then $dots[0].value
-  else "" end' "$endpoint_file" 2>/dev/null) || return 1
+    endpoint_value=$(python3 -I -c 'import sys, tomllib
+want = sys.argv[2]
+try:
+    if sys.argv[1] == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        with open(sys.argv[1], "rb") as handle:
+            data = handle.read()
+    doc = tomllib.loads(data.decode("utf-8-sig"))
+except Exception:
+    raise SystemExit(1)
+providers = doc.get("model_providers")
+if providers is None:
+    entry = None
+elif not isinstance(providers, dict):
+    sys.stdout.write("conflict")
+    raise SystemExit(0)
+else:
+    entry = providers.get(want)
+if entry is None:
+    sys.stdout.write("")
+elif not isinstance(entry, dict):
+    sys.stdout.write("conflict")
+elif "base_url" not in entry:
+    sys.stdout.write("")
+elif not isinstance(entry["base_url"], str):
+    sys.stdout.write("conflict")
+else:
+    sys.stdout.write(entry["base_url"])
+' "$endpoint_file" "$endpoint_provider" 2>/dev/null) || return 1
     [ "$endpoint_value" = conflict ] && return 1
     printf '%s' "$endpoint_value"
 }
