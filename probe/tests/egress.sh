@@ -2671,5 +2671,19 @@ grep -q 'malformed or unsupported' "$t/err" 2>/dev/null || problems="$problems t
 [ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
 finish_case
 
+mk t18_a_continuation_with_whitespace_before_the_newline_folds
+host_key=synthetic-T18-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
+{
+    printf '%s\n' 'model = "glm-5.3"' 'model_provider = "zai"' '' '[model_providers.zai]' 'name = "Z.AI"'
+    printf 'base_url = \"\"\"https://api.z.ai/api/\\ \n    v1\"\"\"\n'
+    printf '%s\n' 'env_key = "ZAI_API_KEY"' 'wire_api = "responses"'
+} >"$t/sandbox/.codex/config.toml"
+begin t18_a_continuation_with_whitespace_before_the_newline_folds step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

@@ -1301,10 +1301,15 @@ provider_endpoint() {
       if .s == 0 then
         (if .f == 1 then (if ([9, 10, 13, 32] | index($c)) == null then .f = 0 | .o += ([$c] | implode) else . end)
          elif $c == 92 then .s = 1 else .o += ([$c] | implode) end)
+      elif .s == 3 then
+        (if $c == 10 then .s = 0 | .f = 1
+         elif $c == 9 or $c == 32 then .
+         else .s = -1 end)
       elif .s == 1 then
         (if $c == 117 then .s = 2 | .h = "" | .n = 4
          elif $c == 85 then .s = 2 | .h = "" | .n = 8
          elif $c == 10 then .s = 0 | .f = 1
+         elif $c == 9 or $c == 32 then .s = 3
          elif ([98, 116, 110, 102, 114, 34, 92] | index($c)) == null then .s = -1
          else .o += (if $c == 98 then "\b" elif $c == 116 then "\t" elif $c == 110 then "\n" elif $c == 102 then "\f" elif $c == 114 then "\r" elif $c == 34 then "\"" else "\\" end) | .s = 0 end)
       elif .s == 2 then
