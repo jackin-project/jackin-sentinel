@@ -1901,8 +1901,9 @@ EOF
     evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","actual_endpoint":"","sandbox_endpoint":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
     _jks_agent_exec_doc=$(jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" --argjson evidence "$evidence" \
+        --argjson config_refused "$((${config_gate_refused:-0} + 0))" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
-          answered: $answered, output_bytes: $bytes,
+          answered: $answered, output_bytes: $bytes, config_refused: $config_refused,
           actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model,
           actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}') || exit 70
     printf '%s\n' "$_jks_agent_exec_doc" >"$work/agent_exec.json" || exit 70
@@ -3316,6 +3317,11 @@ EOF_JKS_AGENT_EXEC
 $_jks_agent_exec_doc
 EOF_JKS_AGENT_EXEC
         )
+        ae_refused=$(
+            jq -r '.config_refused // 0' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
         if [ "$attempted" = true ]; then
             if [ "$complete" = true ]; then
                 pass agent_reaches_api "codex exec answered and completed the declared tool"
@@ -3326,7 +3332,7 @@ EOF_JKS_AGENT_EXEC
             else
                 fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $ae_exit)"
             fi
-        elif [ "${config_gate_refused-}" = 1 ]; then
+        elif [ "${config_gate_refused-}" = 1 ] || [ "$ae_refused" = 1 ]; then
             fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL; the launches were refused because the declared configuration was not validated and pinned"
         else
             skip agent_reaches_api "$(cat "$work/agent_exec.why")"

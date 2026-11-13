@@ -2735,5 +2735,21 @@ expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec | "\(.actual_endpoint) \(.sandbox_endpoint)"' 'https://api.z.ai/api/v1 https://api.z.ai/api/v1'
 finish_case
 
+mk t09_a_config_gate_refusal_is_reported_by_both_steps
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+rm -f "$t/sandbox/.omp/config.toml"
+total=$((total + 1))
+problems=
+name=t09_a_config_gate_refusal_is_reported_by_both_steps
+execute J07,J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+execute_rc=$?
+if [ "$execute_rc" -eq 0 ]; then :; else problems="$problems exit=[$execute_rc](want [0])"; fi
+jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J07","J09"]' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape"
+expect agent_exec FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
