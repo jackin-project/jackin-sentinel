@@ -849,6 +849,49 @@ if handle.st_size > int(os.environ["RB_CAP"]):
     return 0
 }
 
+read_entropy() {
+    entropy_target=$1
+    entropy_bytes=
+    rm -f "$entropy_target"
+    if command -v head >/dev/null 2>&1; then
+        head -c 32 /dev/urandom >"$entropy_target" 2>/dev/null || return 1
+    elif command -v python3 >/dev/null 2>&1; then
+        entropy_bytes=$(python3 -I -c 'import os, sys
+handle = os.open("/dev/urandom", os.O_RDONLY)
+collected = b""
+try:
+    while len(collected) < 32:
+        chunk = os.read(handle, 32 - len(collected))
+        if not chunk:
+            break
+        collected += chunk
+finally:
+    os.close(handle)
+with open(sys.argv[1], "wb") as target:
+    target.write(collected)
+sys.stdout.write(str(len(collected)))
+' "$entropy_target" 2>/dev/null) || return 1
+    elif command -v dd >/dev/null 2>&1; then
+        dd if=/dev/urandom of="$entropy_target" bs=32 count=1 2>/dev/null || return 1
+    else
+        return 1
+    fi
+    [ -f "$entropy_target" ] || return 1
+    if [ -z "$entropy_bytes" ] && command -v wc >/dev/null 2>&1; then
+        entropy_bytes=$(wc -c <"$entropy_target" 2>/dev/null | tr -d '[:space:]') || entropy_bytes=
+    fi
+    if [ -z "$entropy_bytes" ] && command -v python3 >/dev/null 2>&1; then
+        entropy_bytes=$(python3 -I -c 'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))' <"$entropy_target" 2>/dev/null) || entropy_bytes=
+    fi
+    case $entropy_bytes in
+        '' | *[!0-9]*) entropy_bytes= ;;
+    esac
+    if [ -n "$entropy_bytes" ] && [ "$entropy_bytes" -ne 32 ]; then
+        return 1
+    fi
+    return 0
+}
+
 root_toml_selection() {
     jq -Rrs '
       def vals:
@@ -4242,7 +4285,7 @@ main() {
     trap 'unpin_declared_configs; rm -rf "$work" "$spec_dir"' EXIT
     trap 'exit 70' INT TERM HUP
     RUN_KEY=
-    if head -c 32 /dev/urandom >"$work/run.entropy" 2>/dev/null; then
+    if read_entropy "$work/run.entropy"; then
         RUN_KEY=$(sha256sum <"$work/run.entropy" 2>/dev/null)
         RUN_KEY=${RUN_KEY%% *}
     fi
