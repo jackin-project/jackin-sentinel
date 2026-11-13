@@ -483,15 +483,17 @@ proc_launcher_identity_record() {
     read -r _ _ record_before_ticks _ <<EOF
 $record_before
 EOF
-    if [ -n "$record_stat_pre" ]; then
-        read -r _ _ record_pre_ticks _ <<EOF
+    [ -n "$record_stat_pre" ] || return 1
+    read -r _ _ record_pre_ticks _ <<EOF
 $record_stat_pre
 EOF
-        [ "$record_pre_ticks" = "$record_before_ticks" ] || return 1
-    fi
-    [ -z "$record_exe_pre" ] || [ "$record_exe_pre" = "$record_exe" ] || return 1
-    [ -z "$record_uid_pre" ] || [ "$record_uid_pre" = "$record_uid" ] || return 1
-    [ -z "$record_comm_pre" ] || [ "$record_comm_pre" = "$record_comm" ] || return 1
+    [ "$record_pre_ticks" = "$record_before_ticks" ] || return 1
+    [ -n "$record_exe_pre" ] || return 1
+    [ "$record_exe_pre" = "$record_exe" ] || return 1
+    [ -n "$record_uid_pre" ] || return 1
+    [ "$record_uid_pre" = "$record_uid" ] || return 1
+    [ -n "$record_comm_pre" ] || return 1
+    [ "$record_comm_pre" = "$record_comm" ] || return 1
     record_argv0=false
     record_argv1=false
     record_argv2=null
