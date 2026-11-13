@@ -2907,7 +2907,7 @@ chmod +x "$t/bin/omp"
 begin t09_a_pin_records_the_real_mode_and_restores_exactly_that step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 mode_during=$(cat "$t/mode.during" 2>/dev/null)
-[ "$mode_during" = 444 ] || problems="$problems pinned-mode=[$mode_during](want [444])"
+[ "$mode_during" = 400 ] || problems="$problems pinned-mode=[$mode_during](want [400])"
 mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
 [ "$mode_after" = 600 ] || problems="$problems config-mode-after=[$mode_after](want [600])"
 finish_case
