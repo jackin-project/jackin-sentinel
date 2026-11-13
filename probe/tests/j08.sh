@@ -4584,7 +4584,7 @@ finish_case
 mk host_tools_outside_sandbox_path
 name=host_tools_outside_sandbox_path
 mkdir -p "$t/host-tools"
-for tool in jq sh tr mktemp rm cat head; do
+for tool in jq sh tr mktemp rm cat head python3; do
     ln -s "$scratch/tools/$tool" "$t/host-tools/$tool"
 done
 total=$((total + 1))
