@@ -1396,6 +1396,25 @@ def outline:
             else .lit += "\n" | .fresh = false end)
         | .skip = 0 | .drop = 0)
     | .out;
+def dotted($segs_want):
+    .lits as $lits
+    | (.code | split("=")) as $eq
+    | if ($eq | length) != 2 then null
+      elif (($eq[1] | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")) != "\u0001") then null
+      else
+        (($eq[0] | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")) | split(".") | map(sub("^[ \t]+"; "") | sub("[ \t]+$"; ""))) as $segs
+        | if ($segs | length) != ($segs_want | length) then null
+          else
+            (reduce $segs[] as $s ({n: 0, ok: true, keys: []};
+                if ($s | length) == 1 and ($s | contains("\u0001")) then
+                    (if .n < ($lits | length) then .keys += [$lits[.n]] | .n += 1 else .ok = false end)
+                elif ($s | contains("\u0001")) then .ok = false
+                else .keys += [$s] end)) as $p
+            | if ($p.ok | not) or ($p.keys != $segs_want) then null
+              elif $p.n < ($lits | length) then {value: $lits[$p.n]}
+              else null end
+          end
+      end;
 . as $raw
 | outline as $o
 | [$o | to_entries[] | {i: .key, code: (.value.code | sub("^[ \t]+"; "") | sub("[ \t]+$"; "")), lits: .value.lits}] as $L
@@ -1408,17 +1427,21 @@ def outline:
             (if .n < ($hl | length) then .keys += [$hl[.n]] | .n += 1 else .bad = true end)
           elif (($k | length) == 0 or ($k | contains("\u0001"))) then .bad = true
           else .keys += [$k] end))
-    | select((.bad | not) and .keys == ["model_providers", $want])
-    | {i: $hi, keys: .keys}] as $tables
+    | select((.bad | not))
+    | {i: $hi, keys: .keys}] as $pheaders
+| [$pheaders[] | select(.keys == ["model_providers", $want])] as $tables
 | (if ($tables | length) == 1 then ([$headers[] | select(.i > $tables[0].i) | .i] | .[0] // ([$L[] | .i] | length)) else 0 end) as $stop
 | [$L[] | select(($tables | length) == 1 and .i > $tables[0].i and .i < $stop and (.code | test("^(base_url|\u0001)[ \t]*=")) and (if (.code | startswith("\u0001")) then ((.lits | length) >= 1 and .lits[0] == "base_url") else true end))] as $setters
 | [$setters[] | select((.code | sub("^(base_url|\u0001)[ \t]*=[ \t]*"; "")) == "\u0001") | select((if (.code | startswith("\u0001")) then (.lits | length) == 2 else (.lits | length) == 1 end))] as $urls
-| if ($tables | length) == 0 then ""
-  elif ($tables | length) > 1 then "conflict"
-  elif ($setters | length) > 1 then "conflict"
-  elif ($setters | length) != ($urls | length) then "conflict"
-  elif ($setters | length) == 0 then ""
-  else ($setters[0].lits[-1] // "conflict") end' "$endpoint_file" 2>/dev/null) || return 1
+| (([$pheaders[].i] | min) // ($L | length)) as $root_end
+| [$L[] | select(.i < $root_end) | dotted(["model_providers", $want, "base_url"]) | select(. != null)] as $root_dots
+| [$pheaders[] | select(.keys == ["model_providers"]) | .i as $hi | ([$pheaders[] | select(.i > $hi) | .i] | .[0] // ($L | length)) as $rstop | [$L[] | select(.i > $hi and .i < $rstop) | dotted([$want, "base_url"]) | select(. != null)][]] as $rel_dots
+| ($root_dots + $rel_dots) as $dots
+| if ($tables | length) > 1 then "conflict"
+  elif (($setters | length) + ($dots | length)) > 1 then "conflict"
+  elif ($setters | length) == 1 then (if ($urls | length) == 1 then $setters[0].lits[-1] else "conflict" end)
+  elif ($dots | length) == 1 then $dots[0].value
+  else "" end' "$endpoint_file" 2>/dev/null) || return 1
     [ "$endpoint_value" = conflict ] && return 1
     printf '%s' "$endpoint_value"
 }
