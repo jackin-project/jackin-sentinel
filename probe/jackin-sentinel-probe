@@ -1259,6 +1259,7 @@ pin_declared_configs_run() {
         [ -n "$_jks_vcfg_sel" ] || return 1
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
+freeze_parent = len(sys.argv) > 2 and sys.argv[2] == "codex"
 data = sys.stdin.buffer.read()
 parent, name = os.path.split(path)
 if not name:
@@ -1269,6 +1270,7 @@ try:
     dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
 except OSError:
     raise SystemExit(1)
+os.chdir(parent)
 mode = None
 dir_mode = None
 frozen = False
@@ -1293,8 +1295,6 @@ try:
         sys.stdout.flush()
     finally:
         os.close(handle)
-    os.fchmod(dirfd, dir_mode & ~0o222)
-    frozen = True
     handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
     try:
         opened = os.fstat(handle)
@@ -1320,6 +1320,9 @@ try:
     finally:
         os.close(writer)
     written = True
+    if freeze_parent:
+        os.fchmod(dirfd, dir_mode & ~0o222)
+        frozen = True
     sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
     sys.stdout.write("%o %d %d\n" % (dir_mode, dirst.st_dev, dirst.st_ino))
     raise SystemExit(0)
@@ -1356,7 +1359,7 @@ finally:
         except OSError:
             pass
     os.close(dirfd)
-' "$declared_path" 2>/dev/null)
+' "$declared_path" "$EXPECTED_AGENT" 2>/dev/null)
         declared_rc=$?
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
