@@ -4097,7 +4097,7 @@ main() {
         echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
         exit 65
     fi
-    if ! jq -e '
+    if ! jq -e --arg scan "$SCAN_ROOT" '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
             (.adapter | type == "string" and length > 0) and
@@ -4117,10 +4117,10 @@ main() {
         (.behavior.prompt.tool.workdir | type == "string" and length > 0) and
         (.behavior.prompt.tool.observation.directory_contains.entries | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
         (.behavior.credential.classification | type == "string" and (IN("oauth_login", "static_key", "api_key"))) and
-        ((.target.tuple == "T01" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".codex/config.toml"] | sort))) or
-         (.target.tuple == "T09" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".omp/config.toml", "agent/models.yml"] | sort))) or
-         (.target.tuple == "T14" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".claude/settings.json"] | sort))) or
-         (.target.tuple == "T18" and (([.behavior.credential.config_files // [] | .[].path | split("/") | .[-2:] | join("/")] | sort) == ([".codex/config.toml"] | sort)))) and
+        ((.target.tuple == "T01" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.codex/config.toml"] | sort))) or
+         (.target.tuple == "T09" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.omp/config.toml", $scan + "/.omp/agent/models.yml"] | sort))) or
+         (.target.tuple == "T14" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.claude/settings.json"] | sort))) or
+         (.target.tuple == "T18" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.codex/config.toml"] | sort)))) and
         (.behavior.credential.environment | type == "array" and length > 0 and (.[0].name | test("^[A-Za-z_][A-Za-z0-9_]*$"))) and
         ((.behavior.credential.classification == "static_key" and (.credential_sha256 | test("^[0-9a-f]{64}$"))) or
          (.behavior.credential.classification != "static_key")) and

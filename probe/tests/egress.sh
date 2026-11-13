@@ -598,6 +598,17 @@ execute() {
         }
         zai_adapter=
     fi
+    if [ -n "${decoy_dir-}" ]; then
+        jq --arg d "$decoy_dir" '.behavior.credential.config_files |= map(if (.path | endswith(".omp/config.toml")) then .path = ($d + "/.omp/config.toml") elif (.path | endswith("agent/models.yml")) then .path = ($d + "/agent/models.yml") else . end)' "$t/spec" >"$t/spec.next" || {
+            fixture_setup_failed=1
+            return 70
+        }
+        mv "$t/spec.next" "$t/spec" || {
+            fixture_setup_failed=1
+            return 70
+        }
+        decoy_dir=
+    fi
     set -- "$@" sh "$t/probe" --only "${step#step_}"
     [ -z "$engine" ] || set -- "$@" --engine "$engine"
     bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
@@ -2640,6 +2651,24 @@ begin t14_a_the_rollback_does_not_chmod_a_replacement_of_the_configuration step_
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 decoy_mode=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/decoy.json" 2>/dev/null)
 [ "$decoy_mode" = 644 ] || problems="$problems the-replacement-mode-changed=[$decoy_mode](want [644])"
+finish_case
+
+mk t09_a_decoy_configuration_root_is_rejected_before_the_launch
+name=t09_a_decoy_configuration_root_is_rejected_before_the_launch
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mkdir -p "$t/decoy/.omp/agent" "$t/decoy/agent"
+printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/decoy/.omp/config.toml"
+printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/decoy/agent/models.yml"
+decoy_dir=$t/decoy
+total=$((total + 1))
+problems=
+execute step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+execute_rc=$?
+[ "$execute_rc" -eq 65 ] || problems="$problems exit=[$execute_rc](want [65])"
+grep -q 'malformed or unsupported' "$t/err" 2>/dev/null || problems="$problems the-decoy-configuration-root-was-accepted"
+[ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
 finish_case
 
 echo "$total cases, $failures failed"
