@@ -806,6 +806,48 @@ copy_bounded() {
     read_bounded "$1" "$2" "$AGENT_HOME_MAX_BYTES"
 }
 
+capture_bounded() {
+    _jks_capture=$(
+        exec 9<"$1" 2>/dev/null || exit 1
+        cb_size=$(
+            RB_FD=9 RB_SRC=$1 RB_CAP=$2 python3 -I -c 'import os, stat, sys
+handle = os.fstat(int(os.environ["RB_FD"]))
+if not stat.S_ISREG(handle.st_mode):
+    raise SystemExit(1)
+named = os.lstat(os.environ["RB_SRC"])
+if (handle.st_dev, handle.st_ino) != (named.st_dev, named.st_ino):
+    raise SystemExit(1)
+if handle.st_size > int(os.environ["RB_CAP"]):
+    raise SystemExit(1)
+sys.stdout.write("%d" % handle.st_size)
+' 2>/dev/null
+        ) || exit 1
+        cb_raw=$(
+            if command -v head >/dev/null 2>&1; then
+                if command -v timeout >/dev/null 2>&1; then
+                    timeout 10 head -c "$3" -- /dev/fd/9 || exit 1
+                else
+                    head -c "$3" -- /dev/fd/9 || exit 1
+                fi
+            elif command -v dd >/dev/null 2>&1; then
+                dd if=/dev/fd/9 bs="$3" count=1 2>/dev/null || exit 1
+            else
+                exit 1
+            fi
+            printf x
+        ) || exit 1
+        cb_raw=${cb_raw%x}
+        cb_len=$(printf '%s' "$cb_raw" | wc -c | tr -d '[:space:]') || exit 1
+        [ -n "$cb_len" ] || exit 1
+        [ "$cb_len" = "$cb_size" ] 2>/dev/null || exit 1
+        [ "$cb_len" -le "$2" ] 2>/dev/null || exit 1
+        printf '%s' "$cb_raw"
+        printf x
+    ) || return 1
+    _jks_capture=${_jks_capture%x}
+    return 0
+}
+
 root_toml_selection() {
     jq -Rrs '
       def vals:
@@ -834,13 +876,8 @@ declared_provider_config() {
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$declared_path" ] || return 1
         if [ -z "${declared_use_snapshot-}" ]; then
-            read_bounded "$declared_path" "$spec_dir/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
-            _jks_vcfg_st=$(
-                cat "$spec_dir/config.snapshot"
-                printf x
-            ) || return 1
-            rm -f "$spec_dir/config.snapshot" || return 1
-            _jks_vcfg_st=${_jks_vcfg_st%x}
+            capture_bounded "$declared_path" "$CONFIG_BYTE_CAP" "$((CONFIG_BYTE_CAP + 1))" || return 1
+            _jks_vcfg_st=$_jks_capture
             case $declared_index in
                 0) _jks_vcfg_0=$_jks_vcfg_st ;;
                 1) _jks_vcfg_1=$_jks_vcfg_st ;;
@@ -4227,14 +4264,14 @@ main() {
         echo "$PROBE: no key material for the step seals; refusing to run" >&2
         exit 70
     fi
-    if read_bounded "$spec" "$spec_dir/spec.snapshot" "$SPEC_BYTE_CAP"; then
-        spec=$spec_dir/spec.snapshot
+    if capture_bounded "$spec" "$SPEC_BYTE_CAP" "$SPEC_BYTE_CAP"; then
+        SPEC_RAW=$_jks_capture
     else
         rm -rf "$spec_dir"
         echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
         exit 65
     fi
-    if ! jq -e --arg scan "$SCAN_ROOT" '
+    if ! printf '%s\n' "$SPEC_RAW" | jq -e --arg scan "$SCAN_ROOT" '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
             (.adapter | type == "string" and length > 0) and
@@ -4266,44 +4303,35 @@ main() {
         (.behavior.credential.auth_file.fields | type == "array") and
         ((.behavior.provider.accepted_status == null and .behavior.provider.accepted_body == null) or
          (.behavior.provider.accepted_status | type == "number") and .behavior.provider.accepted_body.json_error_code.code == "invalid_api_key")
-    ' "$spec" >/dev/null 2>&1; then
+    ' >/dev/null 2>&1; then
         echo "$PROBE: the private probe specification is malformed or unsupported" >&2
         exit 65
     fi
-    AGENT_BIN=$(jq -r '.behavior.version.binary' "$spec") || exit 65
-    EXPECTED_VERSION=$(jq -r '.behavior.version.exact_output' "$spec") || exit 65
-    AGENT_COMM=$(jq -r '.behavior.process.comm' "$spec") || exit 65
-    AUTH_FILE=$(jq -r '.behavior.credential.auth_file.path' "$spec") || exit 65
-    AUTH_REQUIRED=$(jq -r '.behavior.credential.auth_file.required_state' "$spec") || exit 65
-    PROVIDER_URL=$(jq -r '.behavior.provider.probe_url' "$spec") || exit 65
-    PROVIDER_STATUS=$(jq -r '.behavior.provider.accepted_status // 0' "$spec") || exit 65
-    PROMPT_ARGV=$(jq -r '.behavior.prompt.argv[] | @base64' "$spec") || exit 65
-    TOOL_ARGV=$(jq -r '.behavior.prompt.tool.argv[] | @base64' "$spec") || exit 65
-    TOOL_KIND=$(jq -r '.behavior.prompt.tool.kind' "$spec") || exit 65
-    TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
-    TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
-    TOOL_OBSERVATION_EXPECTED=$(jq -c '[.behavior.prompt.tool.observation.directory_contains.entries[]]' "$spec") || exit 65
-    CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
-    CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
-    CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
-    EXPECTED_PROVIDER=$(jq -r '.target.provider' "$spec") || exit 65
-    EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
-    EXPECTED_AGENT=$(jq -r '.target.agent' "$spec") || exit 65
-    ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
-    SPEC_TARGET_JSON=$(jq -c '.target' "$spec") || exit 65
+    AGENT_BIN=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.version.binary') || exit 65
+    EXPECTED_VERSION=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.version.exact_output') || exit 65
+    AGENT_COMM=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.process.comm') || exit 65
+    AUTH_FILE=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.auth_file.path') || exit 65
+    AUTH_REQUIRED=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.auth_file.required_state') || exit 65
+    PROVIDER_URL=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.provider.probe_url') || exit 65
+    PROVIDER_STATUS=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.provider.accepted_status // 0') || exit 65
+    PROMPT_ARGV=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.argv[] | @base64') || exit 65
+    TOOL_ARGV=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.argv[] | @base64') || exit 65
+    TOOL_KIND=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.kind') || exit 65
+    TOOL_WORKDIR=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.workdir') || exit 65
+    TOOL_OBSERVATION=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64') || exit 65
+    TOOL_OBSERVATION_EXPECTED=$(printf '%s\n' "$SPEC_RAW" | jq -c '[.behavior.prompt.tool.observation.directory_contains.entries[]]') || exit 65
+    CREDENTIAL_CLASS=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.classification') || exit 65
+    CREDENTIAL_ENV=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.environment[0].name') || exit 65
+    CREDENTIAL_FINGERPRINT=$(printf '%s\n' "$SPEC_RAW" | jq -r '.credential_sha256 // ""') || exit 65
+    EXPECTED_PROVIDER=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.provider') || exit 65
+    EXPECTED_MODEL=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.model') || exit 65
+    EXPECTED_AGENT=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.agent') || exit 65
+    ADAPTER=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.adapter') || exit 65
+    SPEC_TARGET_JSON=$(printf '%s\n' "$SPEC_RAW" | jq -c '.target') || exit 65
     [ -n "$SPEC_TARGET_JSON" ] || exit 65
-    if command -v head >/dev/null 2>&1; then
-        SPEC_JSON=$(head -c "$SPEC_BYTE_CAP" -- "$spec" 2>/dev/null) || exit 65
-    elif command -v dd >/dev/null 2>&1; then
-        dd if="$spec" of="$spec_dir/spec.capped" bs="$SPEC_BYTE_CAP" count=1 2>/dev/null || exit 65
-        SPEC_JSON=$(cat "$spec_dir/spec.capped" 2>/dev/null) || exit 65
-    else
-        echo "$PROBE: no bounded reader for the probe specification; refusing to run" >&2
-        exit 65
-    fi
+    SPEC_JSON=$(printf '%s\n' "$SPEC_RAW" | jq -c '.' 2>/dev/null) || exit 65
     [ -n "$SPEC_JSON" ] || exit 65
-    SPEC_JSON=$(printf '%s\n' "$SPEC_JSON" | jq -c '.' 2>/dev/null) || exit 65
-    [ -n "$SPEC_JSON" ] || exit 65
+    SPEC_RAW=
     rm -f "$spec_dir/spec.snapshot" "$spec_dir/spec.capped" 2>/dev/null || exit 70
     spec=
     prompt_configs_validated=false

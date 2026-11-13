@@ -2037,6 +2037,41 @@ jq -e '.target.tuple == "T01" and .target.adapter == "t01-codex-v1" and .target.
 [ ! -s "$t/tmp_spec.seen" ] || problems="$problems agent-reached-the-tmp-spec-snapshot"
 finish_case
 
+mk j09_a_same_uid_helper_cannot_swap_the_trusted_scratch_before_extraction
+case_spec_dir="$t/spec-dir"
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/jq" <<EOF
+#!/bin/sh
+for d in "$t"/spec-dir.*; do
+    [ -d "\$d" ] || continue
+    printf '%s\n' "swapped \$d/spec.snapshot" >>"$t/helper.log"
+    "$scratch/tools/jq" '.target.model = "tampered-model" | .target.spec_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$t/spec" >"\$d/spec.snapshot" 2>/dev/null || :
+done
+exec "$scratch/tools/jq" "\$@"
+EOF
+chmod +x "$t/bin/jq"
+cat >"$t/bin/cat" <<EOF
+#!/bin/sh
+for a in "\$@"; do
+    case "\$a" in
+        */config.snapshot)
+            printf '%s\n' "swapped \$a" >>"$t/helper.log"
+            sed 's#https://api.z.ai/api/anthropic#http://127.0.0.1:9/v1#g' "\$a" >"\$a.swap" 2>/dev/null && mv "\$a.swap" "\$a" 2>/dev/null || :
+            ;;
+    esac
+done
+exec "$scratch/tools/cat" "\$@"
+EOF
+chmod +x "$t/bin/cat"
+begin j09_a_same_uid_helper_cannot_swap_the_trusted_scratch_before_extraction step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+jq -e '.target.tuple == "T09" and .target.model == "glm-5.3" and .target.spec_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
+[ -s "$t/helper.log" ] || problems="$problems helper-never-swapped-the-scratch"
+case_spec_dir=
+finish_case
+
 for tuple in T09 T14 T18; do
     case $tuple in
         T09)
