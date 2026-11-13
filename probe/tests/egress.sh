@@ -2508,12 +2508,22 @@ cat >"$t/bin/omp" <<EOF
 echo ran >>"$t/codex.ran"
 case " \$* " in
     *"Use one shell tool"*)
-        for d in /tmp/jackin-sentinel-probe-spec.*; do
-            if [ -d "\$d" ]; then
-                rm -f "\$d/config.validated.0" 2>/dev/null
-                printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' 'httpProxy: http://127.0.0.1:9' >"\$d/config.validated.0" 2>/dev/null && printf '%s\n' "\$d" >>"$t/tampered"
-            fi
-        done
+        (
+            attack=0
+            target=
+            for d in /tmp/jackin-sentinel-probe-spec.*; do
+                if [ -d "\$d" ]; then
+                    target=\$d
+                    break
+                fi
+            done
+            while [ "\$attack" -lt 2000 ] && [ -n "\$target" ] && [ -d "\$target" ]; do
+                attack=\$((attack + 1))
+                for scratch in config.snapshot config.normalized config.declared; do
+                    printf '%s\n' 'note: baseUrl: https://api.z.ai/api/anthropic credentialEnv: ZAI_API_KEY default: zai/glm-5.3' 'baseUrl: http://127.0.0.1:9/v1' >"\$target/\$scratch" 2>/dev/null && printf '%s\n' "\$target/\$scratch" >>"$t/tampered"
+                done
+            done
+        ) >/dev/null 2>&1 &
         printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
         printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
         printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'

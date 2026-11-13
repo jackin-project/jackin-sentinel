@@ -816,30 +816,11 @@ declared_provider_config() {
         [ -n "$declared_path" ] || return 1
         if [ -z "${declared_use_snapshot-}" ]; then
             read_bounded "$declared_path" "$spec_dir/config.snapshot" "$CONFIG_BYTE_CAP" || return 1
-        else
-            case $declared_index in
-                0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
-                1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
-                *) return 1 ;;
-            esac
-            [ -n "$_jks_vcfg_sel" ] || return 1
-            printf '%s' "$_jks_vcfg_sel" >"$spec_dir/config.snapshot" || return 1
-        fi
-        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]' >"$spec_dir/config.required" 2>/dev/null || return 1
-        while IFS= read -r declared_line; do
-            [ -n "$declared_line" ] || continue
-            grep -Fq -- "$declared_line" "$spec_dir/config.snapshot" || return 1
-        done <"$spec_dir/config.required"
-        printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]' >"$spec_dir/config.forbidden" 2>/dev/null || return 1
-        while IFS= read -r declared_line; do
-            [ -n "$declared_line" ] || continue
-            grep -Fq -- "$declared_line" "$spec_dir/config.snapshot" && return 1
-        done <"$spec_dir/config.forbidden"
-        if [ -z "${declared_use_snapshot-}" ]; then
             _jks_vcfg_st=$(
                 cat "$spec_dir/config.snapshot"
                 printf x
             ) || return 1
+            rm -f "$spec_dir/config.snapshot" || return 1
             _jks_vcfg_st=${_jks_vcfg_st%x}
             case $declared_index in
                 0) _jks_vcfg_0=$_jks_vcfg_st ;;
@@ -847,10 +828,35 @@ declared_provider_config() {
                 *) return 1 ;;
             esac
         fi
-        sed 's/\r$//' "$spec_dir/config.snapshot" >"$spec_dir/config.normalized" 2>/dev/null || return 1
+        case $declared_index in
+            0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+            1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+            *) return 1 ;;
+        esac
+        [ -n "$_jks_vcfg_sel" ] || return 1
+        _jks_declared_required=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]') || return 1
+        while IFS= read -r declared_line; do
+            [ -n "$declared_line" ] || continue
+            printf '%s' "$_jks_vcfg_sel" | grep -Fq -- "$declared_line" || return 1
+        done <<EOF_JKS_DECLARED_REQUIRED
+$_jks_declared_required
+EOF_JKS_DECLARED_REQUIRED
+        _jks_declared_forbidden=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]') || return 1
+        while IFS= read -r declared_line; do
+            [ -n "$declared_line" ] || continue
+            printf '%s' "$_jks_vcfg_sel" | grep -Fq -- "$declared_line" && return 1
+        done <<EOF_JKS_DECLARED_FORBIDDEN
+$_jks_declared_forbidden
+EOF_JKS_DECLARED_FORBIDDEN
+        _jks_norm=$(printf '%s' "$_jks_vcfg_sel" | sed 's/\r$//') || return 1
         case $ADAPTER in
             t09-omp-zai-v1)
-                if ! python3 -I - "$spec_dir/config.normalized" >"$spec_dir/config.declared" <<'PY'
+                if [ -z "${_jks_yaml_code-}" ]; then
+                    _jks_yaml_code=
+                    while IFS= read -r _jks_yaml_line; do
+                        _jks_yaml_code="$_jks_yaml_code$_jks_yaml_line
+"
+                    done <<'PY_JKS_YAML_CODE'
 import re
 import sys
 
@@ -1035,26 +1041,26 @@ def plain_root_scalars(text):
     return root
 
 
+text = sys.stdin.buffer.read().decode("utf-8-sig")
 try:
-    with open(sys.argv[1], encoding="utf-8-sig") as handle:
-        if yaml is not None:
+    if yaml is not None:
 
-            class Loader(yaml.SafeLoader):
-                pass
+        class Loader(yaml.SafeLoader):
+            pass
 
-            def construct_mapping(loader, node, deep=False):
-                mapping = {}
-                for key_node, value_node in node.value:
-                    key = loader.construct_object(key_node, deep=deep)
-                    if key in mapping:
-                        raise ValueError("duplicate key")
-                    mapping[key] = loader.construct_object(value_node, deep=deep)
-                return mapping
+        def construct_mapping(loader, node, deep=False):
+            mapping = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise ValueError("duplicate key")
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
 
-            Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
-            doc = yaml.load(handle, Loader=Loader)
-        else:
-            doc = plain_root_scalars(handle.read())
+        Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+        doc = yaml.load(text, Loader=Loader)
+    else:
+        doc = plain_root_scalars(text)
 except Exception:
     raise SystemExit(1)
 if not isinstance(doc, dict) or "baseUrl" not in doc:
@@ -1063,19 +1069,17 @@ value = doc["baseUrl"]
 if not isinstance(value, str) or url_re.match(value) is None:
     raise SystemExit(1)
 sys.stdout.write(value)
-PY
-                then
-                    return 1
+PY_JKS_YAML_CODE
                 fi
-                declared_parsed=$(cat "$spec_dir/config.declared")
+                declared_parsed=$(printf '%s' "$_jks_norm" | python3 -I -c "$_jks_yaml_code" 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             t14-claude-zai-v1)
-                declared_parsed=$(jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' "$spec_dir/config.normalized" 2>/dev/null) || return 1
+                declared_parsed=$(printf '%s' "$_jks_norm" | jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             t01-codex-v1 | t18-codex-zai-v1)
-                declared_parsed=$(provider_endpoint "$spec_dir/config.normalized" "$EXPECTED_PROVIDER" 2>/dev/null) || return 1
+                declared_parsed=$(printf '%s' "$_jks_norm" | provider_endpoint - "$EXPECTED_PROVIDER" 2>/dev/null) || return 1
                 [ -n "$declared_parsed" ] || return 1
                 ;;
             *) return 1 ;;
@@ -1226,13 +1230,31 @@ declared_configs_match_snapshot() {
             *) return 1 ;;
         esac
         [ -n "$_jks_vcfg_sel" ] || return 1
-        read_bounded "$declared_path" "$spec_dir/config.livecheck" "$CONFIG_BYTE_CAP" || return 1
-        _jks_live=$(
-            cat "$spec_dir/config.livecheck"
-            printf x
-        ) || return 1
-        _jks_live=${_jks_live%x}
-        [ "$_jks_live" = "$_jks_vcfg_sel" ] || return 1
+        printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+expected = sys.stdin.buffer.read()
+try:
+    handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(handle)
+    if not stat.S_ISREG(opened.st_mode):
+        raise SystemExit(1)
+    named = os.lstat(path)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    data = b""
+    while len(data) <= len(expected):
+        chunk = os.read(handle, 65536)
+        if not chunk:
+            break
+        data += chunk
+finally:
+    os.close(handle)
+if data != expected:
+    raise SystemExit(1)
+' "$declared_path" 2>/dev/null || return 1
         declared_index=$((declared_index + 1))
     done
     return 0
@@ -1268,7 +1290,7 @@ sys.stdout.write("%d %d %d %d %d" % (handle.st_dev, handle.st_ino, handle.st_siz
 provider_endpoint() {
     endpoint_file=$1
     endpoint_provider=$2
-    [ -f "$endpoint_file" ] || return 0
+    [ "$endpoint_file" = - ] || [ -f "$endpoint_file" ] || return 0
     case $endpoint_provider in
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
@@ -4156,6 +4178,7 @@ main() {
             prompt_configs_pinned=true
         fi
     fi
+    rm -f "$spec_dir"/config.snapshot "$spec_dir"/config.normalized "$spec_dir"/config.declared "$spec_dir"/config.required "$spec_dir"/config.forbidden "$spec_dir"/config.livecheck 2>/dev/null || exit 70
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"
         if [ -n "$selected_value" ] && [ "$(printf '%s' "$selected_value" | sha256sum | cut -d' ' -f1)" = "$CREDENTIAL_FINGERPRINT" ]; then
