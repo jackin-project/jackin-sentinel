@@ -5050,7 +5050,7 @@ chmod 600 "$t/sandbox/.codex/config.toml"
 (
     swap_ticks=0
     pinned_seen=
-    while [ "$swap_ticks" -lt 600 ]; do
+    while [ "$swap_ticks" -lt 1000 ]; do
         current_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
         if [ -z "$pinned_seen" ]; then
             if [ "$current_mode" != 600 ] && [ -n "$current_mode" ]; then
@@ -5064,7 +5064,7 @@ chmod 600 "$t/sandbox/.codex/config.toml"
             : >"$t/replaced"
             exit 0
         fi
-        sleep 0.05
+        sleep 0.01
         swap_ticks=$((swap_ticks + 1))
     done
     exit 0
@@ -5074,6 +5074,11 @@ cat >"$t/bin/codex" <<EOF
 #!/bin/sh
 case " \$* " in
     *"Use one shell tool"*)
+        waited=0
+        while [ ! -e "$t/observed.mode" ] && [ "\$waited" -lt 100 ]; do
+            sleep 0.05
+            waited=\$((waited + 1))
+        done
         printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
         printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
         printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
