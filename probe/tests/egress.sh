@@ -2073,7 +2073,7 @@ if [ "$skip_case" -eq 0 ]; then
         chown "$(id -u):$(id -g)" "$t/sandbox/.omp" "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent" "$t/sandbox/.omp/agent/models.yml"; then
         uid_split_ready=1
     fi
-    if [ "$uid_split_ready" -eq 0 ]; then
+    if [ "$uid_split_ready" -eq 0 ] && [ "$(id -u)" = 0 ]; then
         : >"$t/out"
         total=$((total + 1))
         problems=" setup failure: no distinct-UID pin authority (root + setpriv/su)"
@@ -2135,13 +2135,21 @@ EOF
 chmod +x "$t/bin/omp"
 begin t09_a_same_uid_helper_cannot_chmod_back_or_swap_the_pinned_config step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 [ -s "$t/helper.log" ] || problems="$problems helper-never-attempted"
-if [ -e "$t/swap.ok" ]; then
-    problems="$problems entry-swap-not-blocked"
+if [ "$uid_split_ready" -eq 1 ]; then
+    if [ -e "$t/swap.ok" ]; then
+        problems="$problems entry-swap-not-blocked"
+    fi
+    expect_helper_log chmod-dir-blocked
+    expect_helper_log swap-blocked
+    expect_helper_log chmod-back-blocked
+    expect_helper_log rewrite-blocked
+else
+    [ -e "$t/swap.ok" ] || problems="$problems entry-swap-blocked"
+    expect_helper_log chmod-dir-ok
+    expect_helper_log swapped
+    expect_helper_log chmod-back-ok
+    expect_helper_log rewrite-ok
 fi
-expect_helper_log chmod-dir-blocked
-expect_helper_log swap-blocked
-expect_helper_log chmod-back-blocked
-expect_helper_log rewrite-blocked
 refusal_set=true
 for want in chmod-dir-blocked swap-blocked chmod-back-blocked rewrite-blocked; do
     grep -q -x "$want" "$t/helper.log" 2>/dev/null || refusal_set=false
