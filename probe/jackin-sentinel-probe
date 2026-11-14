@@ -863,11 +863,46 @@ EOF_JKS_CAPTURE_BODY
     return 0
 }
 
+entropy_encode() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 2>/dev/null
+    else
+        python3 -I -c 'import base64, sys
+raw = sys.stdin.buffer.read()
+if len(raw) != 32:
+    raise SystemExit(1)
+sys.stdout.write(base64.b64encode(raw).decode())' 2>/dev/null
+    fi
+}
+
+entropy_decode() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -d 2>/dev/null
+    else
+        python3 -I -c 'import base64, sys
+raw = base64.b64decode(sys.stdin.buffer.read())
+if len(raw) != 32:
+    raise SystemExit(1)
+sys.stdout.buffer.write(raw)' 2>/dev/null
+    fi
+}
+
+entropy_wire_valid() {
+    case $1 in
+        *[!A-Za-z0-9+/=]*) return 1 ;;
+    esac
+    [ "${#1}" -eq 44 ] || return 1
+    [ "${1%=}" != "$1" ] || return 1
+    [ "${1%==}" = "$1" ] || return 1
+}
+
 read_entropy() {
     entropy_wire=
     if command -v head >/dev/null 2>&1; then
-        entropy_wire=$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null) || return 1
-    elif command -v python3 >/dev/null 2>&1; then
+        entropy_wire=$(head -c 32 /dev/urandom 2>/dev/null | entropy_encode) || entropy_wire=
+        entropy_wire_valid "$entropy_wire" || entropy_wire=
+    fi
+    if [ -z "$entropy_wire" ] && command -v python3 >/dev/null 2>&1; then
         entropy_wire=$(python3 -I -c 'import base64, os, sys
 handle = os.open("/dev/urandom", os.O_RDONLY)
 collected = b""
@@ -880,18 +915,14 @@ try:
 finally:
     os.close(handle)
 sys.stdout.write(base64.b64encode(collected).decode())
-' 2>/dev/null) || return 1
-    elif command -v dd >/dev/null 2>&1; then
-        entropy_wire=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 2>/dev/null) || return 1
-    else
-        return 1
+' 2>/dev/null) || entropy_wire=
+        entropy_wire_valid "$entropy_wire" || entropy_wire=
     fi
-    case $entropy_wire in
-        *[!A-Za-z0-9+/=]*) return 1 ;;
-    esac
-    [ "${#entropy_wire}" -eq 44 ] || return 1
-    [ "${entropy_wire%=}" != "$entropy_wire" ] || return 1
-    [ "${entropy_wire%==}" = "$entropy_wire" ] || return 1
+    if [ -z "$entropy_wire" ] && command -v dd >/dev/null 2>&1; then
+        entropy_wire=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | entropy_encode) || entropy_wire=
+        entropy_wire_valid "$entropy_wire" || entropy_wire=
+    fi
+    entropy_wire_valid "$entropy_wire" || return 1
     printf '%s' "$entropy_wire"
 }
 
@@ -4334,7 +4365,7 @@ main() {
     RUN_KEY=
     run_entropy_wire=$(read_entropy 2>/dev/null) || run_entropy_wire=
     if [ -n "$run_entropy_wire" ]; then
-        RUN_KEY=$(printf '%s' "$run_entropy_wire" | base64 -d 2>/dev/null | sha256sum 2>/dev/null)
+        RUN_KEY=$(printf '%s' "$run_entropy_wire" | entropy_decode | sha256sum 2>/dev/null)
         RUN_KEY=${RUN_KEY%% *}
     fi
     case $RUN_KEY in
