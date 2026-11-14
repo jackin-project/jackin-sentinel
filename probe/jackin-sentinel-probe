@@ -413,6 +413,18 @@ stat_start_ticks() {
     echo "$stat_ticks"
 }
 
+stat_identity_key() {
+    [ -n "${1-}" ] || return 1
+    stat_key_pid=${1%% *}
+    case $stat_key_pid in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    stat_key_comm=$(printf '%s\n' "$1" | sed -n 's/^[0-9][0-9]* (\(.*\)) [^)]*$/\1/p')
+    [ -n "$stat_key_comm" ] || return 1
+    stat_key_ticks=$(stat_start_ticks "$1") || return 1
+    printf '%s %s %s\n' "$stat_key_pid" "$stat_key_comm" "$stat_key_ticks"
+}
+
 proc_arg() {
     { tr '\0' '\n' <"/proc/$1/cmdline"; } 2>/dev/null | sed -n "$2p" | cut -c1-200
 }
@@ -526,7 +538,9 @@ proc_launcher_identity_record() {
     fi
     record_after=$(proc_stat_raw "$record_pid") || return 1
     record_stable=false
-    [ "$record_before" = "$record_after" ] && record_stable=true
+    record_before_identity=$(stat_identity_key "$record_before") || return 1
+    record_after_identity=$(stat_identity_key "$record_after") || return 1
+    [ "$record_before_identity" = "$record_after_identity" ] && record_stable=true
     jq -cn --arg interpreter "$record_interpreter" --arg interpreter_arg "$record_interpreter_arg" \
         --arg resolved "$record_resolved" \
         --arg exe "$record_exe" --arg uid "$record_uid" --arg comm "$record_comm" \
@@ -1453,18 +1467,32 @@ launch_env_classifications() {
     launch_classes=$work/launch-env-classes.$$
     launch_parsed=$work/launch-env-parsed.$$
     rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed"
-    launch_nuls=$(LC_ALL=C tr -cd '\000' <"$launch_source" | wc -c | tr -d ' ')
+    launch_nul_bytes=$work/launch-env-nuls.$$
+    rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+    if ! LC_ALL=C tr -cd '\000' <"$launch_source" >"$launch_nul_bytes" 2>/dev/null; then
+        rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+        return 1
+    fi
+    if ! launch_nuls=$(LC_ALL=C wc -c <"$launch_nul_bytes" 2>/dev/null); then
+        rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+        return 1
+    fi
+    if ! launch_nuls=$(printf '%s\n' "$launch_nuls" | LC_ALL=C tr -d '[:space:]' 2>/dev/null); then
+        rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+        return 1
+    fi
     case $launch_nuls in
         '' | *[!0-9]*)
-            rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed"
+            rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
             return 1
             ;;
         0) ;;
         *)
-            rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed"
+            rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
             return 1
             ;;
     esac
+    rm -f "$launch_nul_bytes"
     # shellcheck disable=SC2016
     LC_ALL=C timeout "$LAUNCH_ENV_PARSE_SECONDS" awk -v max_line="$LAUNCH_ENV_MAX_LINE_BYTES" -v status_file="$launch_parse_status" '
         function reject() { invalid = 1 }
@@ -1524,8 +1552,10 @@ launch_env_classifications() {
         return 1
     fi
     rm -f "$launch_parsed"
-    cat "$launch_classes"
+    launch_class_status=0
+    cat "$launch_classes" || launch_class_status=$?
     rm -f "$launch_classes"
+    return "$launch_class_status"
 }
 
 sanitize_launch_environment() {

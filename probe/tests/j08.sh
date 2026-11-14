@@ -5305,5 +5305,95 @@ fact '.launcher_identity.stable' null
 fact '.launcher_identity.stat_pre' null
 finish_case
 
+mk j07_launcher_identity_stability_uses_the_identity_fields
+state 'running 1'
+printf '#!/bin/sh -e\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0%s\0' /bin/sh -e "$t/bin/jackin-start" >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat.before"
+printf '100 (jackin-start) R 1 100 100 0 -1 0 0 0 0 7 3 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat.after"
+resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
+ln -s "$resolved_sh" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+real_sed=$(command -v sed) || real_sed=$scratch/tools/sed
+cat >"$t/bin/sed" <<EOF
+#!/bin/sh
+if [ "\$1" = "-n" ] && [ "\$2" = "1p" ] && [ "\$3" = "$t/proc/100/stat" ]; then
+    reads=\$(cat "$t/stat.reads" 2>/dev/null)
+    case \$reads in
+        '' | *[!0-9]*) reads=0 ;;
+    esac
+    reads=\$((reads + 1))
+    printf '%s\n' "\$reads" >"$t/stat.reads"
+    if [ "\$reads" -le 2 ]; then
+        cat "$t/proc/100/stat.before"
+    else
+        cat "$t/proc/100/stat.after"
+    fi
+    exit 0
+fi
+exec "$real_sed" "\$@"
+EOF
+chmod +x "$t/bin/sed"
+begin j07_launcher_identity_stability_uses_the_identity_fields sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+fact '.launcher_identity.interpreter' '/bin/sh'
+fact '.launcher_identity.stable' 'true'
+fact '.launcher_identity.stat_pre' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+fact '.launcher_identity.stat_before' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+fact '.launcher_identity.stat_after' '100 (jackin-start) R 1 100 100 0 -1 0 0 0 0 7 3 0 0 0 20 0 1 0 100 0 0'
+finish_case
+
+mk j08_launch_environment_nul_scan_failure_is_propagated
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export SENTINEL_NUL_SCAN_TRAP_TOKEN_000='openshell:resolve:env:TOKEN_000'" >"$t/sandbox/.jackin/env-000"
+real_tr=$(command -v tr) || real_tr=$scratch/tools/tr
+cat >"$t/bin/tr" <<EOF
+#!/bin/sh
+captured=\${TMPDIR:-/tmp}/sentinel-tr.\$\$
+cat >"\$captured"
+if grep -q 'SENTINEL_NUL_SCAN_TRAP' "\$captured" 2>/dev/null; then
+    rm -f "\$captured"
+    echo 'tr: simulated read failure' >&2
+    exit 1
+fi
+exec "$real_tr" "\$@" <"\$captured"
+EOF
+chmod +x "$t/bin/tr"
+report j08_launch_environment_nul_scan_failure_is_propagated
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+mk j08_launch_environment_classification_read_failure_is_propagated
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export TOKEN_000='openshell:resolve:env:TOKEN_000'" >"$t/sandbox/.jackin/env-000"
+real_cat=$(command -v cat) || real_cat=$scratch/tools/cat
+cat >"$t/bin/cat" <<EOF
+#!/bin/sh
+for argument; do
+    case \$argument in
+        *launch-env-classes*)
+            echo 'cat: simulated read failure' >&2
+            exit 1
+            ;;
+    esac
+done
+exec "$real_cat" "\$@"
+EOF
+chmod +x "$t/bin/cat"
+report j08_launch_environment_classification_read_failure_is_propagated
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]
