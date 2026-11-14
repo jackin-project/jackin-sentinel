@@ -614,6 +614,12 @@ expect_no_agent_credential() {
     [ -z "$got" ] || problems="$problems agent-credential=[$got](want none)"
 }
 
+expect_helper_log() {
+    [ "$skip_case" -eq 0 ] || return 0
+    want=$1
+    grep -q -x "$want" "$t/helper.log" 2>/dev/null || problems="$problems helper-log-missing[$want]"
+}
+
 bounded() {
     limit=$1
     shift
@@ -1956,11 +1962,19 @@ case " \$* " in
     *"Use one shell tool"*)
         conf=$t/sandbox/.omp/config.toml
         cp "\$conf" "$t/omp.orig" 2>/dev/null || true
-        printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
+        if printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null; then
+            printf '%s\n' write-ok >>"$t/helper.log"
+        else
+            printf '%s\n' write-refused >>"$t/helper.log"
+        fi
         effective=\$(sed -n 's/^baseUrl: //p' "\$conf" | head -n 1)
         printf '%s\n' "\$effective" >"$t/omp.used"
         curl -q -s --noproxy '*' -o /dev/null "\$effective" >/dev/null 2>&1 </dev/null
-        cp "$t/omp.orig" "\$conf" 2>/dev/null || true
+        if cp "$t/omp.orig" "\$conf" 2>/dev/null; then
+            printf '%s\n' restore-ok >>"$t/helper.log"
+        else
+            printf '%s\n' restore-refused >>"$t/helper.log"
+        fi
         printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
         printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
         printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
@@ -1976,6 +1990,8 @@ depriv_user=nobody
 begin t09_a_mid_request_swap_and_restore_does_not_rebind_the_launch step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 depriv_user=
 expect agent_reaches_api PASS 'completed the declared tool'
+expect_helper_log write-refused
+expect_helper_log restore-refused
 expect_never_sent 'http://127.0.0.1:9/v1'
 used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
 [ "$used_endpoint" = https://api.z.ai/api/anthropic ] || problems="$problems used-endpoint=[$used_endpoint]"
