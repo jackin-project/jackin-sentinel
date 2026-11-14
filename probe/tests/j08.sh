@@ -5198,8 +5198,8 @@ fact '.launcher_identity.exe_matches_interpreter' 'true'
 fact '.launcher_identity.argv0_matches' 'true'
 fact '.launcher_identity.argv1_matches' 'true'
 fact '.launcher_identity.argv2_matches' 'true'
-fact '.launcher_identity.stat_pre' '1 100 100 0'
-fact '.launcher_identity.stat_before' '1 100 100 0'
+fact '.launcher_identity.stat_pre' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+fact '.launcher_identity.stat_before' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
 case $(jq -r '.steps[].facts | .launcher_identity.stat_after | length > 0' "$t/out" 2>/dev/null) in
     true) ;;
     *) problems="$problems launcher-stat-after-missing" ;;
@@ -5231,6 +5231,41 @@ begin j07_launcher_identity_binds_the_interpreter_to_the_running_executable sh "
 expect_rc 0
 expect_report J07 sandbox
 fact '.launcher_identity' null
+finish_case
+
+mk j07_launcher_stat_snapshots_are_raw_stat_lines
+state 'running 1'
+printf '#!/bin/sh -e\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0%s\0' /bin/sh -e "$t/bin/jackin-start" >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
+ln -s "$resolved_sh" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+begin j07_launcher_stat_snapshots_are_raw_stat_lines sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+for snapshot_field in stat_pre stat_before stat_after; do
+    snapshot=$(jq -r ".steps[].facts | .launcher_identity.$snapshot_field" "$t/out" 2>/dev/null)
+    case $snapshot in
+        '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0') ;;
+        *) problems="$problems launcher-$snapshot_field-not-raw-stat" ;;
+    esac
+    snapshot_pid=$(printf '%s\n' "$snapshot" | sed 's/^\([0-9][0-9]*\) .*/\1/')
+    snapshot_ticks=$(printf '%s\n' "$snapshot" | sed 's/^.*) //' | awk '{print $20}')
+    case $snapshot_pid in
+        100) ;;
+        *) problems="$problems launcher-$snapshot_field-pid-unrecoverable" ;;
+    esac
+    case $snapshot_ticks in
+        100) ;;
+        *) problems="$problems launcher-$snapshot_field-field22-unrecoverable" ;;
+    esac
+done
 finish_case
 
 mk j07_launcher_identity_rejects_a_failed_pre_launch_capture

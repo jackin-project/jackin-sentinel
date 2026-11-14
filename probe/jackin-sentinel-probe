@@ -399,6 +399,20 @@ proc_stat() {
     echo "$stat_line"
 }
 
+proc_stat_raw() {
+    [ -r "/proc/$1/stat" ] || return 1
+    stat_raw_line=$(sed -n 1p "/proc/$1/stat" 2>/dev/null)
+    [ -n "$stat_raw_line" ] || return 1
+    echo "$stat_raw_line"
+}
+
+stat_start_ticks() {
+    [ -n "${1-}" ] || return 1
+    stat_ticks=$(printf '%s\n' "$1" | sed 's/^.*) //' | awk '{print $20}')
+    [ -n "$stat_ticks" ] || return 1
+    echo "$stat_ticks"
+}
+
 proc_arg() {
     { tr '\0' '\n' <"/proc/$1/cmdline"; } 2>/dev/null | sed -n "$2p" | cut -c1-200
 }
@@ -479,14 +493,10 @@ proc_launcher_identity_record() {
     [ "$record_exe_path" = "$record_resolved" ] || return 1
     record_uid=$(proc_uid "$record_pid") || record_uid=
     record_comm=$(proc_comm "$record_pid") || record_comm=
-    record_before=$(proc_stat "$record_pid") || return 1
-    read -r _ _ record_before_ticks _ <<EOF
-$record_before
-EOF
+    record_before=$(proc_stat_raw "$record_pid") || return 1
+    record_before_ticks=$(stat_start_ticks "$record_before") || return 1
     [ -n "$record_stat_pre" ] || return 1
-    read -r _ _ record_pre_ticks _ <<EOF
-$record_stat_pre
-EOF
+    record_pre_ticks=$(stat_start_ticks "$record_stat_pre") || return 1
     [ "$record_pre_ticks" = "$record_before_ticks" ] || return 1
     [ -n "$record_exe_pre" ] || return 1
     [ "$record_exe_pre" = "$record_exe" ] || return 1
@@ -514,7 +524,7 @@ EOF
     elif proc_argv_matches "$record_pid" 1 "$START_BIN"; then
         record_argv1=true
     fi
-    record_after=$(proc_stat "$record_pid") || return 1
+    record_after=$(proc_stat_raw "$record_pid") || return 1
     record_stable=false
     [ "$record_before" = "$record_after" ] && record_stable=true
     jq -cn --arg interpreter "$record_interpreter" --arg interpreter_arg "$record_interpreter_arg" \
@@ -2278,7 +2288,7 @@ step_J07() (
     launcher_interp=
     launcher_interp_arg=
     if [ -n "$launcher_pid" ]; then
-        launcher_stat_pre=$(proc_stat "$launcher_pid") || launcher_stat_pre=
+        launcher_stat_pre=$(proc_stat_raw "$launcher_pid") || launcher_stat_pre=
         launcher_exe_pre=$(readlink "/proc/$launcher_pid/exe" 2>/dev/null) || launcher_exe_pre=
         launcher_uid_pre=$(proc_uid "$launcher_pid") || launcher_uid_pre=
         launcher_comm_pre=$(proc_comm "$launcher_pid") || launcher_comm_pre=
