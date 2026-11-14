@@ -4285,6 +4285,10 @@ main() {
         echo "$PROBE: jq is required" >&2
         exit 69
     }
+    command -v python3 >/dev/null 2>&1 || {
+        echo "$PROBE: python3 is required" >&2
+        exit 69
+    }
     if [ -z "$spec" ] || [ ! -f "$spec" ] || [ -L "$spec" ]; then
         echo "$PROBE: --spec must name a regular private probe specification" >&2
         exit 65

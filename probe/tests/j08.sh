@@ -2326,6 +2326,36 @@ expect_report J08 host
 expect sandbox SKIP 'not running in a sandbox'
 finish_case
 
+mk host_mode_checks_the_python3_dependency_before_the_spec_capture
+if ! prepare_probe; then
+    setup_failed host_mode_checks_the_python3_dependency_before_the_spec_capture
+else
+    mkdir -p "$t/no-py"
+    for tool_link in "$scratch/tools"/*; do
+        tool_name=${tool_link##*/}
+        case $tool_name in
+            python3) continue ;;
+        esac
+        ln -s "$(readlink "$tool_link")" "$t/no-py/$tool_name"
+    done
+    state 'exited 1 0'
+    record "$R_OK1"
+    total=$((total + 1))
+    name=host_mode_checks_the_python3_dependency_before_the_spec_capture
+    problems=
+    bounded 20 env -i PATH="$t/no-py" TMPDIR="$t/tmp" sh "$t/probe" --host --only J08
+    rc=$?
+    cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
+    expect_rc 69
+    case $(cat "$t/err") in
+        *'python3'*) ;;
+        *) problems="$problems stderr=[$(cat "$t/err")](want python3 dependency message)" ;;
+    esac
+    [ ! -s "$t/out" ] || problems="$problems stdout-not-empty"
+    finish_case
+fi
+
 mk outside_a_sandbox_the_probe_refuses
 ln -s "$real_uname" "$t/bin/uname" || exit 70
 ln -s "$real_id" "$t/bin/id" || exit 70
