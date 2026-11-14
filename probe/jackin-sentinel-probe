@@ -851,13 +851,11 @@ if b"\x00" in os.pread(int(os.environ["RB_FD"]), min(handle.st_size, int(os.envi
 }
 
 read_entropy() {
-    entropy_target=$1
-    entropy_bytes=
-    rm -f "$entropy_target"
+    entropy_wire=
     if command -v head >/dev/null 2>&1; then
-        head -c 32 /dev/urandom >"$entropy_target" 2>/dev/null || return 1
+        entropy_wire=$(head -c 32 /dev/urandom 2>/dev/null | base64 2>/dev/null) || return 1
     elif command -v python3 >/dev/null 2>&1; then
-        entropy_bytes=$(python3 -I -c 'import os, sys
+        entropy_wire=$(python3 -I -c 'import base64, os, sys
 handle = os.open("/dev/urandom", os.O_RDONLY)
 collected = b""
 try:
@@ -868,29 +866,20 @@ try:
         collected += chunk
 finally:
     os.close(handle)
-with open(sys.argv[1], "wb") as target:
-    target.write(collected)
-sys.stdout.write(str(len(collected)))
-' "$entropy_target" 2>/dev/null) || return 1
+sys.stdout.write(base64.b64encode(collected).decode())
+' 2>/dev/null) || return 1
     elif command -v dd >/dev/null 2>&1; then
-        dd if=/dev/urandom of="$entropy_target" bs=32 count=1 2>/dev/null || return 1
+        entropy_wire=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 2>/dev/null) || return 1
     else
         return 1
     fi
-    [ -f "$entropy_target" ] || return 1
-    if [ -z "$entropy_bytes" ] && command -v wc >/dev/null 2>&1; then
-        entropy_bytes=$(wc -c <"$entropy_target" 2>/dev/null | tr -d '[:space:]') || entropy_bytes=
-    fi
-    if [ -z "$entropy_bytes" ] && command -v python3 >/dev/null 2>&1; then
-        entropy_bytes=$(python3 -I -c 'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))' <"$entropy_target" 2>/dev/null) || entropy_bytes=
-    fi
-    case $entropy_bytes in
-        '' | *[!0-9]*) entropy_bytes= ;;
+    case $entropy_wire in
+        *[!A-Za-z0-9+/=]*) return 1 ;;
     esac
-    if [ -n "$entropy_bytes" ] && [ "$entropy_bytes" -ne 32 ]; then
-        return 1
-    fi
-    return 0
+    [ "${#entropy_wire}" -eq 44 ] || return 1
+    [ "${entropy_wire%=}" != "$entropy_wire" ] || return 1
+    [ "${entropy_wire%==}" = "$entropy_wire" ] || return 1
+    printf '%s' "$entropy_wire"
 }
 
 root_toml_selection() {
@@ -4282,11 +4271,11 @@ main() {
     trap 'unpin_declared_configs; rm -rf "$work" "$spec_dir"' EXIT
     trap 'exit 70' INT TERM HUP
     RUN_KEY=
-    if read_entropy "$work/run.entropy"; then
-        RUN_KEY=$(sha256sum <"$work/run.entropy" 2>/dev/null)
+    run_entropy_wire=$(read_entropy 2>/dev/null) || run_entropy_wire=
+    if [ -n "$run_entropy_wire" ]; then
+        RUN_KEY=$(printf '%s' "$run_entropy_wire" | base64 -d 2>/dev/null | sha256sum 2>/dev/null)
         RUN_KEY=${RUN_KEY%% *}
     fi
-    rm -f "$work/run.entropy" 2>/dev/null || :
     case $RUN_KEY in
         '' | *[!0-9a-f]*) RUN_KEY= ;;
     esac

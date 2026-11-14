@@ -4889,6 +4889,32 @@ case $(cat "$t/err") in
 esac
 finish_case
 
+mk run_key_material_is_never_written_to_a_named_file
+real_head_entropy=$(command -v head) || exit 70
+cat >"$t/bin/head" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*)
+        if [ -f /dev/fd/1 ]; then
+            echo named-entropy-file >"$t/entropy.named"
+            exit 1
+        fi
+        ;;
+esac
+exec "$real_head_entropy" "\$@"
+EOF
+chmod +x "$t/bin/head"
+state 'exited 1 0'
+record "$R_OK1"
+begin run_key_material_is_never_written_to_a_named_file sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment PASS 'via record'
+if [ -f "$t/entropy.named" ]; then
+    problems="$problems run-entropy-materialized-in-a-named-file"
+fi
+finish_case
+
 mk pin_write_failure_restores_the_original_mode
 real_python3_probe=$(command -v python3) || exit 70
 cat >"$t/bin/python3" <<EOF
