@@ -96,9 +96,22 @@ exit 99
 EOF
 chmod +x "$scratch/stub-curl"
 
+EGRESS_ONLY=${1-}
+skip_case=0
+
 mk() {
     t=$scratch/$1
     rm -rf "$t"
+    if [ -n "$EGRESS_ONLY" ] && [ "$1" != "$EGRESS_ONLY" ]; then
+        skip_case=1
+        mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox/project" "$t/tmp" "$t/sandbox/.codex"
+        : >"$t/table"
+        : >"$t/curl.log"
+        PROVIDER=https://chatgpt.com/backend-api/models
+        pathvar=$t/bad-bin:$t/bin:$scratch/tools
+        return 0
+    fi
+    skip_case=0
     mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox/project" "$t/tmp"
     mkdir -p "$t/sandbox/.codex"
     printf '%s\n' 'model = "gpt-6.1-sol"' 'model_provider = "codex"' '' '[model_providers.codex]' 'name = "codex"' 'base_url = "https://chatgpt.com/backend-api/models"' >"$t/sandbox/.codex/config.toml"
@@ -610,6 +623,7 @@ bounded() {
 }
 
 execute() {
+    [ "$skip_case" -eq 0 ] || return 0
     step=$1
     engine=${2-}
     shift 2
@@ -682,6 +696,7 @@ execute() {
 }
 
 begin() {
+    [ "$skip_case" -eq 0 ] || return 0
     total=$((total + 1))
     name=$1
     shift
@@ -698,6 +713,7 @@ begin() {
 }
 
 begin_without_probe_env() {
+    [ "$skip_case" -eq 0 ] || return 0
     rm "$scratch/tools/env"
     begin "$@"
     result=$?
@@ -726,6 +742,7 @@ fact() {
 }
 
 finish_case() {
+    [ "$skip_case" -eq 0 ] || return 0
     if LC_ALL=C grep -q '[[:cntrl:]]' "$t/out"; then
         problems="$problems control-byte-in-report"
     fi

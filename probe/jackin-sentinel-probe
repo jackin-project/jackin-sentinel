@@ -30,7 +30,9 @@ EXPECTED_PROVIDER=
 EXPECTED_MODEL=
 PIN_MODES=
 PIN_STATS=
+PIN_HOME_DIRS=
 stage_config_stat=
+stage_config_path=
 EXPECTED_AGENT=
 ADAPTER=
 AUTH_REQUIRED=present
@@ -680,16 +682,19 @@ agent_tool_evidence() {
         done <<EOF
 $TOOL_ARGV
 EOF
-        if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ]; then
+        if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ] && declared_configs_stat_unchanged; then
             (
                 ulimit -f 128
                 cd "$PROJECT" || exit 1
                 sanitize_launch_environment || exit 1
-                CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
+                HOME="$work/agent-home" CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
             )
             tool_exit=$?
         else
             tool_exit=126
+            if [ "$configs_pinned" = true ] && ! declared_configs_stat_unchanged; then
+                : >"$work/config-gate.refused"
+            fi
         fi
         if [ "$configs_pinned" = true ]; then
             declared_configs_stat_unchanged || configs_stat_ok=false
@@ -728,11 +733,11 @@ EOF
 $TOOL_OBSERVATION
 EOF
     fi
+    if [ -n "$stage_config_stat" ] || { [ -n "${stage_config_path-}" ] && [ -e "$stage_config_path" ]; }; then
+        stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "${stage_config_path-}" 2>/dev/null) || stage_stat_now=
+        [ -n "$stage_config_stat" ] && [ "$stage_stat_now" = "$stage_config_stat" ] || sandbox_conflict=true
+    fi
     if [ "$EXPECTED_AGENT" = codex ]; then
-        if [ -n "$stage_config_stat" ] || [ -e "$work/agent-home/config.toml" ]; then
-            stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$work/agent-home/config.toml" 2>/dev/null) || stage_stat_now=
-            [ -n "$stage_config_stat" ] && [ "$stage_stat_now" = "$stage_config_stat" ] || sandbox_conflict=true
-        fi
         if [ "$configs_pinned" != true ]; then
             actual_endpoint=
             sandbox_conflict=true
@@ -1316,7 +1321,6 @@ pin_declared_configs_run() {
         [ -n "$_jks_vcfg_sel" ] || return 1
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
-freeze_parent = len(sys.argv) > 2 and sys.argv[2] == "codex"
 data = sys.stdin.buffer.read()
 parent, name = os.path.split(path)
 if not name:
@@ -1379,9 +1383,8 @@ try:
     finally:
         os.close(writer)
     written = True
-    if freeze_parent:
-        os.fchmod(dirfd, dir_mode & ~0o222)
-        frozen = True
+    os.fchmod(dirfd, dir_mode & ~0o222)
+    frozen = True
     sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
     sys.stdout.write("%o %d %d\n" % (dir_mode, dirst.st_dev, dirst.st_ino))
     raise SystemExit(0)
@@ -1395,10 +1398,12 @@ except SystemExit as ex:
                     if truncated:
                         fixer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
                         try:
-                            os.ftruncate(fixer, 0)
-                            view = memoryview(data)
-                            while view:
-                                view = view[os.write(fixer, view):]
+                            swapped = os.fstat(fixer)
+                            if (swapped.st_dev, swapped.st_ino) == (named.st_dev, named.st_ino):
+                                os.ftruncate(fixer, 0)
+                                view = memoryview(data)
+                                while view:
+                                    view = view[os.write(fixer, view):]
                         finally:
                             os.close(fixer)
                     os.fchmod(restorer, mode)
@@ -1417,10 +1422,12 @@ except BaseException:
                     if truncated:
                         fixer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
                         try:
-                            os.ftruncate(fixer, 0)
-                            view = memoryview(data)
-                            while view:
-                                view = view[os.write(fixer, view):]
+                            swapped = os.fstat(fixer)
+                            if (swapped.st_dev, swapped.st_ino) == (named.st_dev, named.st_ino):
+                                os.ftruncate(fixer, 0)
+                                view = memoryview(data)
+                                while view:
+                                    view = view[os.write(fixer, view):]
                         finally:
                             os.close(fixer)
                     os.fchmod(restorer, mode)
@@ -1436,7 +1443,7 @@ finally:
         except OSError:
             pass
     os.close(dirfd)
-' "$declared_path" "$EXPECTED_AGENT" 2>/dev/null)
+' "$declared_path" 2>/dev/null)
         declared_rc=$?
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
@@ -1481,6 +1488,7 @@ finally:
 }
 
 unpin_declared_configs() {
+    unseal_agent_home
     [ -n "${PIN_MODES-}" ] || return 0
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 0
     declared_index=0
@@ -1520,15 +1528,6 @@ except OSError:
     raise SystemExit(0)
 try:
     try:
-        dirst = os.fstat(dirfd)
-        if len(dirfields) < 3:
-            raise OSError
-        if (dirst.st_dev, dirst.st_ino) != (int(dirfields[1]), int(dirfields[2])):
-            raise OSError
-        os.fchmod(dirfd, int(dirfields[0], 8))
-    except OSError:
-        pass
-    try:
         named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
     except OSError:
         raise SystemExit(0)
@@ -1544,6 +1543,15 @@ try:
             raise SystemExit(0)
         if (opened.st_dev, opened.st_ino) != (want_dev, want_ino):
             raise SystemExit(0)
+        try:
+            dirst = os.fstat(dirfd)
+            if len(dirfields) < 3:
+                raise OSError
+            if (dirst.st_dev, dirst.st_ino) != (int(dirfields[1]), int(dirfields[2])):
+                raise OSError
+            os.fchmod(dirfd, int(dirfields[0], 8))
+        except OSError:
+            pass
         os.fchmod(handle, mode)
     finally:
         os.close(handle)
@@ -1694,8 +1702,37 @@ EOF_JKS_EXPECTED_MODEL
     [ -s "$stage_target" ] || return 1
 }
 
+unseal_agent_home() {
+    [ -n "${PIN_HOME_DIRS-}" ] || return 0
+    while read -r home_dir home_mode home_dev home_ino; do
+        [ -n "$home_dir" ] || continue
+        python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+mode = int(sys.argv[2], 8)
+want_dev = int(sys.argv[3])
+want_ino = int(sys.argv[4])
+try:
+    handle = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(0)
+try:
+    current = os.fstat(handle)
+    if (current.st_dev, current.st_ino) != (want_dev, want_ino):
+        raise SystemExit(0)
+    os.fchmod(handle, mode)
+finally:
+    os.close(handle)
+' "$home_dir" "$home_mode" "$home_dev" "$home_ino" 2>/dev/null || true
+    done <<EOF_JKS_HOME_DIRS
+${PIN_HOME_DIRS}
+EOF_JKS_HOME_DIRS
+    PIN_HOME_DIRS=
+    return 0
+}
+
 stage_agent_home() {
     stage_dir=$work/agent-home
+    unseal_agent_home
     rm -rf "$stage_dir" 2>/dev/null || return 1
     mkdir -p "$stage_dir" 2>/dev/null || return 1
     if [ -e "$AUTH_FILE" ] || [ -L "$AUTH_FILE" ]; then
@@ -1708,10 +1745,51 @@ stage_agent_home() {
     fi
     stage_provider_config "$stage_dir/config.toml" || return 1
     stage_config_stat=
+    stage_config_path=
     if [ -f "$stage_dir/config.toml" ]; then
-        chmod 0444 "$stage_dir/config.toml" 2>/dev/null || return 1
-        stage_config_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_dir/config.toml" 2>/dev/null) || return 1
+        stage_config_path=$stage_dir/config.toml
+    else
+        stage_declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+        stage_declared_index=0
+        while [ "$stage_declared_index" -lt "$stage_declared_count" ]; do
+            stage_declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$stage_declared_index" '.behavior.credential.config_files[$i].path') || return 1
+            case $stage_declared_index in
+                0) stage_snapshot=${_jks_vcfg_0-} ;;
+                1) stage_snapshot=${_jks_vcfg_1-} ;;
+                *) return 1 ;;
+            esac
+            [ -n "$stage_snapshot" ] || return 1
+            stage_rel=${stage_declared_path#"$SCAN_ROOT"/}
+            [ -n "$stage_rel" ] && [ "$stage_rel" != "$stage_declared_path" ] || return 1
+            stage_parent=${stage_rel%/*}
+            [ -n "$stage_parent" ] && [ "$stage_parent" != "$stage_rel" ] || return 1
+            mkdir -p "$stage_dir/$stage_parent" 2>/dev/null || return 1
+            printf '%s' "$stage_snapshot" >"$stage_dir/$stage_rel" 2>/dev/null || return 1
+            if [ -z "$stage_config_path" ]; then
+                stage_config_path=$stage_dir/$stage_rel
+            fi
+            stage_declared_index=$((stage_declared_index + 1))
+        done
     fi
+    if [ -n "$stage_config_path" ]; then
+        chmod 0444 "$stage_config_path" 2>/dev/null || return 1
+        stage_config_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_config_path" 2>/dev/null) || return 1
+    fi
+    PIN_HOME_DIRS=$(python3 -I -c 'import os, stat, sys
+root = sys.argv[1]
+lines = []
+for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+    handle = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        current = os.fstat(handle)
+        mode = stat.S_IMODE(current.st_mode)
+        os.fchmod(handle, mode & ~0o222)
+        lines.append("%s %o %d %d" % (dirpath, mode, current.st_dev, current.st_ino))
+    finally:
+        os.close(handle)
+if lines:
+    sys.stdout.write("\n".join(lines) + "\n")
+' "$stage_dir" 2>/dev/null) || return 1
     return 0
 }
 
@@ -1847,7 +1925,7 @@ EOF
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
     fi
-    if [ "${prompt_configs_validated-}" != true ] || [ "${prompt_configs_pinned-}" != true ] || [ "${declared_effective-}" != "$PROVIDER_URL" ]; then
+    if [ "${prompt_configs_validated-}" != true ] || [ "${prompt_configs_pinned-}" != true ] || [ "${declared_effective-}" != "$PROVIDER_URL" ] || ! declared_configs_stat_unchanged; then
         config_gate_refused=1
         launch_kind=none
         why="codex exec was not run: the declared configuration was not validated and pinned"
@@ -1857,6 +1935,7 @@ EOF
         why="codex exec was not run: the probe could not build a sanitized environment for the launch"
     fi
     if [ "$launch_kind" = none ] && [ "${prompt_configs_pinned-}" != true ]; then
+        unseal_agent_home
         rm -rf "$work/agent-home" 2>/dev/null
     fi
     printf '%s' "$why" >"$work/agent_exec.why"
@@ -1883,7 +1962,7 @@ EOF
             exec 3>&1 || exit 1
             (
                 _jks_stdout_producer_status=0
-                if (cd "$SCAN_ROOT" && sanitize_launch_environment && CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
+                if (cd "$SCAN_ROOT" && sanitize_launch_environment && HOME="$work/agent-home" CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
                     :
                 else
                     _jks_stdout_producer_status=$?
@@ -2126,6 +2205,9 @@ EOF
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
     unset _jks_stdout_parsed_answer _jks_stdout_extra
     evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","actual_endpoint":"","sandbox_endpoint":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
+    if [ -f "$work/config-gate.refused" ]; then
+        config_gate_refused=1
+    fi
     _jks_agent_exec_doc=$(jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" --argjson evidence "$evidence" \
         --argjson config_refused "$((${config_gate_refused:-0} + 0))" \
