@@ -9,6 +9,7 @@ scratch=$(mktemp -d) || exit 70
 trap 'rm -rf "$scratch"' EXIT
 failures=0
 total=0
+case_bound=20
 fixture_spec=
 fixture_comm=
 fixture_fingerprint=
@@ -539,7 +540,7 @@ begin() {
         sed -f "$t/seams.sed" "$t/probe.impl" >"$t/probe.seamed" && mv "$t/probe.seamed" "$t/probe.impl"
         chmod +x "$t/probe.impl"
     fi
-    bounded 20 env -i PATH="$t/bin:$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$@"
+    bounded "$case_bound" env -i PATH="$t/bin:$scratch/shim:$scratch/tools" TMPDIR="$t/tmp" "$@"
     rc=$?
     cp "$scratch/bounded.out" "$t/out"
     cp "$scratch/bounded.err" "$t/err"
@@ -4838,6 +4839,561 @@ finish_case
 fixture_spec=
 fixture_comm=
 fixture_fingerprint=
+
+launch_env_record() {
+    state 'exited 1 0'
+    record "$R_OK1"
+}
+
+launch_env_series() {
+    path=$1
+    first=$2
+    count=$3
+    physical_line_bytes=$4
+    python3 - "$path" "$first" "$count" "$physical_line_bytes" <<'PY'
+import sys
+
+path, first, count, physical_line_bytes = sys.argv[1:]
+first = int(first)
+count = int(count)
+physical_line_bytes = int(physical_line_bytes)
+line_bytes = physical_line_bytes - 1
+with open(path, "wb") as output:
+    for index in range(first, first + count):
+        name = f"TOKEN_{index:03d}"
+        prefix = f"export {name}='"
+        placeholder_prefix = "openshell:resolve:env:"
+        value_size = line_bytes - len(prefix) - 1
+        if value_size < len(placeholder_prefix):
+            raise SystemExit(2)
+        value = placeholder_prefix + "X" * (value_size - len(placeholder_prefix))
+        line = prefix + value + "'"
+        if len(line) != line_bytes:
+            raise SystemExit(3)
+        output.write(line.encode() + b"\n")
+PY
+}
+
+launch_env_small_files() {
+    directory=$1
+    count=$2
+    python3 - "$directory" "$count" <<'PY'
+import os
+import sys
+
+directory, count = sys.argv[1:]
+count = int(count)
+for index in range(count):
+    name = f"TOKEN_{index:03d}"
+    path = os.path.join(directory, f"env-{index:03d}")
+    with open(path, "wb") as output:
+        output.write(f"export {name}='openshell:resolve:env:{name}'\n".encode())
+PY
+}
+
+mk j08_launch_environment_exact_file_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 8 131072
+report j08_launch_environment_exact_file_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 8
+finish_case
+
+mk j08_launch_environment_over_file_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 8 131072
+printf '%s\n' "export TOKEN_008='openshell:resolve:env:TOKEN_008'" >>"$t/sandbox/.jackin/env-000"
+report j08_launch_environment_over_file_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+case_bound=120
+mk j08_launch_environment_exact_aggregate_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8 131072
+done
+report j08_launch_environment_exact_aggregate_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 64
+finish_case
+case_bound=20
+
+case_bound=120
+mk j08_launch_environment_over_aggregate_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8 131072
+done
+printf '%s\n' "export TOKEN_064='openshell:resolve:env:TOKEN_064'" >"$t/sandbox/.jackin/env-008"
+report j08_launch_environment_over_aggregate_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+case_bound=20
+
+mk j08_launch_environment_exact_line_limit_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 1 131073
+report j08_launch_environment_exact_line_limit_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 1
+finish_case
+
+mk j08_launch_environment_over_line_limit_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 1 131074
+report j08_launch_environment_over_line_limit_is_rejected
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+case_bound=120
+for count in 128 129; do
+    case_name=j08_launch_environment_${count}_files
+    mk "$case_name"
+    launch_env_record
+    mkdir -p "$t/sandbox/.jackin"
+    launch_env_small_files "$t/sandbox/.jackin" "$count"
+    report "$case_name"
+    if [ "$count" -eq 128 ]; then
+        expect environment PASS 'every credential variable is a placeholder'
+        fact '.environment | map(select(.source == "launch_env")) | length' 128
+    else
+        expect environment FAIL 'exceed bounded limits'
+    fi
+    finish_case
+done
+case_bound=20
+
+mk j08_launch_environment_counts_every_matched_input
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+target=$t/launch-target
+printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$target"
+index=0
+while [ "$index" -lt 128 ]; do
+    ln -s "$target" "$t/sandbox/.jackin/env-$(printf '%03d' "$index")"
+    index=$((index + 1))
+done
+printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$t/sandbox/.jackin/env-128"
+report j08_launch_environment_counts_every_matched_input
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+mk j08_launch_environment_malformed_file_cannot_be_hidden_by_a_placeholder
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$t/sandbox/.jackin/env-000"
+printf '%s\n' 'malformed' >"$t/sandbox/.jackin/env-001"
+report j08_launch_environment_malformed_file_cannot_be_hidden_by_a_placeholder
+expect environment FAIL 'exceed bounded limits'
+finish_case
+
+for kind in symlink_regular symlink_fifo direct_fifo; do
+    case_name=j08_launch_environment_${kind}_is_rejected
+    mk "$case_name"
+    launch_env_record
+    mkdir -p "$t/sandbox/.jackin"
+    target=$t/launch-target
+    case $kind in
+        symlink_regular)
+            printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$target"
+            ln -s "$target" "$t/sandbox/.jackin/env-000"
+            ;;
+        symlink_fifo)
+            mkfifo "$target"
+            ln -s "$target" "$t/sandbox/.jackin/env-000"
+            ;;
+        direct_fifo)
+            mkfifo "$t/sandbox/.jackin/env-000"
+            ;;
+    esac
+    report "$case_name"
+    expect environment FAIL 'exceed bounded limits'
+    fact '.environment | map(select(.source == "launch_env")) | length' 0
+    case $kind in
+        symlink_regular)
+            [ "$(cat "$target")" = "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" ] || problems="$problems launch-target-changed"
+            [ "$(readlink "$t/sandbox/.jackin/env-000")" = "$target" ] || problems="$problems launch-symlink-changed"
+            ;;
+        symlink_fifo)
+            [ -p "$target" ] || problems="$problems launch-target-fifo-changed"
+            [ "$(readlink "$t/sandbox/.jackin/env-000")" = "$target" ] || problems="$problems launch-symlink-changed"
+            ;;
+        direct_fifo) [ -p "$t/sandbox/.jackin/env-000" ] || problems="$problems launch-fifo-changed" ;;
+    esac
+    finish_case
+done
+
+case_bound=120
+mk j08_launch_environment_empty_file_at_exact_aggregate_is_accepted
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8 131072
+done
+: >"$t/sandbox/.jackin/env-008"
+report j08_launch_environment_empty_file_at_exact_aggregate_is_accepted
+expect environment PASS 'every credential variable is a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 64
+finish_case
+case_bound=20
+
+case_bound=120
+mk j08_launch_environment_rejected_reads_consume_the_aggregate_budget
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+launch_env_series "$t/sandbox/.jackin/env-000" 0 8 131072
+printf '%s\n' "export TOKEN_065='openshell:resolve:env:TOKEN_065'" >>"$t/sandbox/.jackin/env-000"
+for index in 1 2 3 4 5 6 7; do
+    launch_env_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8 131072
+done
+printf '%s\n' "export TOKEN_064='openshell:resolve:env:TOKEN_064'" >"$t/sandbox/.jackin/env-008"
+report j08_launch_environment_rejected_reads_consume_the_aggregate_budget
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 56
+finish_case
+case_bound=20
+
+mk j08_launch_environment_nul_byte_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%b' "export TOKEN_000='x\0y'\n" >"$t/sandbox/.jackin/env-000"
+report j08_launch_environment_nul_byte_is_rejected
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+mk j08_launch_environment_duplicate_name_is_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export TOKEN_000='openshell:resolve:env:TOKEN_000'" "export TOKEN_000='openshell:resolve:env:TOKEN_000'" >"$t/sandbox/.jackin/env-000"
+report j08_launch_environment_duplicate_name_is_rejected
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+mk j08_launch_environment_out_of_order_names_are_rejected
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export TOKEN_001='openshell:resolve:env:TOKEN_001'" "export TOKEN_000='openshell:resolve:env:TOKEN_000'" >"$t/sandbox/.jackin/env-000"
+report j08_launch_environment_out_of_order_names_are_rejected
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+mk j08_launch_environment_classification_failure_is_propagated
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export OPENAI_API_KEY='openshell:resolve:env:OPENAI_API_KEY'" >"$t/sandbox/.jackin/env-000"
+real_jq=$(command -v jq) || real_jq=$scratch/tools/jq
+cat >"$t/bin/jq" <<EOF
+#!/bin/sh
+for argument; do
+    if [ "\$argument" = launch_env ]; then
+        echo 'jq: simulated launch_env classification failure' >&2
+        exit 9
+    fi
+done
+exec "$real_jq" "\$@"
+EOF
+chmod +x "$t/bin/jq"
+report j08_launch_environment_classification_failure_is_propagated
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+launch_env_escaped_series() {
+    path=$1
+    first=$2
+    count=$3
+    python3 - "$path" "$first" "$count" <<'PY'
+import sys
+
+path, first, count = sys.argv[1:]
+first = int(first)
+count = int(count)
+with open(path, "wb") as output:
+    for index in range(first, first + count):
+        name = f"TOKEN_{index:03d}"
+        line = "export " + name + "='a" + "'\\''a" * 26210 + "b'"
+        if len(line) != 131071:
+            raise SystemExit(2)
+        output.write(line.encode() + b"\n")
+PY
+}
+
+case_bound=20
+mk j08_launch_environment_large_escaped_value_parses_within_bound
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+for index in 0 1 2 3 4 5 6 7; do
+    launch_env_escaped_series "$t/sandbox/.jackin/env-00$index" $((index * 8)) 8
+done
+report j08_launch_environment_large_escaped_value_parses_within_bound
+expect launch_env PASS '8 launch environment file(s) read'
+expect environment FAIL 'not a placeholder'
+fact '.environment | map(select(.source == "launch_env")) | length' 64
+finish_case
+
+j07_launcher_agent_exec_fixtures() {
+    auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+    {
+        printf 'model = "gpt-6.1-sol"\n'
+        printf 'model_provider = "codex"\n'
+        printf '\n'
+        printf '[model_providers.codex]\n'
+        printf 'name = "codex"\n'
+        printf 'base_url = "http://127.0.0.1:9/v1"\n'
+    } >"$t/sandbox/.codex/config.toml"
+    cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+    chmod +x "$t/bin/codex"
+}
+
+mk j07_launcher_identity_accepts_a_shebang_interpreter_argument
+state 'running 1'
+printf '#!/bin/sh -e\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0%s\0' /bin/sh -e "$t/bin/jackin-start" >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
+ln -s "$resolved_sh" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+real_awk=$(command -v awk) || real_awk=$scratch/tools/awk
+cat >"$t/bin/awk" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$t/awk.argv"
+exec "$real_awk" "\$@"
+EOF
+chmod +x "$t/bin/awk"
+begin j07_launcher_identity_accepts_a_shebang_interpreter_argument sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+fact '.launcher_identity.interpreter' '/bin/sh'
+fact '.launcher_identity.interpreter_arg' '-e'
+fact '.launcher_identity.exe_matches_interpreter' 'true'
+fact '.launcher_identity.argv0_matches' 'true'
+fact '.launcher_identity.argv1_matches' 'true'
+fact '.launcher_identity.argv2_matches' 'true'
+fact '.launcher_identity.stat_pre' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+fact '.launcher_identity.stat_before' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+case $(jq -r '.steps[].facts | .launcher_identity.stat_after | length > 0' "$t/out" 2>/dev/null) in
+    true) ;;
+    *) problems="$problems launcher-stat-after-missing" ;;
+esac
+for secret in "$t/bin/jackin-start" /bin/sh; do
+    secret_hex=$(printf '%s' "$secret" | od -An -v -tx1 | tr -d '[:space:]')
+    if grep -Fq "$secret_hex" "$t/awk.argv" 2>/dev/null; then
+        problems="$problems expected-hex-in-helper-argv"
+    fi
+    if grep -Fq "$secret" "$t/awk.argv" 2>/dev/null; then
+        problems="$problems expected-raw-in-helper-argv"
+    fi
+done
+finish_case
+
+mk j07_launcher_identity_binds_the_interpreter_to_the_running_executable
+state 'running 1'
+printf '#!/bin/sh\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0' "$t/bin/jackin-start" codex >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+ln -s "$t/bin/jackin-start" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+begin j07_launcher_identity_binds_the_interpreter_to_the_running_executable sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+fact '.launcher_identity' null
+finish_case
+
+mk j07_launcher_stat_snapshots_are_raw_stat_lines
+state 'running 1'
+printf '#!/bin/sh -e\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0%s\0' /bin/sh -e "$t/bin/jackin-start" >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
+ln -s "$resolved_sh" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+begin j07_launcher_stat_snapshots_are_raw_stat_lines sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+for snapshot_field in stat_pre stat_before stat_after; do
+    snapshot=$(jq -r ".steps[].facts | .launcher_identity.$snapshot_field" "$t/out" 2>/dev/null)
+    case $snapshot in
+        '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0') ;;
+        *) problems="$problems launcher-$snapshot_field-not-raw-stat" ;;
+    esac
+    snapshot_pid=$(printf '%s\n' "$snapshot" | sed 's/^\([0-9][0-9]*\) .*/\1/')
+    snapshot_ticks=$(printf '%s\n' "$snapshot" | sed 's/^.*) //' | awk '{print $20}')
+    case $snapshot_pid in
+        100) ;;
+        *) problems="$problems launcher-$snapshot_field-pid-unrecoverable" ;;
+    esac
+    case $snapshot_ticks in
+        100) ;;
+        *) problems="$problems launcher-$snapshot_field-field22-unrecoverable" ;;
+    esac
+done
+finish_case
+
+mk j07_launcher_identity_rejects_a_failed_pre_launch_capture
+state 'running 1'
+printf '#!/bin/sh -e\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0%s\0' /bin/sh -e "$t/bin/jackin-start" >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
+ln -s "$resolved_sh" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+real_readlink=$(command -v readlink) || exit 70
+cat >"$t/bin/readlink" <<EOF
+#!/bin/sh
+count=\$(cat "$t/readlink.count" 2>/dev/null)
+case \$count in
+    '' | *[!0-9]*) count=0 ;;
+esac
+if [ "\$#" -eq 1 ] && [ "\$1" = "$t/proc/100/exe" ]; then
+    count=\$((count + 1))
+    printf '%s\n' "\$count" >"$t/readlink.count"
+    [ "\$count" -ne 2 ] || exit 1
+fi
+exec "$real_readlink" "\$@"
+EOF
+chmod +x "$t/bin/readlink"
+begin j07_launcher_identity_rejects_a_failed_pre_launch_capture sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+expect main_process PASS 'verified as'
+fact '.launcher_identity' null
+fact '.launcher_identity.stable' null
+fact '.launcher_identity.stat_pre' null
+finish_case
+
+mk j07_launcher_identity_stability_uses_the_identity_fields
+state 'running 1'
+printf '#!/bin/sh -e\nexit 0\n' >"$t/bin/jackin-start"
+chmod +x "$t/bin/jackin-start"
+seam START_BIN "$t/bin/jackin-start"
+mkdir -p "$t/proc/100"
+printf '%s\0%s\0%s\0' /bin/sh -e "$t/bin/jackin-start" >"$t/proc/100/cmdline"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat"
+printf '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat.before"
+printf '100 (jackin-start) R 1 100 100 0 -1 0 0 0 0 7 3 0 0 0 20 0 1 0 100 0 0\n' >"$t/proc/100/stat.after"
+resolved_sh=$("$real_python3" -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' /bin/sh) || exit 70
+ln -s "$resolved_sh" "$t/proc/100/exe"
+proc_uid_status 100
+proc_codex
+j07_launcher_agent_exec_fixtures
+real_sed=$(command -v sed) || real_sed=$scratch/tools/sed
+cat >"$t/bin/sed" <<EOF
+#!/bin/sh
+if [ "\$1" = "-n" ] && [ "\$2" = "1p" ] && [ "\$3" = "$t/proc/100/stat" ]; then
+    reads=\$(cat "$t/stat.reads" 2>/dev/null)
+    case \$reads in
+        '' | *[!0-9]*) reads=0 ;;
+    esac
+    reads=\$((reads + 1))
+    printf '%s\n' "\$reads" >"$t/stat.reads"
+    if [ "\$reads" -le 2 ]; then
+        cat "$t/proc/100/stat.before"
+    else
+        cat "$t/proc/100/stat.after"
+    fi
+    exit 0
+fi
+exec "$real_sed" "\$@"
+EOF
+chmod +x "$t/bin/sed"
+begin j07_launcher_identity_stability_uses_the_identity_fields sh "$t/probe" --only J07
+expect_rc 0
+expect_report J07 sandbox
+fact '.launcher_identity.interpreter' '/bin/sh'
+fact '.launcher_identity.stable' 'true'
+fact '.launcher_identity.stat_pre' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+fact '.launcher_identity.stat_before' '100 (jackin-start) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0'
+fact '.launcher_identity.stat_after' '100 (jackin-start) R 1 100 100 0 -1 0 0 0 0 7 3 0 0 0 20 0 1 0 100 0 0'
+finish_case
+
+mk j08_launch_environment_nul_scan_failure_is_propagated
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export SENTINEL_NUL_SCAN_TRAP_TOKEN_000='openshell:resolve:env:TOKEN_000'" >"$t/sandbox/.jackin/env-000"
+real_tr=$(command -v tr) || real_tr=$scratch/tools/tr
+cat >"$t/bin/tr" <<EOF
+#!/bin/sh
+captured=\${TMPDIR:-/tmp}/sentinel-tr.\$\$
+cat >"\$captured"
+if grep -q 'SENTINEL_NUL_SCAN_TRAP' "\$captured" 2>/dev/null; then
+    rm -f "\$captured"
+    echo 'tr: simulated read failure' >&2
+    exit 1
+fi
+exec "$real_tr" "\$@" <"\$captured"
+EOF
+chmod +x "$t/bin/tr"
+report j08_launch_environment_nul_scan_failure_is_propagated
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
+
+mk j08_launch_environment_classification_read_failure_is_propagated
+launch_env_record
+mkdir -p "$t/sandbox/.jackin"
+printf '%s\n' "export TOKEN_000='openshell:resolve:env:TOKEN_000'" >"$t/sandbox/.jackin/env-000"
+real_cat=$(command -v cat) || real_cat=$scratch/tools/cat
+cat >"$t/bin/cat" <<EOF
+#!/bin/sh
+for argument; do
+    case \$argument in
+        *launch-env-classes*)
+            echo 'cat: simulated read failure' >&2
+            exit 1
+            ;;
+    esac
+done
+exec "$real_cat" "\$@"
+EOF
+chmod +x "$t/bin/cat"
+report j08_launch_environment_classification_read_failure_is_propagated
+expect environment FAIL 'exceed bounded limits'
+fact '.environment | map(select(.source == "launch_env")) | length' 0
+finish_case
 
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

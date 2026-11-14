@@ -47,6 +47,10 @@ AGENT_HOME_MAX_BYTES=1048576
 SCAN_GREP_SECONDS=20
 LOG_BYTE_CAP=1048576
 LOG_READ_SECONDS=10
+LAUNCH_ENV_MAX_LINE_BYTES=131072
+LAUNCH_ENV_MAX_FILES=128
+LAUNCH_ENV_TOTAL_MAX_BYTES=8388608
+LAUNCH_ENV_PARSE_SECONDS=20
 PROJECT_FILE_MAX_BYTES=67108864
 PROJECT_TOTAL_MAX_BYTES=536870912
 PROJECT_HASH_SECONDS=300
@@ -210,11 +214,13 @@ bounded_read() {
     bounded_target=$2
     bounded_cap=$3
     bounded_seconds=$4
+    bounded_bytes=
     rm -f "$bounded_target"
-    if ! timeout "$bounded_seconds" sh "$work/bounded-copy.sh" "$bounded_source" "$bounded_target" "$bounded_cap" "$work/bounded.err" >/dev/null 2>&1; then
+    bounded_bytes=$(timeout "$bounded_seconds" sh "$work/bounded-copy.sh" "$bounded_source" "$bounded_target" "$bounded_cap" "$work/bounded.err" 2>/dev/null) || {
+        bounded_bytes=
         rm -f "$bounded_target"
         return 1
-    fi
+    }
     return 0
 }
 
@@ -393,12 +399,158 @@ proc_stat() {
     echo "$stat_line"
 }
 
+proc_stat_raw() {
+    [ -r "/proc/$1/stat" ] || return 1
+    stat_raw_line=$(sed -n 1p "/proc/$1/stat" 2>/dev/null)
+    [ -n "$stat_raw_line" ] || return 1
+    echo "$stat_raw_line"
+}
+
+stat_start_ticks() {
+    [ -n "${1-}" ] || return 1
+    stat_ticks=$(printf '%s\n' "$1" | sed 's/^.*) //' | awk '{print $20}')
+    [ -n "$stat_ticks" ] || return 1
+    echo "$stat_ticks"
+}
+
+stat_identity_key() {
+    [ -n "${1-}" ] || return 1
+    stat_key_pid=${1%% *}
+    case $stat_key_pid in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    stat_key_comm=$(printf '%s\n' "$1" | sed -n 's/^[0-9][0-9]* (\(.*\)) [^)]*$/\1/p')
+    [ -n "$stat_key_comm" ] || return 1
+    stat_key_ticks=$(stat_start_ticks "$1") || return 1
+    printf '%s %s %s\n' "$stat_key_pid" "$stat_key_comm" "$stat_key_ticks"
+}
+
 proc_arg() {
     { tr '\0' '\n' <"/proc/$1/cmdline"; } 2>/dev/null | sed -n "$2p" | cut -c1-200
 }
 
 proc_uid() {
     sed -n 's/^Uid:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "/proc/$1/status" 2>/dev/null
+}
+
+proc_argv_matches() {
+    [ "$#" -eq 3 ] || return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
+    expected=$(printf '%s' "$3" | od -An -v -tx1 | tr -d '[:space:]')
+    [ -n "$expected" ] || return 1
+    head -c 4097 "/proc/$1/cmdline" 2>/dev/null | od -An -v -tx1 |
+        LC_ALL=C awk -v wanted_slot="$2" '
+            BEGIN {
+                if ((getline expected < "/dev/fd/3") <= 0) exit 1
+                close("/dev/fd/3")
+            }
+            {
+                for (i = 1; i <= NF; i++) {
+                    byte = tolower($i)
+                    if (byte == "00") {
+                        if (slot == wanted_slot) {
+                            terminated = 1
+                            if (byte_count <= 4096 && argument == expected) exit 0
+                            exit 1
+                        }
+                        slot++
+                        argument = ""
+                        byte_count = 0
+                    } else if (slot == wanted_slot) {
+                        argument = argument byte
+                        byte_count++
+                    }
+                }
+            }
+            END { if (!terminated) exit 1 }' 3<<EOF
+$expected
+EOF
+}
+
+start_interpreter_line() {
+    shebang_line=$(head -c 256 "$START_BIN" 2>/dev/null | sed -n 1p) || return 1
+    case $shebang_line in
+        '#!'*) ;;
+        *) return 1 ;;
+    esac
+    shebang_body=${shebang_line#\#!}
+    shebang_interp=$(printf '%s\n' "$shebang_body" | awk '{print $1}')
+    [ -n "$shebang_interp" ] || return 1
+    case $shebang_interp in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    shebang_arg=$(printf '%s\n' "$shebang_body" | awk '{print $2}')
+}
+
+proc_launcher_identity_record() {
+    record_pid=$1
+    record_interpreter=$2
+    record_interpreter_arg=$3
+    record_stat_pre=${4-}
+    record_exe_pre=${5-}
+    record_uid_pre=${6-}
+    record_comm_pre=${7-}
+    [ -n "$record_interpreter" ] || return 1
+    record_resolved=$(physical_path "$record_interpreter") || return 1
+    record_exe=$(readlink "/proc/$record_pid/exe" 2>/dev/null) || return 1
+    case $record_exe in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case $record_exe in
+        *' (deleted)') return 1 ;;
+    esac
+    record_exe_path=$(physical_path "$record_exe") || return 1
+    [ "$record_exe_path" = "$record_resolved" ] || return 1
+    record_uid=$(proc_uid "$record_pid") || record_uid=
+    record_comm=$(proc_comm "$record_pid") || record_comm=
+    record_before=$(proc_stat_raw "$record_pid") || return 1
+    record_before_ticks=$(stat_start_ticks "$record_before") || return 1
+    [ -n "$record_stat_pre" ] || return 1
+    record_pre_ticks=$(stat_start_ticks "$record_stat_pre") || return 1
+    [ "$record_pre_ticks" = "$record_before_ticks" ] || return 1
+    [ -n "$record_exe_pre" ] || return 1
+    [ "$record_exe_pre" = "$record_exe" ] || return 1
+    [ -n "$record_uid_pre" ] || return 1
+    [ "$record_uid_pre" = "$record_uid" ] || return 1
+    [ -n "$record_comm_pre" ] || return 1
+    [ "$record_comm_pre" = "$record_comm" ] || return 1
+    record_argv0=false
+    record_argv1=false
+    record_argv2=null
+    if proc_argv_matches "$record_pid" 0 "$record_interpreter"; then
+        record_argv0=true
+    elif proc_argv_matches "$record_pid" 0 "$START_BIN"; then
+        record_argv0=true
+    fi
+    if [ -n "$record_interpreter_arg" ]; then
+        if proc_argv_matches "$record_pid" 1 "$record_interpreter_arg"; then
+            record_argv1=true
+        fi
+        if proc_argv_matches "$record_pid" 2 "$START_BIN"; then
+            record_argv2=true
+        else
+            record_argv2=false
+        fi
+    elif proc_argv_matches "$record_pid" 1 "$START_BIN"; then
+        record_argv1=true
+    fi
+    record_after=$(proc_stat_raw "$record_pid") || return 1
+    record_stable=false
+    record_before_identity=$(stat_identity_key "$record_before") || return 1
+    record_after_identity=$(stat_identity_key "$record_after") || return 1
+    [ "$record_before_identity" = "$record_after_identity" ] && record_stable=true
+    jq -cn --arg interpreter "$record_interpreter" --arg interpreter_arg "$record_interpreter_arg" \
+        --arg resolved "$record_resolved" \
+        --arg exe "$record_exe" --arg uid "$record_uid" --arg comm "$record_comm" \
+        --arg stat_pre "$record_stat_pre" --arg stat_before "$record_before" --arg stat_after "$record_after" \
+        --argjson argv0 "$record_argv0" --argjson argv1 "$record_argv1" --argjson argv2 "$record_argv2" \
+        --argjson stable "$record_stable" \
+        "$JQN"'{interpreter: $interpreter, interpreter_arg: ($interpreter_arg | n), interpreter_resolved: $resolved,
+          exe: ($exe | n), exe_matches_interpreter: true, uid: ($uid | n), comm: ($comm | n),
+          argv0_matches: $argv0, argv1_matches: $argv1, argv2_matches: ($argv2 | if . == null then null else . end),
+          stable: $stable, stat_pre: ($stat_pre | n), stat_before: ($stat_before | n), stat_after: ($stat_after | n)}'
 }
 
 proc_script_identity() {
@@ -412,14 +564,21 @@ proc_script_identity() {
     script_interp=$(printf '%s\n' "${script_head#\#!}" | awk '{print $1}')
     [ -n "$script_interp" ] || return 1
     script_interp_path=$(physical_path "$script_interp") || return 1
-    [ "$identity_exe" = "$script_interp_path" ] || return 1
+    identity_exe_path=$(physical_path "$identity_exe") || return 1
+    [ "$identity_exe_path" = "$script_interp_path" ] || return 1
     script_interp_arg=$(printf '%s\n' "${script_head#\#!}" | awk '{print $2}')
     if [ -n "$script_interp_arg" ]; then
-        [ "$(proc_arg "$script_pid" 2)" = "$script_interp_arg" ] || return 1
-        [ "$(proc_arg "$script_pid" 3)" = "$START_BIN" ] || return 1
+        proc_argv_matches "$script_pid" 0 "$script_interp" || return 1
+        proc_argv_matches "$script_pid" 1 "$script_interp_arg" || return 1
+        proc_argv_matches "$script_pid" 2 "$START_BIN" || return 1
     else
-        [ "$(proc_arg "$script_pid" 2)" = "$START_BIN" ] || return 1
+        proc_argv_matches "$script_pid" 0 "$script_interp" || return 1
+        proc_argv_matches "$script_pid" 1 "$START_BIN" || return 1
     fi
+    script_stat_before=$(proc_stat "$script_pid") || return 1
+    [ "$(proc_comm "$script_pid")" = "${START_BIN##*/}" ] || return 1
+    script_stat_after=$(proc_stat "$script_pid") || return 1
+    [ "$script_stat_before" = "$script_stat_after" ]
 }
 
 proc_identity() {
@@ -1302,6 +1461,103 @@ credential_variables() {
         | [$name, kind($value), $source] | @tsv'
 }
 
+launch_env_classifications() {
+    launch_source=$1
+    launch_parse_status=$work/launch-env-parse.$$
+    launch_classes=$work/launch-env-classes.$$
+    launch_parsed=$work/launch-env-parsed.$$
+    rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed"
+    launch_nul_bytes=$work/launch-env-nuls.$$
+    rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+    if ! LC_ALL=C tr -cd '\000' <"$launch_source" >"$launch_nul_bytes" 2>/dev/null; then
+        rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+        return 1
+    fi
+    if ! launch_nuls=$(LC_ALL=C wc -c <"$launch_nul_bytes" 2>/dev/null); then
+        rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+        return 1
+    fi
+    if ! launch_nuls=$(printf '%s\n' "$launch_nuls" | LC_ALL=C tr -d '[:space:]' 2>/dev/null); then
+        rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+        return 1
+    fi
+    case $launch_nuls in
+        '' | *[!0-9]*)
+            rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+            return 1
+            ;;
+        0) ;;
+        *)
+            rm -f "$launch_parse_status" "$launch_classes" "$launch_parsed" "$launch_nul_bytes"
+            return 1
+            ;;
+    esac
+    rm -f "$launch_nul_bytes"
+    # shellcheck disable=SC2016
+    LC_ALL=C timeout "$LAUNCH_ENV_PARSE_SECONDS" awk -v max_line="$LAUNCH_ENV_MAX_LINE_BYTES" -v status_file="$launch_parse_status" '
+        function reject() { invalid = 1 }
+        function parse(line,    rest, equal, name, quoted, single, slash, count, i) {
+            single = sprintf("%c", 39)
+            slash = sprintf("%c", 92)
+            if (substr(line, 1, 7) != "export ") return 0
+            rest = substr(line, 8)
+            equal = index(rest, "=")
+            if (equal < 2) return 0
+            name = substr(rest, 1, equal - 1)
+            if (name !~ /^[A-Za-z_][A-Za-z0-9_]*$/ || name ~ /^JACKIN_/) return 0
+            quoted = substr(rest, equal + 1)
+            if (substr(quoted, 1, 1) != single) return 0
+            count = split(quoted, parts, single)
+            if (count < 3 || count % 3 != 0) return 0
+            if (parts[count] != "") return 0
+            for (i = 3; i < count; i += 3) {
+                if (parts[i] != slash) return 0
+                if (parts[i + 1] != "") return 0
+            }
+            parsed_name = name
+            part_count = count
+            return 1
+        }
+        {
+            if (length($0) > max_line) reject()
+            if (invalid) next
+            if (!parse($0)) {
+                reject()
+                next
+            }
+            if (previous != "" && parsed_name <= previous) reject()
+            previous = parsed_name
+            printf "%s=", parsed_name
+            for (i = 2; i < part_count; i += 3) {
+                if (i > 2) printf "%c", 39
+                printf "%s", parts[i]
+            }
+            printf "%c", 0
+        }
+        END {
+            printf "%s\n", invalid ? 1 : 0 > status_file
+            close(status_file)
+            if (invalid) exit 2
+        }
+    ' "$launch_source" >"$launch_parsed"
+    launch_awk_status=$?
+    IFS= read -r launch_parse <"$launch_parse_status" 2>/dev/null || launch_parse=1
+    rm -f "$launch_parse_status"
+    if [ "$launch_awk_status" -ne 0 ] || [ "$launch_parse" != 0 ]; then
+        rm -f "$launch_classes" "$launch_parsed"
+        return 1
+    fi
+    if ! credential_variables launch_env <"$launch_parsed" >"$launch_classes"; then
+        rm -f "$launch_classes" "$launch_parsed"
+        return 1
+    fi
+    rm -f "$launch_parsed"
+    launch_class_status=0
+    cat "$launch_classes" || launch_class_status=$?
+    rm -f "$launch_classes"
+    return "$launch_class_status"
+}
+
 sanitize_launch_environment() {
     launch_names=$(env -0 2>/dev/null | jq -Rrs 'split("\u0000") | map(select(length > 0) | split("=")[0]) | .[]' 2>/dev/null) || return 1
     while IFS= read -r launch_name; do
@@ -2054,8 +2310,29 @@ EOF
 
 step_J07() (
     collect_processes
+    launcher_pid=$main_pid
+    launcher_stat_pre=
+    launcher_exe_pre=
+    launcher_uid_pre=
+    launcher_comm_pre=
+    launcher_interp=
+    launcher_interp_arg=
+    if [ -n "$launcher_pid" ]; then
+        launcher_stat_pre=$(proc_stat_raw "$launcher_pid") || launcher_stat_pre=
+        launcher_exe_pre=$(readlink "/proc/$launcher_pid/exe" 2>/dev/null) || launcher_exe_pre=
+        launcher_uid_pre=$(proc_uid "$launcher_pid") || launcher_uid_pre=
+        launcher_comm_pre=$(proc_comm "$launcher_pid") || launcher_comm_pre=
+        if start_interpreter_line; then
+            launcher_interp=$shebang_interp
+            launcher_interp_arg=$shebang_arg
+        fi
+    fi
     ensure_agent_exec
     process_checks
+    launcher_identity=null
+    if [ -n "$launcher_pid" ] && [ -n "$launcher_interp" ]; then
+        launcher_identity=$(proc_launcher_identity_record "$launcher_pid" "$launcher_interp" "$launcher_interp_arg" "$launcher_stat_pre" "$launcher_exe_pre" "$launcher_uid_pre" "$launcher_comm_pre") || launcher_identity=null
+    fi
     attempted=$(jq -r '.attempted' "$work/agent_exec.json")
     codex_target=false
     [ "$EXPECTED_AGENT" = codex ] && codex_target=true
@@ -2084,8 +2361,9 @@ step_J07() (
     else
         skip agent_exec "$(cat "$work/agent_exec.why")"
     fi
-    _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
-        '{processes: $p[0], agent_exec: $x[0]}')
+    _jks_facts_doc=$(jq -n --argjson launcher "$launcher_identity" \
+        --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
+        '{processes: $p[0], agent_exec: $x[0], launcher_identity: $launcher}')
     seal_facts "$_jks_facts_doc"
 )
 
@@ -2265,6 +2543,9 @@ step_J08() (
     fi
     env -0 | credential_variables probe >>"$work/variables.tsv"
     launch_files=0
+    launch_inputs=0
+    launch_bytes=0
+    launch_env_valid=true
     launch_bad=
     launch_problem=
     if [ -d "$JACKIN_DIR" ] && LC_ALL=C ls -1 "$JACKIN_DIR" >"$work/launch.ls" 2>"$work/launch.ls.err"; then
@@ -2272,23 +2553,55 @@ step_J08() (
             if [ "$file" = "$JACKIN_DIR/env-*" ] && ! grep -Fxq -- 'env-*' "$work/launch.ls"; then
                 continue
             fi
+            if [ "$launch_inputs" -ge "$LAUNCH_ENV_MAX_FILES" ]; then
+                launch_env_valid=false
+                break
+            fi
+            launch_inputs=$((launch_inputs + 1))
             if [ -L "$file" ] || [ ! -f "$file" ]; then
                 launch_bad="$launch_bad ${file##*/}"
                 continue
             fi
-            if ! bounded_read "$file" "$work/launch.env" "$LOG_BYTE_CAP" "$LOG_READ_SECONDS"; then
+            remaining_bytes=$((LAUNCH_ENV_TOTAL_MAX_BYTES - launch_bytes))
+            if [ "$remaining_bytes" -lt 0 ]; then
+                launch_env_valid=false
+                break
+            fi
+            file_limit=$LOG_BYTE_CAP
+            [ "$remaining_bytes" -ge "$file_limit" ] || file_limit=$remaining_bytes
+            if ! bounded_read "$file" "$work/launch.env" "$file_limit" "$LOG_READ_SECONDS"; then
+                launch_bytes=$((launch_bytes + file_limit))
+                if [ "$file_limit" -le 0 ]; then
+                    launch_env_valid=false
+                    break
+                fi
                 launch_bad="$launch_bad ${file##*/}"
                 continue
             fi
+            case $bounded_bytes in
+                '' | *[!0-9]*)
+                    launch_bytes=$((launch_bytes + file_limit))
+                    launch_bad="$launch_bad ${file##*/}"
+                    continue
+                    ;;
+            esac
+            launch_bytes=$((launch_bytes + bounded_bytes))
             launch_files=$((launch_files + 1))
-            sed -e 's/^export //' -e "s/='\\(.*\\)'\$/=\\1/" "$work/launch.env" |
-                awk '{ printf "%s%c", $0, 0 }' | credential_variables launch_env >>"$work/variables.tsv"
+            if launch_classes=$(launch_env_classifications "$work/launch.env"); then
+                [ -z "$launch_classes" ] || printf '%s\n' "$launch_classes" >>"$work/variables.tsv"
+            else
+                launch_env_valid=false
+                break
+            fi
         done
     elif [ -d "$JACKIN_DIR" ] || [ -e "$JACKIN_DIR" ] || [ -L "$JACKIN_DIR" ] || ! [ -x "${JACKIN_DIR%/*}" ]; then
         launch_problem="the launch environment directory $JACKIN_DIR could not be enumerated"
     fi
     if [ -n "$launch_bad" ]; then
         launch_problem="${launch_problem:+$launch_problem; }the launch environment file(s)$launch_bad are not regular files readable within $LOG_BYTE_CAP bytes"
+    fi
+    if [ "$launch_env_valid" != true ]; then
+        launch_problem="${launch_problem:+$launch_problem; }the launch environment inputs are malformed, non-regular, changing, or exceed bounded limits"
     fi
     read_from="the probe environment, $launch_files launch env file(s)"
     unread_from=
@@ -2451,7 +2764,7 @@ EOF
     elif [ "$agent_known" -ne 1 ]; then
         skip environment "the Codex environment is not known: the record at attempt $record_attempt holds no Codex environment"
     elif [ -n "$launch_problem" ]; then
-        fail environment "the launch environment could not be read, so the credentials are unknown: $launch_problem"
+        fail environment "the launch environment could not be read, or its inputs are malformed, non-regular, changing, or exceed bounded limits, so the credentials are unknown: $launch_problem"
     elif [ -n "$disagree" ]; then
         fail environment "every credential variable is a placeholder or empty, but the start record and /proc disagree for: $disagree"
     else
