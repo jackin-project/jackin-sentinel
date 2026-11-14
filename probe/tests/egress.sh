@@ -104,6 +104,8 @@ mk() {
     rm -rf "$t"
     if [ -n "$EGRESS_ONLY" ] && [ "$1" != "$EGRESS_ONLY" ]; then
         skip_case=1
+        name=$1
+        problems=
         mkdir -p "$t/bin" "$t/bad-bin" "$t/home" "$t/sandbox/project" "$t/tmp" "$t/sandbox/.codex"
         : >"$t/table"
         : >"$t/curl.log"
@@ -555,26 +557,31 @@ openai_401() {
 }
 
 expect_never_sent() {
+    [ "$skip_case" -eq 0 ] || return 0
     if grep -q -e "$1" "$t/curl.log"; then
         problems="$problems sent[$1]"
     fi
 }
 
 expect_sent() {
+    [ "$skip_case" -eq 0 ] || return 0
     grep -q -e "$1" "$t/curl.log" || problems="$problems not-sent[$1]"
 }
 
 expect_absent_from_report() {
+    [ "$skip_case" -eq 0 ] || return 0
     if grep -q -e "$1" "$t/out"; then
         problems="$problems reported[$1]"
     fi
 }
 
 expect_codex_not_run() {
+    [ "$skip_case" -eq 0 ] || return 0
     [ ! -e "$t/codex.ran" ] || problems="$problems codex-ran"
 }
 
 expect_child_variable() {
+    [ "$skip_case" -eq 0 ] || return 0
     variable=$1
     value=$2
     got=$(grep "^$variable=" "$t/codex.env" 2>/dev/null | head -n 1)
@@ -582,6 +589,7 @@ expect_child_variable() {
 }
 
 expect_no_child_variable() {
+    [ "$skip_case" -eq 0 ] || return 0
     variable=$1
     if [ -f "$t/codex.env" ] && grep -q "^$variable=" "$t/codex.env" 2>/dev/null; then
         problems="$problems child-received-$variable"
@@ -594,12 +602,14 @@ hostile_codex_home() {
 }
 
 expect_agent_credential() {
+    [ "$skip_case" -eq 0 ] || return 0
     want=$1
     got=$(sort -u "$t/agent.credential" 2>/dev/null | tr '\n' ' ')
     [ "$got" = "$want " ] || problems="$problems agent-credential=[$got](want [$want ])"
 }
 
 expect_no_agent_credential() {
+    [ "$skip_case" -eq 0 ] || return 0
     got=$(sort -u "$t/agent.credential" 2>/dev/null | tr '\n' ' ')
     [ -z "$got" ] || problems="$problems agent-credential=[$got](want none)"
 }
@@ -722,6 +732,7 @@ begin_without_probe_env() {
 }
 
 expect() {
+    [ "$skip_case" -eq 0 ] || return 0
     check=$1
     want_result=$2
     want_detail=$3
@@ -735,6 +746,7 @@ expect() {
 }
 
 fact() {
+    [ "$skip_case" -eq 0 ] || return 0
     filter=$1
     want=$2
     got=$(jq -r ".steps[].facts | $filter" "$t/out" 2>/dev/null)
@@ -2005,6 +2017,54 @@ used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
 [ "$used_endpoint" = http://127.0.0.1:9/v1 ] || problems="$problems swap-not-effective=[$used_endpoint]"
 finish_case
 
+mk t09_a_same_uid_helper_cannot_chmod_back_or_swap_the_pinned_config
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+conf=$t/sandbox/.omp/config.toml
+if rm -f "\$conf" 2>/dev/null; then
+    : >"$t/swap.ok"
+    printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
+    printf '%s\n' swapped >>"$t/helper.log"
+else
+    printf '%s\n' swap-blocked >>"$t/helper.log"
+fi
+if chmod 0644 "\$conf" 2>/dev/null; then
+    printf '%s\n' chmod-back-ok >>"$t/helper.log"
+else
+    printf '%s\n' chmod-back-blocked >>"$t/helper.log"
+fi
+if printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null; then
+    printf '%s\n' rewrite-ok >>"$t/helper.log"
+else
+    printf '%s\n' rewrite-blocked >>"$t/helper.log"
+fi
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_same_uid_helper_cannot_chmod_back_or_swap_the_pinned_config step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+[ -s "$t/helper.log" ] || problems="$problems helper-never-attempted"
+if [ -e "$t/swap.ok" ]; then
+    problems="$problems entry-swap-not-blocked"
+fi
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+fact '.agent_exec.config_refused' '1'
+expect_never_sent 'http://127.0.0.1:9/v1'
+finish_case
+
 mk t09_a_headless_run_still_streams_a_bounded_config
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
@@ -2039,7 +2099,7 @@ fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 mv "$scratch/tools/head" "$scratch/head.save"
 mv "$scratch/tools/dd" "$scratch/dd.save"
-total=$((total + 1))
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
 problems=
 execute step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 execute_rc=$?
@@ -2810,7 +2870,7 @@ zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/
 printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
 name=t09_an_omitted_tuple_config_is_rejected_pre_launch
 problems=
-total=$((total + 1))
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
 prepare_probe || problems=" setup failure"
 if [ -z "$problems" ]; then
     zai_spec t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint" || problems=" setup failure"
@@ -2867,7 +2927,7 @@ wait "$probe_pid" 2>/dev/null
 probe_status=$?
 name=t09_pinned_modes_restored_when_the_probe_is_signalled
 problems=
-total=$((total + 1))
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
 [ "$kill_status" -eq 0 ] || problems="$problems the-probe-signal-failed"
 [ "$probe_status" -eq 70 ] || problems="$problems the-probe-exit=$probe_status(want 70)"
 mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
@@ -3071,7 +3131,7 @@ mkdir -p "$t/decoy/.omp/agent" "$t/decoy/agent"
 printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/decoy/.omp/config.toml"
 printf '%s\n' 'baseUrl: https://api.z.ai/api/anthropic' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/decoy/agent/models.yml"
 decoy_dir=$t/decoy
-total=$((total + 1))
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
 problems=
 execute step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 execute_rc=$?
@@ -3182,7 +3242,7 @@ host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
 rm -f "$t/sandbox/.omp/config.toml"
-total=$((total + 1))
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
 problems=
 name=t09_a_config_gate_refusal_is_reported_by_both_steps
 execute J07,J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
@@ -3197,7 +3257,7 @@ mk t18_a_host_dry_run_does_not_pin_the_declared_config
 host_key=synthetic-T18-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t18-codex-zai-v1 codex codex 'codex-cli 0.167.0' shell ZAI_API_KEY https://api.z.ai/api/v1 absent "$fingerprint"
-total=$((total + 1))
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
 problems=
 name=t18_a_host_dry_run_does_not_pin_the_declared_config
 prepare_probe || problems="$problems setup failure"

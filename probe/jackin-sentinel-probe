@@ -1319,6 +1319,66 @@ pin_declared_configs_run() {
             *) return 1 ;;
         esac
         [ -n "$_jks_vcfg_sel" ] || return 1
+        declared_pre=$(python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+parent, name = os.path.split(path)
+if not name:
+    raise SystemExit(1)
+if not parent:
+    parent = "."
+try:
+    dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+try:
+    dirst = os.fstat(dirfd)
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except FileNotFoundError:
+        sys.stdout.write("absent\n")
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(handle)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(1)
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise SystemExit(1)
+        sys.stdout.write("%o\n%d %d %d %d %d\n%o %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, stat.S_IMODE(dirst.st_mode), dirst.st_dev, dirst.st_ino))
+    finally:
+        os.close(handle)
+finally:
+    os.close(dirfd)
+' "$declared_path" 2>/dev/null) || return 1
+        declared_pre_mode=$(printf '%s\n' "$declared_pre" | sed -n 1p)
+        declared_pre_id=$(printf '%s\n' "$declared_pre" | sed -n 2p)
+        declared_pre_dir=$(printf '%s\n' "$declared_pre" | sed -n 3p)
+        if [ "$declared_pre_mode" = absent ]; then
+            PIN_MODES="${PIN_MODES}absent
+"
+            PIN_IDS="${PIN_IDS}absent
+"
+            PIN_STATS="${PIN_STATS}absent
+"
+            PIN_DIRS="${PIN_DIRS}absent
+"
+            return 1
+        fi
+        case $declared_pre_mode in
+            '' | *[!0-7]*) return 1 ;;
+        esac
+        case $declared_pre_id in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        case $declared_pre_dir in
+            '' | *[!0-9\ ]*) declared_pre_dir= ;;
+        esac
+        PIN_MODES="${PIN_MODES}${declared_pre_mode}
+"
+        PIN_IDS="${PIN_IDS}${declared_pre_id}
+"
+        PIN_DIRS="${PIN_DIRS}${declared_pre_dir}
+"
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 data = sys.stdin.buffer.read()
@@ -1448,40 +1508,14 @@ finally:
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
         declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 3p)
-        declared_dir=$(printf '%s\n' "$declared_pin" | sed -n 4p)
-        if [ "$declared_mode" = absent ]; then
-            PIN_MODES="${PIN_MODES}absent
-"
-            PIN_IDS="${PIN_IDS}absent
-"
-            PIN_STATS="${PIN_STATS}absent
-"
-            PIN_DIRS="${PIN_DIRS}absent
-"
-            return 1
-        fi
-        case $declared_mode in
-            '' | *[!0-7]*) return 1 ;;
-        esac
-        case $declared_id in
-            '' | *[!0-9\ ]*) return 1 ;;
-        esac
-        PIN_MODES="${PIN_MODES}${declared_mode}
-"
-        PIN_IDS="${PIN_IDS}${declared_id}
-"
+        [ "$declared_rc" -eq 0 ] || return 1
+        [ "$declared_mode" = "$declared_pre_mode" ] || return 1
+        [ "$declared_id" = "$declared_pre_id" ] || return 1
         case $declared_stat in
-            '' | *[!0-9\ ]*) declared_stat= ;;
+            '' | *[!0-9\ ]*) return 1 ;;
         esac
         PIN_STATS="${PIN_STATS}${declared_stat}
 "
-        case $declared_dir in
-            '' | *[!0-9\ ]*) declared_dir= ;;
-        esac
-        PIN_DIRS="${PIN_DIRS}${declared_dir}
-"
-        [ "$declared_rc" -eq 0 ] || return 1
-        [ -n "$declared_stat" ] || return 1
         declared_index=$((declared_index + 1))
     done
     return 0
