@@ -1015,6 +1015,30 @@ def flow_collection_line(line):
     return False
 
 
+def strip_inline_comment(text):
+    quote_ch = None
+    escaped = False
+    for i in range(len(text)):
+        ch = text[i]
+        if quote_ch == "\"":
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "\"":
+                quote_ch = None
+            continue
+        if quote_ch == "'":
+            if ch == "'":
+                quote_ch = None
+            continue
+        if ch in "\"'":
+            quote_ch = ch
+        elif ch == "#" and i > 0 and text[i - 1] in " \t":
+            return text[:i].strip()
+    return text.strip()
+
+
 def plain_root_scalars(text):
     root = {}
     lines = text.split("\n")
@@ -1047,7 +1071,7 @@ def plain_root_scalars(text):
         if not rest.strip() or rest.lstrip().startswith("#"):
             root[key] = None
             continue
-        rest = re.sub(r"[ \t]+#.*$", "", rest).strip()
+        rest = strip_inline_comment(rest)
         if rest[0] in "|>":
             header = re.match(r"^[|>](?:([+-])([0-9])?|([0-9])([+-])?)?(?:[ \t]+#.*)?$", rest)
             if header is None:
