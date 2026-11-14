@@ -4900,7 +4900,7 @@ esac
 exec "$real_head" "\$@"
 EOF
 chmod +x "$t/bin/head"
-real_python3_entropy=$(command -v python3) || exit 70
+real_python3_entropy=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 case " \$* " in
@@ -4946,7 +4946,7 @@ fi
 finish_case
 
 mk pin_write_failure_restores_the_original_mode
-real_python3_probe=$(command -v python3) || exit 70
+real_python3_probe=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 rewrite=
@@ -4992,7 +4992,7 @@ fi
 finish_case
 
 mk pin_rollback_leaves_a_recreated_absent_path_untouched
-real_python3_absent=$(command -v python3) || exit 70
+real_python3_absent=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 rewrite=
@@ -5041,7 +5041,7 @@ fi
 finish_case
 
 mk pin_failed_write_restorer_skips_a_replaced_identity
-real_python3_replace=$(command -v python3) || exit 70
+real_python3_replace=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 rewrite=
