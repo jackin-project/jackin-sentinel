@@ -31,6 +31,7 @@ EXPECTED_MODEL=
 PIN_MODES=
 PIN_STATS=
 PIN_HOME_DIRS=
+DECL_IDS=
 stage_config_stat=
 stage_config_path=
 EXPECTED_AGENT=
@@ -868,6 +869,25 @@ EOF_JKS_CAPTURE_BODY
     return 0
 }
 
+capture_config_identity() {
+    python3 -I -c 'import os, stat, sys
+try:
+    handle = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(handle)
+    if not stat.S_ISREG(opened.st_mode):
+        raise SystemExit(1)
+    named = os.lstat(sys.argv[1])
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    sys.stdout.write("%d %d %d %d %d" % (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
+finally:
+    os.close(handle)
+' "$1" 2>/dev/null
+}
+
 entropy_encode() {
     if command -v base64 >/dev/null 2>&1; then
         base64 2>/dev/null
@@ -952,11 +972,16 @@ declared_provider_config() {
     declared_effective=
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
     [ "$declared_count" -ge 1 ] || return 1
+    if [ -z "${declared_use_snapshot-}" ]; then
+        DECL_IDS=
+    fi
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
         [ -n "$declared_path" ] || return 1
         if [ -z "${declared_use_snapshot-}" ]; then
+            _jks_vcfg_ident=$(capture_config_identity "$declared_path") || return 1
+            [ -n "$_jks_vcfg_ident" ] || return 1
             capture_bounded "$declared_path" "$CONFIG_BYTE_CAP" "$((CONFIG_BYTE_CAP + 1))" || return 1
             _jks_vcfg_st=$_jks_capture
             case $declared_index in
@@ -964,6 +989,8 @@ declared_provider_config() {
                 1) _jks_vcfg_1=$_jks_vcfg_st ;;
                 *) return 1 ;;
             esac
+            DECL_IDS="${DECL_IDS}${_jks_vcfg_ident}
+"
         fi
         case $declared_index in
             0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
@@ -1310,6 +1337,10 @@ pin_declared_configs() {
 pin_declared_configs_run() {
     command -v python3 >/dev/null 2>&1 || return 1
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    declared_freeze=1
+    case $ADAPTER in
+        t14-claude-zai-v1) declared_freeze=0 ;;
+    esac
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
@@ -1331,7 +1362,6 @@ try:
 except OSError:
     raise SystemExit(1)
 try:
-    dirst = os.fstat(dirfd)
     try:
         handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
     except FileNotFoundError:
@@ -1344,7 +1374,7 @@ try:
         named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise SystemExit(1)
-        sys.stdout.write("%o\n%d %d %d %d %d\n%o %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, stat.S_IMODE(dirst.st_mode), dirst.st_dev, dirst.st_ino))
+        sys.stdout.write("%o\n%d %d %d %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
     finally:
         os.close(handle)
 finally:
@@ -1352,7 +1382,8 @@ finally:
 ' "$declared_path" 2>/dev/null) || return 1
         declared_pre_mode=$(printf '%s\n' "$declared_pre" | sed -n 1p)
         declared_pre_id=$(printf '%s\n' "$declared_pre" | sed -n 2p)
-        declared_pre_dir=$(printf '%s\n' "$declared_pre" | sed -n 3p)
+        declared_recorded_id=$(printf '%s\n' "$DECL_IDS" | sed -n "$((declared_index + 1))p")
+        [ -n "$declared_recorded_id" ] || return 1
         if [ "$declared_pre_mode" = absent ]; then
             PIN_MODES="${PIN_MODES}absent
 "
@@ -1370,17 +1401,17 @@ finally:
         case $declared_pre_id in
             '' | *[!0-9\ ]*) return 1 ;;
         esac
-        case $declared_pre_dir in
-            '' | *[!0-9\ ]*) declared_pre_dir= ;;
+        case $declared_recorded_id in
+            '' | *[!0-9\ ]*) return 1 ;;
         esac
+        [ "$declared_pre_id" = "$declared_recorded_id" ] || return 1
         PIN_MODES="${PIN_MODES}${declared_pre_mode}
 "
-        PIN_IDS="${PIN_IDS}${declared_pre_id}
-"
-        PIN_DIRS="${PIN_DIRS}${declared_pre_dir}
+        PIN_IDS="${PIN_IDS}${declared_recorded_id}
 "
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
+freeze_parent = len(sys.argv) > 2 and sys.argv[2] == "1"
 data = sys.stdin.buffer.read()
 parent, name = os.path.split(path)
 if not name:
@@ -1397,6 +1428,7 @@ dir_mode = None
 frozen = False
 written = False
 truncated = False
+done = False
 try:
     dirst = os.fstat(dirfd)
     dir_mode = stat.S_IMODE(dirst.st_mode)
@@ -1443,10 +1475,12 @@ try:
     finally:
         os.close(writer)
     written = True
-    os.fchmod(dirfd, dir_mode & ~0o222)
-    frozen = True
+    if freeze_parent:
+        os.fchmod(dirfd, dir_mode & ~0o222)
+        frozen = True
     sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
-    sys.stdout.write("%o %d %d\n" % (dir_mode, dirst.st_dev, dirst.st_ino))
+    sys.stdout.write("%o %d %d %d\n" % (dir_mode, dirst.st_dev, dirst.st_ino, 1 if frozen else 0))
+    done = True
     raise SystemExit(0)
 except SystemExit as ex:
     if ex.code and mode is not None and not written:
@@ -1497,24 +1531,30 @@ except BaseException:
             pass
     raise SystemExit(1)
 finally:
-    if frozen and not written:
+    if frozen and not done:
         try:
             os.fchmod(dirfd, dir_mode)
         except OSError:
             pass
     os.close(dirfd)
-' "$declared_path" 2>/dev/null)
+' "$declared_path" "$declared_freeze" 2>/dev/null)
         declared_rc=$?
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
         declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 3p)
+        declared_dir=$(printf '%s\n' "$declared_pin" | sed -n 4p)
         [ "$declared_rc" -eq 0 ] || return 1
         [ "$declared_mode" = "$declared_pre_mode" ] || return 1
         [ "$declared_id" = "$declared_pre_id" ] || return 1
         case $declared_stat in
             '' | *[!0-9\ ]*) return 1 ;;
         esac
+        case $declared_dir in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
         PIN_STATS="${PIN_STATS}${declared_stat}
+"
+        PIN_DIRS="${PIN_DIRS}${declared_dir}
 "
         declared_index=$((declared_index + 1))
     done
@@ -1579,7 +1619,9 @@ try:
             raise SystemExit(0)
         try:
             dirst = os.fstat(dirfd)
-            if len(dirfields) < 3:
+            if len(dirfields) < 4:
+                raise OSError
+            if dirfields[3] != "1":
                 raise OSError
             if (dirst.st_dev, dirst.st_ino) != (int(dirfields[1]), int(dirfields[2])):
                 raise OSError
@@ -2238,6 +2280,9 @@ EOF
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
     unset _jks_stdout_parsed_answer _jks_stdout_extra
+    if [ "${prompt_configs_pinned-}" = true ] && ! declared_configs_stat_unchanged; then
+        config_gate_refused=1
+    fi
     evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","actual_endpoint":"","sandbox_endpoint":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
     if [ -f "$work/config-gate.refused" ]; then
         config_gate_refused=1
