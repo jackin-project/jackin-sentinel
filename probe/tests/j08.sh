@@ -4991,6 +4991,62 @@ if [ "$restored_mode" != 600 ]; then
 fi
 finish_case
 
+mk pin_mid_write_failure_restores_the_original_content_and_mode
+real_python3_mid=$python_real
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's/view = view\[os\.write(writer, view):\]/raise SystemExit(1)/')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_mid" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "http://127.0.0.1:9/v1"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_mid_write_failure_restores_the_original_content_and_mode sh "$t/probe" --only J07
+expect_rc 0
+mid_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$mid_mode" != 600 ]; then
+    problems="$problems config-mode=$mid_mode(want 600 restored)"
+fi
+restored_content=$(cat "$t/sandbox/.codex/config.toml")
+expected_content='model = "gpt-6.1-sol"
+model_provider = "codex"
+
+[model_providers.codex]
+name = "codex"
+base_url = "http://127.0.0.1:9/v1"'
+if [ "$restored_content" != "$expected_content" ]; then
+    problems="$problems config-content-not-restored"
+fi
+finish_case
+
 mk pin_rollback_leaves_a_recreated_absent_path_untouched
 real_python3_absent=$python_real
 cat >"$t/bin/python3" <<EOF

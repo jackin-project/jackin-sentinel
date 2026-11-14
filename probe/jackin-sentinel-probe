@@ -1288,6 +1288,7 @@ mode = None
 dir_mode = None
 frozen = False
 written = False
+truncated = False
 try:
     dirst = os.fstat(dirfd)
     dir_mode = stat.S_IMODE(dirst.st_mode)
@@ -1325,6 +1326,7 @@ try:
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise SystemExit(1)
         os.ftruncate(writer, 0)
+        truncated = True
         view = memoryview(data)
         while view:
             view = view[os.write(writer, view):]
@@ -1346,6 +1348,15 @@ except SystemExit as ex:
             try:
                 restored = os.fstat(restorer)
                 if (restored.st_dev, restored.st_ino) == (named.st_dev, named.st_ino):
+                    if truncated:
+                        fixer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+                        try:
+                            os.ftruncate(fixer, 0)
+                            view = memoryview(data)
+                            while view:
+                                view = view[os.write(fixer, view):]
+                        finally:
+                            os.close(fixer)
                     os.fchmod(restorer, mode)
             finally:
                 os.close(restorer)
@@ -1359,6 +1370,15 @@ except BaseException:
             try:
                 restored = os.fstat(restorer)
                 if (restored.st_dev, restored.st_ino) == (named.st_dev, named.st_ino):
+                    if truncated:
+                        fixer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+                        try:
+                            os.ftruncate(fixer, 0)
+                            view = memoryview(data)
+                            while view:
+                                view = view[os.write(fixer, view):]
+                        finally:
+                            os.close(fixer)
                     os.fchmod(restorer, mode)
             finally:
                 os.close(restorer)
