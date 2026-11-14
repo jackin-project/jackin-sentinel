@@ -2034,13 +2034,59 @@ used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
 finish_case
 
 mk t09_a_same_uid_helper_cannot_chmod_back_or_swap_the_pinned_config
+name=${t##*/}
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+agent_depriv_uid=
+agent_depriv_gid=
+agent_depriv_tool=
+uid_split_ready=0
+if [ "$skip_case" -eq 0 ]; then
+    if [ "$(id -u)" = 0 ] && [ -n "$(id -u nobody 2>/dev/null)" ] && [ -n "$(id -g nobody 2>/dev/null)" ]; then
+        agent_depriv_uid=$(id -u nobody 2>/dev/null)
+        agent_depriv_gid=$(id -g nobody 2>/dev/null)
+        if command -v setpriv >/dev/null 2>&1; then
+            agent_depriv_tool=$(command -v setpriv)
+        elif command -v su >/dev/null 2>&1; then
+            agent_depriv_tool=$(command -v su)
+        fi
+    fi
+    if [ -n "$agent_depriv_tool" ] &&
+        chown -R "$agent_depriv_uid:$agent_depriv_gid" "$t" &&
+        chown "$(id -u):$(id -g)" "$t/sandbox/.omp" "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent" "$t/sandbox/.omp/agent/models.yml"; then
+        uid_split_ready=1
+    fi
+    if [ "$uid_split_ready" -eq 0 ]; then
+        : >"$t/out"
+        total=$((total + 1))
+        problems=" setup failure: no distinct-UID pin authority (root + setpriv/su)"
+        finish_case
+        skip_case=1
+    fi
+fi
+agent_depriv_prelude=:
+if [ "$uid_split_ready" -eq 1 ]; then
+    case ${agent_depriv_tool##*/} in
+        setpriv) agent_depriv_prelude="if [ \"\$(id -u)\" != \"$agent_depriv_uid\" ]; then
+    exec $agent_depriv_tool --reuid=$agent_depriv_uid --regid=$agent_depriv_gid --clear-groups /bin/sh \"\$0\" \"\$@\"
+fi" ;;
+        *) agent_depriv_prelude="if [ \"\$(id -u)\" != \"$agent_depriv_uid\" ]; then
+    exec $agent_depriv_tool -s /bin/sh nobody -c 'exec \"\$@\"' run /bin/sh \"\$0\" \"\$@\"
+fi" ;;
+    esac
+fi
 cat >"$t/bin/omp" <<EOF
 #!/bin/sh
+$agent_depriv_prelude
 echo ran >>"$t/codex.ran"
 conf=$t/sandbox/.omp/config.toml
+dir=\${conf%/*}
+if chmod u+w "\$dir" 2>/dev/null; then
+    printf '%s\n' chmod-dir-ok >>"$t/helper.log"
+else
+    printf '%s\n' chmod-dir-blocked >>"$t/helper.log"
+fi
 if rm -f "\$conf" 2>/dev/null; then
     : >"$t/swap.ok"
     printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"\$conf" 2>/dev/null || true
@@ -2076,8 +2122,21 @@ begin t09_a_same_uid_helper_cannot_chmod_back_or_swap_the_pinned_config step_J09
 if [ -e "$t/swap.ok" ]; then
     problems="$problems entry-swap-not-blocked"
 fi
-expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
-fact '.agent_exec.config_refused' '1'
+expect_helper_log chmod-dir-blocked
+expect_helper_log swap-blocked
+expect_helper_log chmod-back-blocked
+expect_helper_log rewrite-blocked
+refusal_set=true
+for want in chmod-dir-blocked swap-blocked chmod-back-blocked rewrite-blocked; do
+    grep -q -x "$want" "$t/helper.log" 2>/dev/null || refusal_set=false
+done
+if [ "$refusal_set" = true ]; then
+    expect agent_reaches_api PASS 'completed the declared tool'
+    fact '.agent_exec.config_refused' '0'
+else
+    expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+    fact '.agent_exec.config_refused' '1'
+fi
 expect_never_sent 'http://127.0.0.1:9/v1'
 finish_case
 
