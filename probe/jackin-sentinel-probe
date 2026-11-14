@@ -763,89 +763,102 @@ read_bounded() {
     read_src=$1
     read_dst=$2
     read_cap=$3
-    (
-        exec 9<"$read_src" 2>/dev/null || exit 1
-        RB_FD=9 RB_SRC=$read_src python3 -I -c 'import os, stat, sys
-handle = os.fstat(int(os.environ["RB_FD"]))
-if not stat.S_ISREG(handle.st_mode):
-    raise SystemExit(1)
-named = os.lstat(os.environ["RB_SRC"])
-if (handle.st_dev, handle.st_ino) != (named.st_dev, named.st_ino):
-    raise SystemExit(1)
-' 2>/dev/null || exit 1
-        read_bytes=
-        if command -v head >/dev/null 2>&1; then
-            if command -v timeout >/dev/null 2>&1; then
-                timeout 10 head -c $((read_cap + 1)) -- /dev/fd/9 >"$read_dst" 2>/dev/null || exit 1
-            else
-                head -c $((read_cap + 1)) -- /dev/fd/9 >"$read_dst" 2>/dev/null || exit 1
-            fi
-        else
-            if command -v dd >/dev/null 2>&1; then
-                dd if=/dev/fd/9 of="$read_dst" bs="$((read_cap + 1))" count=1 2>/dev/null || exit 1
-            else
-                exit 1
-            fi
-        fi
-        [ -f "$read_dst" ] || exit 1
-        if command -v wc >/dev/null 2>&1; then
-            read_bytes=$(wc -c <"$read_dst" 2>/dev/null | tr -d '[:space:]') || exit 1
-        else
-            read_bytes=$(jq -Rrn --rawfile d "$read_dst" '$d | utf8bytelength' 2>/dev/null) || exit 1
-        fi
-        case $read_bytes in
-            '' | *[!0-9]*) exit 1 ;;
-        esac
-        [ "$read_bytes" -le "$read_cap" ] || exit 1
-        exit 0
-    )
+    read_body=
+    while IFS= read -r _jks_body_line; do
+        read_body="$read_body$_jks_body_line
+"
+    done <<'EOF_JKS_READ_BODY'
+read_bytes=
+if command -v head >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 head -c $((RB_CAP + 1)) -- /dev/fd/9 >"$RB_DST" 2>/dev/null || exit 1
+    else
+        head -c $((RB_CAP + 1)) -- /dev/fd/9 >"$RB_DST" 2>/dev/null || exit 1
+    fi
+else
+    if command -v dd >/dev/null 2>&1; then
+        dd if=/dev/fd/9 of="$RB_DST" bs="$((RB_CAP + 1))" count=1 2>/dev/null || exit 1
+    else
+        exit 1
+    fi
+fi
+[ -f "$RB_DST" ] || exit 1
+if command -v wc >/dev/null 2>&1; then
+    read_bytes=$(wc -c <"$RB_DST" 2>/dev/null | tr -d "[:space:]") || exit 1
+else
+    read_bytes=$(jq -Rrn --rawfile d "$RB_DST" '$d | utf8bytelength' 2>/dev/null) || exit 1
+fi
+case $read_bytes in
+    "" | *[!0-9]*) exit 1 ;;
+esac
+[ "$read_bytes" -le "$RB_CAP" ] || exit 1
+exit 0
+EOF_JKS_READ_BODY
+    capture_open_exec "$read_src" "$read_dst" "$read_cap" "$read_cap" 0 "$read_body"
 }
 
 copy_bounded() {
     read_bounded "$1" "$2" "$AGENT_HOME_MAX_BYTES"
 }
 
+capture_open_exec() {
+    RB_SRC=$1 RB_DST=$2 RB_CAP=$3 RB_LEN=$4 RB_NUL=$5 RB_BODY=$6 python3 -I -c 'import os, stat, sys
+src = os.environ["RB_SRC"]
+try:
+    handle = os.open(src, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+opened = os.fstat(handle)
+if not stat.S_ISREG(opened.st_mode):
+    raise SystemExit(1)
+named = os.lstat(src)
+if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+    raise SystemExit(1)
+if opened.st_size > int(os.environ["RB_CAP"]):
+    raise SystemExit(1)
+if os.environ["RB_NUL"] == "1" and b"\x00" in os.pread(handle, min(opened.st_size, int(os.environ["RB_LEN"])), 0):
+    raise SystemExit(1)
+os.dup2(handle, 9)
+if handle != 9:
+    os.close(handle)
+os.set_inheritable(9, True)
+os.execvp("sh", ["sh", "-c", os.environ["RB_BODY"]])
+' 2>/dev/null
+}
+
 capture_bounded() {
     _jks_capture=
-    _jks_capture=$(
-        exec 9<"$1" 2>/dev/null || exit 1
-        RB_FD=9 RB_SRC=$1 RB_CAP=$2 RB_LEN=$3 python3 -I -c 'import os, stat, sys
-handle = os.fstat(int(os.environ["RB_FD"]))
-if not stat.S_ISREG(handle.st_mode):
-    raise SystemExit(1)
-named = os.lstat(os.environ["RB_SRC"])
-if (handle.st_dev, handle.st_ino) != (named.st_dev, named.st_ino):
-    raise SystemExit(1)
-if handle.st_size > int(os.environ["RB_CAP"]):
-    raise SystemExit(1)
-if b"\x00" in os.pread(int(os.environ["RB_FD"]), min(handle.st_size, int(os.environ["RB_LEN"])), 0):
-    raise SystemExit(1)
-' 2>/dev/null || exit 1
-        cb_raw=$(
-            if command -v head >/dev/null 2>&1; then
-                if command -v timeout >/dev/null 2>&1; then
-                    timeout 10 head -c "$3" <&9 || exit 1
-                else
-                    head -c "$3" <&9 || exit 1
-                fi
-            elif command -v dd >/dev/null 2>&1; then
-                dd bs="$3" count=1 <&9 2>/dev/null || exit 1
-            else
-                exit 1
-            fi
-            printf x
-        ) || exit 1
-        cb_raw=${cb_raw%x}
-        if command -v wc >/dev/null 2>&1; then
-            cb_len=$(printf '%s' "$cb_raw" | wc -c | tr -d '[:space:]') || exit 1
+    capture_body=
+    while IFS= read -r _jks_body_line; do
+        capture_body="$capture_body$_jks_body_line
+"
+    done <<'EOF_JKS_CAPTURE_BODY'
+cb_raw=$(
+    if command -v head >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 head -c "$RB_LEN" <&9 || exit 1
         else
-            cb_len=$(printf '%s' "$cb_raw" | python3 -I -c 'import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))' 2>/dev/null) || exit 1
+            head -c "$RB_LEN" <&9 || exit 1
         fi
-        [ -n "$cb_len" ] || exit 1
-        [ "$cb_len" -le "$2" ] 2>/dev/null || exit 1
-        printf '%s' "$cb_raw"
-        printf x
-    ) || return 1
+    elif command -v dd >/dev/null 2>&1; then
+        dd bs="$RB_LEN" count=1 <&9 2>/dev/null || exit 1
+    else
+        exit 1
+    fi
+    printf x
+) || exit 1
+cb_raw=${cb_raw%x}
+if command -v wc >/dev/null 2>&1; then
+    cb_len=$(printf "%s" "$cb_raw" | wc -c | tr -d "[:space:]") || exit 1
+else
+    cb_len=$(printf "%s" "$cb_raw" | python3 -I -c "import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))" 2>/dev/null) || exit 1
+fi
+[ -n "$cb_len" ] || exit 1
+[ "$cb_len" -le "$RB_CAP" ] 2>/dev/null || exit 1
+printf "%s" "$cb_raw"
+printf x
+EOF_JKS_CAPTURE_BODY
+    _jks_capture=$(capture_open_exec "$1" "" "$2" "$3" 1 "$capture_body") || return 1
     _jks_capture=${_jks_capture%x}
     return 0
 }

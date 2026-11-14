@@ -4945,6 +4945,29 @@ if [ -f "$t/entropy.named" ]; then
 fi
 finish_case
 
+mk spec_swapped_for_a_fifo_is_refused_without_blocking
+real_head_swap=$(command -v head) || exit 70
+cat >"$t/bin/head" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*)
+        rm -f "$t/spec"
+        mkfifo "$t/spec"
+        ;;
+esac
+exec "$real_head_swap" "\$@"
+EOF
+chmod +x "$t/bin/head"
+state 'exited 1 0'
+record "$R_OK1"
+begin spec_swapped_for_a_fifo_is_refused_without_blocking sh "$t/probe" --only J08
+expect_rc 65
+case $(cat "$t/err") in
+    *'unreadable'*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want unreadable refusal)" ;;
+esac
+finish_case
+
 mk pin_write_failure_restores_the_original_mode
 real_python3_probe=$python_real
 cat >"$t/bin/python3" <<EOF
