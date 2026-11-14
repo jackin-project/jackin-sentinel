@@ -12,7 +12,7 @@ The `Dockerfile` ends in a stage that starts `FROM construct`. One `RUN` layer i
 
 Jackin adds the selected agent binaries, `jackin-start`, and the two hooks when it derives the final image (decisions D05 and D11).
 
-The probe is a POSIX `sh` script that needs `jq`. The construct image has `jq`.
+The probe is a POSIX `sh` script that needs `jq` and `python3`. It checks both at startup and exits 69 when either is missing. The construct image has `jq`.
 
 ## Egress policy
 
@@ -83,7 +83,7 @@ jackin-sentinel-probe --version
 | `--engine HOST:PORT` | The engine endpoint that J16 tries to reach. Without it, the connection check of J16 is `SKIP`. |
 | `--only` | A comma-separated list of steps. An unselected step is absent from the report. |
 
-Without `--host`, the probe runs only on Linux as the user `sandbox` with `/sandbox` present. Otherwise it exits 66. The probe exits 0 whenever it printed a report, even when a step is `FAIL`. It exits 64 for a usage error, 65 for an invalid probe specification, and 69 when `jq` is missing.
+Without `--host`, the probe runs only on Linux as the user `sandbox` with `/sandbox` present. Otherwise it exits 66. The probe exits 0 whenever it printed a report, even when a step is `FAIL`. It exits 64 for a usage error, 65 for an invalid probe specification, and 69 when `jq` or `python3` is missing.
 
 Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, and typed `facts`. A step that needs a credential or a capability that the sandbox lacks is `SKIP`. It is never `PASS`.
 
@@ -106,7 +106,7 @@ Each step has a `result` (`PASS`, `FAIL`, or `SKIP`), a `reason`, its `checks`, 
 
 J01, J02, J03, and J17 have no in-sandbox part. `xtask e2e` runs them on the host.
 
-Run a dry run on any host that has `jq`:
+Run a dry run on any host that has `jq` and `python3`:
 
 ```sh
 probe/jackin-sentinel-probe --spec /path/to/probe-spec.json --host | jq .

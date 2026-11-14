@@ -14,9 +14,31 @@ fixture_comm=
 fixture_fingerprint=
 
 mkdir -p "$scratch/tools" "$scratch/shim"
+python_bin=$(command -v python3) || {
+    echo "FAIL setup: python3 is not installed"
+    exit 70
+}
+case "$python_bin" in
+    /*) ;;
+    *)
+        python_dir=${python_bin%/*}
+        python_name=${python_bin##*/}
+        [ "$python_dir" != "$python_bin" ] || python_dir=.
+        python_dir=$(cd "$python_dir" && pwd -P) || exit 70
+        python_bin=$python_dir/$python_name
+        ;;
+esac
+python_real=$("$python_bin" -c 'import sys; sys.stdout.write(sys.executable)' 2>/dev/null) || python_real=
+case "$python_real" in
+    /*) ;;
+    *) python_real= ;;
+esac
+[ -n "$python_real" ] && [ -x "$python_real" ] || python_real=$python_bin
 for tool in awk basename base64 cat chmod cp cut date dirname env find grep head jq ls mkdir mkfifo mktemp mv od python3 readlink rm rmdir sed sha256sum sh sleep sort stat tail tee timeout touch tr wc git; do
     if [ "$tool" = jq ] && command -v mise >/dev/null 2>&1; then
         found=$(mise which jq) || exit 70
+    elif [ "$tool" = python3 ]; then
+        found=$python_real
     else
         found=$(command -v "$tool") || {
             echo "FAIL setup: $tool is not installed"
@@ -62,7 +84,7 @@ prepare_probe() {
         fixture_case_spec || return 1
     else
         cat >"$t/spec" <<EOF
-{"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"}},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
+{"target":{"tuple":"T01","agent":"codex","provider":"codex","model":"gpt-6.1-sol","adapter":"t01-codex-v1","spec_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"behavior":{"version":{"binary":"$t/bin/codex","exact_output":"codex-cli 0.167.0"},"process":{"comm":"codex","minimum_age_seconds":15},"prompt":{"argv":["$t/bin/codex","exec","--skip-git-repo-check","Reply with the word ready"],"answer":{"word_case_insensitive":{"word":"ready"}}},"credential":{"auth_file":{"path":"$t/sandbox/.codex/auth.json"},"config_files":[{"path":"$t/sandbox/.codex/config.toml","required_state":"present","mode":"600","required_text":[],"forbidden_text":[]}]},"provider":{"probe_url":"https://chatgpt.com/backend-api/models","accepted_status":401,"accepted_body":{"json_error_code":{"code":"invalid_api_key"}}}}}
 EOF
         # shellcheck disable=SC2016
         "$scratch/tools/jq" \
@@ -2303,6 +2325,36 @@ expect_rc 0
 expect_report J08 host
 expect sandbox SKIP 'not running in a sandbox'
 finish_case
+
+mk host_mode_checks_the_python3_dependency_before_the_spec_capture
+if ! prepare_probe; then
+    setup_failed host_mode_checks_the_python3_dependency_before_the_spec_capture
+else
+    mkdir -p "$t/no-py"
+    for tool_link in "$scratch/tools"/*; do
+        tool_name=${tool_link##*/}
+        case $tool_name in
+            python3) continue ;;
+        esac
+        ln -s "$(readlink "$tool_link")" "$t/no-py/$tool_name"
+    done
+    state 'exited 1 0'
+    record "$R_OK1"
+    total=$((total + 1))
+    name=host_mode_checks_the_python3_dependency_before_the_spec_capture
+    problems=
+    bounded 20 env -i PATH="$t/no-py" TMPDIR="$t/tmp" sh "$t/probe" --host --only J08
+    rc=$?
+    cp "$scratch/bounded.out" "$t/out"
+    cp "$scratch/bounded.err" "$t/err"
+    expect_rc 69
+    case $(cat "$t/err") in
+        *'python3'*) ;;
+        *) problems="$problems stderr=[$(cat "$t/err")](want python3 dependency message)" ;;
+    esac
+    [ ! -s "$t/out" ] || problems="$problems stdout-not-empty"
+    finish_case
+fi
 
 mk outside_a_sandbox_the_probe_refuses
 ln -s "$real_uname" "$t/bin/uname" || exit 70
@@ -4584,7 +4636,7 @@ finish_case
 mk host_tools_outside_sandbox_path
 name=host_tools_outside_sandbox_path
 mkdir -p "$t/host-tools"
-for tool in jq sh tr mktemp rm cat; do
+for tool in jq sh tr mktemp rm cat head python3; do
     ln -s "$scratch/tools/$tool" "$t/host-tools/$tool"
 done
 total=$((total + 1))
@@ -4755,6 +4807,9 @@ for tuple in T09 T14 T18; do
     not_disclosed "$export_key"
     finish_case
 done
+fixture_spec=
+fixture_comm=
+fixture_fingerprint=
 
 forge_peer() {
     real_timeout=$(command -v timeout) || return 1
@@ -4833,6 +4888,358 @@ fi
 if grep -Fq 'peer note' "$t/out"; then
     problems="$problems peer-note-in-report"
 fi
+finish_case
+
+mk known_no_head_run_key_is_refused
+real_head=$(command -v head) || exit 70
+cat >"$t/bin/head" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*) exit 1 ;;
+esac
+exec "$real_head" "\$@"
+EOF
+chmod +x "$t/bin/head"
+real_python3_entropy=$python_real
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*) exit 1 ;;
+esac
+exec "$real_python3_entropy" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'exited 1 0'
+record "$R_OK1"
+begin known_no_head_run_key_is_refused sh "$t/probe" --only J08
+expect_rc 70
+case $(cat "$t/err") in
+    *'no key material'*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want no-key refusal)" ;;
+esac
+finish_case
+
+mk run_key_material_is_never_written_to_a_named_file
+real_head_entropy=$(command -v head) || exit 70
+cat >"$t/bin/head" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*)
+        if [ -f /dev/fd/1 ]; then
+            echo named-entropy-file >"$t/entropy.named"
+            exit 1
+        fi
+        ;;
+esac
+exec "$real_head_entropy" "\$@"
+EOF
+chmod +x "$t/bin/head"
+state 'exited 1 0'
+record "$R_OK1"
+begin run_key_material_is_never_written_to_a_named_file sh "$t/probe" --only J08
+expect_rc 0
+expect_report J08 sandbox
+expect environment PASS 'via record'
+if [ -f "$t/entropy.named" ]; then
+    problems="$problems run-entropy-materialized-in-a-named-file"
+fi
+finish_case
+
+mk spec_swapped_for_a_fifo_is_refused_without_blocking
+real_head_swap=$(command -v head) || exit 70
+cat >"$t/bin/head" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"/dev/urandom"*)
+        rm -f "$t/spec"
+        mkfifo "$t/spec"
+        ;;
+esac
+exec "$real_head_swap" "\$@"
+EOF
+chmod +x "$t/bin/head"
+state 'exited 1 0'
+record "$R_OK1"
+begin spec_swapped_for_a_fifo_is_refused_without_blocking sh "$t/probe" --only J08
+expect_rc 65
+case $(cat "$t/err") in
+    *'unreadable'*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want unreadable refusal)" ;;
+esac
+finish_case
+
+mk pin_write_failure_restores_the_original_mode
+real_python3_probe=$python_real
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's/os\.ftruncate(writer, 0)/raise SystemExit(1)/')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_probe" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "http://127.0.0.1:9/v1"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_write_failure_restores_the_original_mode sh "$t/probe" --only J07
+expect_rc 0
+restored_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$restored_mode" != 600 ]; then
+    problems="$problems config-mode=$restored_mode(want 600 restored)"
+fi
+finish_case
+
+mk pin_mid_write_failure_restores_the_original_content_and_mode
+real_python3_mid=$python_real
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's/view = view\[os\.write(writer, view):\]/raise SystemExit(1)/')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_mid" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "http://127.0.0.1:9/v1"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_mid_write_failure_restores_the_original_content_and_mode sh "$t/probe" --only J07
+expect_rc 0
+mid_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$mid_mode" != 600 ]; then
+    problems="$problems config-mode=$mid_mode(want 600 restored)"
+fi
+restored_content=$(cat "$t/sandbox/.codex/config.toml")
+expected_content='model = "gpt-6.1-sol"
+model_provider = "codex"
+
+[model_providers.codex]
+name = "codex"
+base_url = "http://127.0.0.1:9/v1"'
+if [ "$restored_content" != "$expected_content" ]; then
+    problems="$problems config-content-not-restored"
+fi
+finish_case
+
+mk pin_rollback_leaves_a_recreated_absent_path_untouched
+real_python3_absent=$python_real
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's/handle = os\.open(name, os\.O_RDONLY | os\.O_NOFOLLOW, dir_fd=dirfd)/raise FileNotFoundError/')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_absent" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_rollback_leaves_a_recreated_absent_path_untouched sh "$t/probe" --only J07
+expect_rc 0
+if [ ! -e "$t/sandbox/.codex/config.toml" ]; then
+    problems="$problems rollback-deleted-the-recreated-path"
+fi
+absent_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$absent_mode" != 600 ]; then
+    problems="$problems recreated-mode=$absent_mode(want 600 untouched)"
+fi
+finish_case
+
+mk pin_failed_write_restorer_skips_a_replaced_identity
+real_python3_replace=$python_real
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+rewrite=
+for a in "\$@"; do
+    if [ "\$rewrite" = 1 ]; then
+        a=\$(printf '%s' "\$a" | sed 's@os\.ftruncate(writer, 0)@os.rename(name, name + ".moved") or os.close(os.open(name, os.O_CREAT | os.O_WRONLY, 0o644)) or os.chmod(name, 0o644) or (_ for _ in ()).throw(SystemExit(1))@')
+        rewrite=
+    fi
+    case \$a in
+        -c) rewrite=1 ;;
+    esac
+    shift
+    set -- "\$@" "\$a"
+done
+exec "$real_python3_replace" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin pin_failed_write_restorer_skips_a_replaced_identity sh "$t/probe" --only J07
+expect_rc 0
+if [ ! -e "$t/sandbox/.codex/config.toml.moved" ]; then
+    problems="$problems original-identity-not-preserved"
+fi
+replaced_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$replaced_mode" != 644 ]; then
+    problems="$problems replacement-mode=$replaced_mode(want 644 untouched)"
+fi
+finish_case
+
+mk cleanup_restores_only_the_pinned_identity
+state 'running 1'
+proc_main
+proc_codex
+auth_json '{"tokens":{"access_token":"openshell:resolve:env:CODEX_AUTH_ACCESS_TOKEN"}}'
+{
+    printf 'model = "gpt-6.1-sol"\n'
+    printf 'model_provider = "codex"\n'
+    printf '\n'
+    printf '[model_providers.codex]\n'
+    printf 'name = "codex"\n'
+    printf 'base_url = "https://chatgpt.com/backend-api/models"\n'
+} >"$t/sandbox/.codex/config.toml"
+chmod 600 "$t/sandbox/.codex/config.toml"
+(
+    swap_ticks=0
+    pinned_seen=
+    while [ "$swap_ticks" -lt 1000 ]; do
+        current_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+        if [ -z "$pinned_seen" ]; then
+            if [ "$current_mode" != 600 ] && [ -n "$current_mode" ]; then
+                pinned_seen=1
+                printf '%s\n' "$current_mode" >"$t/observed.mode"
+            fi
+        elif [ "$current_mode" = 600 ]; then
+            rm -f "$t/sandbox/.codex/config.toml"
+            printf 'replacement\n' >"$t/sandbox/.codex/config.toml"
+            chmod 644 "$t/sandbox/.codex/config.toml"
+            : >"$t/replaced"
+            exit 0
+        fi
+        sleep 0.01
+        swap_ticks=$((swap_ticks + 1))
+    done
+    exit 0
+) &
+swap_pid=$!
+cat >"$t/bin/codex" <<EOF
+#!/bin/sh
+case " \$* " in
+    *"Use one shell tool"*)
+        waited=0
+        while [ ! -e "$t/observed.mode" ] && [ "\$waited" -lt 100 ]; do
+            sleep 0.05
+            waited=\$((waited + 1))
+        done
+        printf '%s\n' '{"type":"turn_context","provider":"codex","model":"gpt-6.1-sol"}'
+        printf '%s\n' '{"type":"exec_command_begin","workdir":"$t/sandbox/project","command":["ls","-A"]}'
+        printf '%s\n' '{"type":"exec_command_end","exit_code":0,"stdout":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/codex"
+begin cleanup_restores_only_the_pinned_identity sh "$t/probe" --only J07
+wait "$swap_pid" 2>/dev/null
+if [ ! -e "$t/replaced" ]; then
+    problems="$problems replacement-never-happened"
+fi
+replaced_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+if [ "$replaced_mode" != 644 ]; then
+    problems="$problems replacement-mode=$replaced_mode(want 644 untouched)"
+fi
+observed_mode=$(cat "$t/observed.mode" 2>/dev/null)
+if [ "$observed_mode" != 400 ]; then
+    problems="$problems pinned-mode=[$observed_mode](want [400])"
+fi
+expect_rc 0
+expect agent_exec PASS 'completed the declared tool'
 finish_case
 
 fixture_spec=
