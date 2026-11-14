@@ -654,9 +654,19 @@ execute() {
             return 70
         }
         if command -v setpriv >/dev/null 2>&1; then
-            set -- "$@" setpriv --reuid="$depriv_uid" --regid="$depriv_gid" --clear-groups
+            depriv_tool=$(command -v setpriv) || depriv_tool=
+            [ -n "$depriv_tool" ] || {
+                fixture_setup_failed=1
+                return 70
+            }
+            set -- "$@" "$depriv_tool" --reuid="$depriv_uid" --regid="$depriv_gid" --clear-groups
         elif command -v su >/dev/null 2>&1; then
-            set -- "$@" su -s /bin/sh "$depriv_for" -c "exec \"\$@\"" run
+            depriv_tool=$(command -v su) || depriv_tool=
+            [ -n "$depriv_tool" ] || {
+                fixture_setup_failed=1
+                return 70
+            }
+            set -- "$@" "$depriv_tool" -s /bin/sh "$depriv_for" -c "exec \"\$@\"" run
         else
             fixture_setup_failed=1
             return 70
