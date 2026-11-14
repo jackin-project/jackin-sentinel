@@ -1486,6 +1486,7 @@ pin_declared_configs() {
     PIN_IDS=
     PIN_STATS=
     PIN_DIRS=
+    PIN_DIRS_PRE=
     pin_declared_configs_run || {
         unpin_declared_configs
         return 1
@@ -1533,7 +1534,8 @@ try:
         named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise SystemExit(1)
-        sys.stdout.write("%o\n%d %d %d %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
+        dirst = os.fstat(dirfd)
+        sys.stdout.write("%o\n%d %d %d %d %d\n%o %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, stat.S_IMODE(dirst.st_mode), dirst.st_dev, dirst.st_ino))
     finally:
         os.close(handle)
 finally:
@@ -1541,6 +1543,7 @@ finally:
 ' "$declared_path" 2>/dev/null) || return 1
         declared_pre_mode=$(printf '%s\n' "$declared_pre" | sed -n 1p)
         declared_pre_id=$(printf '%s\n' "$declared_pre" | sed -n 2p)
+        declared_pre_dir=$(printf '%s\n' "$declared_pre" | sed -n 3p)
         declared_recorded_id=$(printf '%s\n' "$DECL_IDS" | sed -n "$((declared_index + 1))p")
         [ -n "$declared_recorded_id" ] || return 1
         if [ "$declared_pre_mode" = absent ]; then
@@ -1552,12 +1555,17 @@ finally:
 "
             PIN_DIRS="${PIN_DIRS}absent
 "
+            PIN_DIRS_PRE="${PIN_DIRS_PRE}absent
+"
             return 1
         fi
         case $declared_pre_mode in
             '' | *[!0-7]*) return 1 ;;
         esac
         case $declared_pre_id in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        case $declared_pre_dir in
             '' | *[!0-9\ ]*) return 1 ;;
         esac
         case $declared_recorded_id in
@@ -1567,6 +1575,8 @@ finally:
         PIN_MODES="${PIN_MODES}${declared_pre_mode}
 "
         PIN_IDS="${PIN_IDS}${declared_recorded_id}
+"
+        PIN_DIRS_PRE="${PIN_DIRS_PRE}${declared_pre_dir} ${declared_freeze}
 "
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
@@ -1736,6 +1746,7 @@ unpin_declared_configs() {
                 declared_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((declared_index + 1))p")
                 declared_ident=$(printf '%s\n' "$PIN_IDS" | sed -n "$((declared_index + 1))p")
                 declared_dir=$(printf '%s\n' "$PIN_DIRS" | sed -n "$((declared_index + 1))p")
+                declared_dir_pre=$(printf '%s\n' "$PIN_DIRS_PRE" | sed -n "$((declared_index + 1))p")
                 python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 mode = int(sys.argv[2], 8)
@@ -1750,6 +1761,8 @@ try:
 except ValueError:
     raise SystemExit(0)
 dirfields = sys.argv[5].split()
+if len(dirfields) < 4:
+    dirfields = sys.argv[6].split()
 parent, name = os.path.split(path)
 if not name:
     raise SystemExit(0)
@@ -1792,7 +1805,7 @@ try:
         os.close(handle)
 finally:
     os.close(dirfd)
-' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" "$declared_dir" 2>/dev/null || true
+' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" "$declared_dir" "$declared_dir_pre" 2>/dev/null || true
                 ;;
         esac
         declared_index=$((declared_index + 1))
@@ -1801,6 +1814,7 @@ finally:
     PIN_IDS=
     PIN_STATS=
     PIN_DIRS=
+    PIN_DIRS_PRE=
     return 0
 }
 
