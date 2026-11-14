@@ -636,6 +636,32 @@ execute() {
         }
         decoy_dir=
     fi
+    depriv_for=${depriv_user-}
+    depriv_user=
+    if [ -n "$depriv_for" ] && [ "$(id -u)" = 0 ]; then
+        depriv_uid=$(id -u "$depriv_for" 2>/dev/null) || depriv_uid=
+        depriv_gid=$(id -g "$depriv_for" 2>/dev/null) || depriv_gid=
+        if [ -z "$depriv_uid" ] || [ -z "$depriv_gid" ]; then
+            fixture_setup_failed=1
+            return 70
+        fi
+        chown -R "$depriv_uid:$depriv_gid" "$t" || {
+            fixture_setup_failed=1
+            return 70
+        }
+        chmod o+rx "$scratch" || {
+            fixture_setup_failed=1
+            return 70
+        }
+        if command -v setpriv >/dev/null 2>&1; then
+            set -- "$@" setpriv --reuid="$depriv_uid" --regid="$depriv_gid" --clear-groups
+        elif command -v su >/dev/null 2>&1; then
+            set -- "$@" su -s /bin/sh "$depriv_for" -c "exec \"\$@\"" run
+        else
+            fixture_setup_failed=1
+            return 70
+        fi
+    fi
     set -- "$@" sh "$t/probe" --only "${step#step_}"
     [ -z "$engine" ] || set -- "$@" --engine "$engine"
     bounded 20 env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" "$@"
@@ -1907,7 +1933,9 @@ echo ready
 exit 0
 EOF
 chmod +x "$t/bin/omp"
+depriv_user=nobody
 begin t09_a_mid_request_swap_and_restore_does_not_rebind_the_launch step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+depriv_user=
 expect agent_reaches_api PASS 'completed the declared tool'
 expect_never_sent 'http://127.0.0.1:9/v1'
 used_endpoint=$(cat "$t/omp.used" 2>/dev/null)
