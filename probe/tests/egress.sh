@@ -3574,18 +3574,26 @@ mk t09_a_the_staged_home_leaves_no_read_only_tree_behind
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
-leaked_before=0
-for leaked_dir in /tmp/jackin-sentinel-probe.*/agent-home; do
-    [ -d "$leaked_dir" ] || continue
-    leaked_before=$((leaked_before + 1))
-done
+mv "$t/bin/omp" "$t/bin/omp.real"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+if [ -n "\${CODEX_HOME-}" ]; then
+    printf '%s\n' "\${CODEX_HOME%/*}" >"$t/work.recorded"
+fi
+exec "$t/bin/omp.real" "\$@"
+EOF
+chmod +x "$t/bin/omp"
 begin t09_a_the_staged_home_leaves_no_read_only_tree_behind step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
-leaked_after=0
-for leaked_dir in /tmp/jackin-sentinel-probe.*/agent-home; do
-    [ -d "$leaked_dir" ] || continue
-    leaked_after=$((leaked_after + 1))
-done
-[ "$leaked_after" = "$leaked_before" ] || problems="$problems the-staged-home-tree-was-left-behind=[$leaked_before]->[$leaked_after]"
+recorded_work=$(cat "$t/work.recorded" 2>/dev/null)
+[ -n "$recorded_work" ] || problems="$problems the-agent-never-ran"
+case $recorded_work in
+    /tmp/jackin-sentinel-probe.*) ;;
+    *) problems="$problems the-recorded-work-tree=[$recorded_work](want this run's work tree)" ;;
+esac
+if [ -n "$recorded_work" ]; then
+    [ ! -e "$recorded_work/agent-home" ] || problems="$problems the-staged-home-tree-was-left-behind=$recorded_work/agent-home"
+    [ ! -e "$recorded_work" ] || problems="$problems the-probe-work-tree-was-left-behind=$recorded_work"
+fi
 finish_case
 
 mk t09_a_the_agent_cannot_leave_a_sealed_staged_home_behind
