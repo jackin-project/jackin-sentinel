@@ -3781,5 +3781,107 @@ redirected=$(cat "$t/redirected" 2>/dev/null)
 [ "$redirected" = 'the redirected file keeps its content' ] || problems="$problems the-staged-copy-was-written-through-the-symlink"
 finish_case
 
+mk t09_a_j09_fails_when_the_fresh_configuration_pin_fails
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+script=
+prev=
+for a in "\$@"; do
+    if [ "\$prev" = -c ]; then
+        script=\$a
+        break
+    fi
+    prev=\$a
+done
+case "\$script" in
+    *'want_dev = int(fields[0])'*)
+        chmod u+w "$t/sandbox/.omp/agent/models.yml" 2>/dev/null || :
+        printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml" 2>/dev/null || :
+        printf '%s\n' 'the declared configuration was changed after the unpin' >"$t/helper.ran"
+        ;;
+esac
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
+problems=
+name=t09_a_j09_fails_when_the_fresh_configuration_pin_fails
+execute J07,J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+execute_rc=$?
+if [ "$execute_rc" -eq 0 ]; then :; else problems="$problems exit=[$execute_rc](want [0])"; fi
+jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J07","J09"]' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape"
+[ -f "$t/helper.ran" ] || problems="$problems the-helper-never-changed-the-declared-configuration"
+expect agent_exec PASS 'codex exec answered the fixed prompt and completed the declared tool'
+expect agent_reaches_api FAIL 'the agent exec evidence is not bound to a successful configuration pin'
+finish_case
+
+mk t09_a_j07_and_j09_pass_when_the_configuration_is_unchanged
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
+problems=
+name=t09_a_j07_and_j09_pass_when_the_configuration_is_unchanged
+execute J07,J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+execute_rc=$?
+if [ "$execute_rc" -eq 0 ]; then :; else problems="$problems exit=[$execute_rc](want [0])"; fi
+jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J07","J09"]' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape"
+expect agent_exec PASS 'codex exec answered the fixed prompt and completed the declared tool'
+expect agent_reaches_api PASS 'codex exec answered and completed the declared tool'
+finish_case
+
+mk t09_a_j07_and_j09_pass_when_the_configuration_is_unchanged
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
+problems=
+name=t09_a_j07_and_j09_pass_when_the_configuration_is_unchanged
+execute J07,J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+execute_rc=$?
+if [ "$execute_rc" -eq 0 ]; then :; else problems="$problems exit=[$execute_rc](want [0])"; fi
+jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J07","J09"]' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape"
+expect agent_exec PASS 'codex exec answered the fixed prompt and completed the declared tool'
+expect agent_reaches_api PASS 'codex exec answered and completed the declared tool'
+finish_case
+
+mk t01_a_the_staged_copy_refuses_a_symlinked_parent
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+mkdir -p "$t/redirected"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+if [ -n "\${RB_DST-}" ]; then
+    parent=\${RB_DST%/*}
+    "$python_bin" -c 'import os, sys
+parent = sys.argv[1]
+target = sys.argv[2]
+try:
+    os.rmdir(parent)
+except OSError:
+    pass
+try:
+    os.symlink(target, parent)
+except OSError:
+    pass' "\$parent" "$t/redirected" 2>/dev/null || :
+    printf '%s\n' "\$RB_DST" >"$t/redirected.at"
+fi
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin t01_a_the_staged_copy_refuses_a_symlinked_parent step_J09 ''
+[ -f "$t/redirected.at" ] || problems="$problems the-staged-copy-was-never-attempted"
+[ ! -e "$t/redirected/auth.json" ] || problems="$problems the-staged-copy-was-written-outside-the-staging-tree"
+expect agent_reaches_api SKIP 'could not stage the validated credential home'
+expect_codex_not_run
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

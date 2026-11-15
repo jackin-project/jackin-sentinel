@@ -1789,7 +1789,9 @@ finally:
         case $declared_recorded_id in
             '' | *[!0-9\ ]*) return 1 ;;
         esac
-        [ "$declared_pre_id" = "$declared_recorded_id" ] || return 1
+        declared_pre_key=${declared_pre_id% *}
+        declared_recorded_key=${declared_recorded_id% *}
+        [ "$declared_pre_key" = "$declared_recorded_key" ] || return 1
         PIN_MODES="${PIN_MODES}${declared_pre_mode}
 "
         PIN_IDS="${PIN_IDS}${declared_recorded_id}
@@ -1834,7 +1836,7 @@ try:
             raise SystemExit(1)
         mode = stat.S_IMODE(opened.st_mode)
         identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
-        if len(expected) != 5 or tuple(int(v) for v in expected) != identity:
+        if len(expected) != 5 or tuple(int(v) for v in expected[:4]) != identity[:4]:
             raise SystemExit(1)
         current = b""
         while len(current) <= len(data):
@@ -2341,7 +2343,13 @@ agent_exec_verified() {
 }
 
 ensure_agent_exec() {
-    [ -f "$work/agent_exec.json" ] && return 0
+    if [ -f "$work/agent_exec.json" ]; then
+        if [ "${pin_state-}" != pinned ] && [ "${prompt_configs_validated-}" = true ]; then
+            agent_exec_reuse_refused=1
+            return 1
+        fi
+        return 0
+    fi
     launch_kind=none
     why="the sandbox holds no credential"
     if stage_agent_home; then
@@ -3736,6 +3744,12 @@ step_J07() (
     if [ -n "$launcher_pid" ] && [ -n "$launcher_interp" ]; then
         launcher_identity=$(proc_launcher_identity_record "$launcher_pid" "$launcher_interp" "$launcher_interp_arg" "$launcher_stat_pre" "$launcher_exe_pre" "$launcher_uid_pre" "$launcher_comm_pre") || launcher_identity=null
     fi
+    if [ "${agent_exec_reuse_refused-}" = 1 ]; then
+        fail agent_exec "the agent exec evidence is not bound to a successful configuration pin"
+        _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0], agent_exec: null}')
+        seal_facts "$_jks_facts_doc"
+        return 0
+    fi
     if ! agent_exec_verified; then
         fail agent_exec "the agent exec evidence is not authentic"
         _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0], agent_exec: null}')
@@ -4273,7 +4287,10 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    if agent_exec_verified; then
+    if [ "${agent_exec_reuse_refused-}" = 1 ]; then
+        _jks_ae_facts_doc=null
+        fail agent_reaches_api "the agent exec evidence is not bound to a successful configuration pin"
+    elif agent_exec_verified; then
         _jks_ae_facts_doc=$_jks_agent_exec_doc
         attempted=$(
             jq -r '.attempted' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
@@ -5234,6 +5251,7 @@ main() {
     spec=
     prompt_configs_validated=false
     prompt_configs_pinned=false
+    pin_state=none
     declared_use_snapshot=
     if declared_provider_config; then
         prompt_configs_validated=true
@@ -5295,6 +5313,9 @@ EOF
                     if pin_declared_configs; then
                         pin_owner=$id
                         prompt_configs_pinned=true
+                        pin_state=pinned
+                    else
+                        pin_state=failed
                     fi
                 fi
                 ;;
