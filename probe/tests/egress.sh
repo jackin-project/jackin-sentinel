@@ -2444,6 +2444,46 @@ expect agent_reaches_api PASS 'completed the declared tool'
 jq -e '.target.tuple == "T01" and .target.adapter == "t01-codex-v1" and .target.spec_sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$t/out" >/dev/null 2>&1 || problems="$problems target-not-snapshotted"
 finish_case
 
+mk j09_a_a_specification_rewritten_while_it_is_read_is_refused
+mv "$scratch/tools/head" "$scratch/head.save"
+cat >"$scratch/tools/head" <<EOF
+#!/bin/sh
+if python3 -I -c 'import os, sys
+try:
+    fd = os.open("/dev/fd/9", os.O_RDONLY)
+    try:
+        seen = os.pread(fd, 32, 0)
+    finally:
+        os.close(fd)
+    with open(sys.argv[1], "rb") as handle:
+        want = handle.read(32)
+except OSError:
+    raise SystemExit(1)
+raise SystemExit(0 if seen == want else 1)
+' "$t/spec" 2>/dev/null; then
+    wc -c <"$t/spec" >"$t/spec.bytes" 2>/dev/null || :
+    "$scratch/tools/jq" '.target.model = "gpt-6.1-evl"' "$t/spec" >"$t/spec.tampered" 2>/dev/null || :
+    cat "$t/spec.tampered" >"$t/spec" 2>/dev/null || :
+fi
+exec "$scratch/head.save" "\$@"
+EOF
+chmod +x "$scratch/tools/head"
+[ "$skip_case" -eq 0 ] && total=$((total + 1))
+name=j09_a_a_specification_rewritten_while_it_is_read_is_refused
+problems=
+execute step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+execute_rc=$?
+[ "$execute_rc" -eq 65 ] || problems="$problems exit=[$execute_rc](want [65])"
+grep -q 'changed while it was read' "$t/err" 2>/dev/null || problems="$problems the-rewritten-specification-was-not-refused"
+[ -f "$t/spec.bytes" ] || problems="$problems the-reader-never-opened-the-specification"
+if [ -f "$t/spec.bytes" ]; then
+    spec_bytes=$(tr -d '[:space:]' <"$t/spec.bytes")
+    spec_now=$(wc -c <"$t/spec" | tr -d '[:space:]')
+    [ "$spec_bytes" = "$spec_now" ] || problems="$problems the-rewrite-changed-the-size=[$spec_bytes]->[$spec_now]"
+fi
+finish_case
+mv "$scratch/head.save" "$scratch/tools/head"
+
 mk j09_the_agent_cannot_reach_the_attested_spec_snapshot
 codex_says_home_mutator
 with_curl
@@ -3548,6 +3588,94 @@ done
 [ "$leaked_after" = "$leaked_before" ] || problems="$problems the-staged-home-tree-was-left-behind=[$leaked_before]->[$leaked_after]"
 finish_case
 
+mk t09_a_the_agent_cannot_leave_a_sealed_staged_home_behind
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+d=\${CODEX_HOME%/*}
+printf '%s\n' "\$d" >"$t/work.recorded"
+rm -f "\$d/agent-home.dirs" 2>/dev/null || :
+awk 'BEGIN { for (i = 0; i < 200000; i++) print "x y z 1 2 3 6 7 8 9 10 11 12 13 14" }' >"\$d/agent-home.dirs" 2>/dev/null || :
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_the_agent_cannot_leave_a_sealed_staged_home_behind step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+recorded_work=$(cat "$t/work.recorded" 2>/dev/null)
+[ -n "$recorded_work" ] || problems="$problems the-agent-never-ran"
+if [ -n "$recorded_work" ]; then
+    [ ! -e "$recorded_work" ] || problems="$problems the-sealed-staged-home-was-left-behind=$recorded_work"
+fi
+finish_case
+
+mk t09_a_a_symlinked_evidence_seal_is_not_written_through
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'the sealed target keeps its content' >"$t/seal.target"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+python3 -c 'import os, sys
+os.symlink(sys.argv[1], sys.argv[2])' "$t/seal.target" "\${CODEX_HOME:-/nonexistent}/../agent_exec.seal" 2>/dev/null || :
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_a_symlinked_evidence_seal_is_not_written_through step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+[ "$(cat "$t/seal.target")" = "the sealed target keeps its content" ] || problems="$problems the-seal-target-was-overwritten"
+finish_case
+
+mk t09_a_a_fifo_evidence_seal_does_not_block_the_probe
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+mkfifo "$t/seal.fifo" || exit 70
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+python3 -c 'import os, sys
+os.symlink(sys.argv[1], sys.argv[2])' "$t/seal.fifo" "\${CODEX_HOME:-/nonexistent}/../agent_exec.seal" 2>/dev/null || :
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_a_fifo_evidence_seal_does_not_block_the_probe step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
 mk t09_a_the_cleanup_restores_the_frozen_parent_after_the_config_disappears
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
@@ -3593,6 +3721,19 @@ chmod +x "$t/bin/python3"
 printf '%s\n' '{baseUrl: https://api.z.ai/api/anthropic, credentialEnv: ZAI_API_KEY, default: zai/glm-5.3}' >"$t/sandbox/.omp/config.toml"
 printf '%s\n' '{baseUrl: https://api.z.ai/api/anthropic, api: anthropic-messages, apiKey: ZAI_API_KEY}' >"$t/sandbox/.omp/agent/models.yml"
 begin t09_a_a_root_flow_mapping_config_is_parsed step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_a_an_indented_comment_before_a_root_flow_mapping_is_parsed_without_pyyaml
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '#!/bin/sh\nexec %s -S "$@"\n' "$python_bin" >"$t/bin/python3"
+chmod +x "$t/bin/python3"
+printf '%s\n' '  # the endpoint configuration' '{baseUrl: https://api.z.ai/api/anthropic, credentialEnv: ZAI_API_KEY, default: zai/glm-5.3}' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' '  # the endpoint configuration' '{baseUrl: https://api.z.ai/api/anthropic, api: anthropic-messages, apiKey: ZAI_API_KEY}' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_an_indented_comment_before_a_root_flow_mapping_is_parsed_without_pyyaml step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api PASS 'completed the declared tool'
 fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
 finish_case

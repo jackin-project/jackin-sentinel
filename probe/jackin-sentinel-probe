@@ -30,7 +30,6 @@ EXPECTED_PROVIDER=
 EXPECTED_MODEL=
 PIN_MODES=
 PIN_STATS=
-PIN_HOME_DIRS=
 DECL_IDS=
 stage_config_paths=
 stage_config_stats=
@@ -95,6 +94,35 @@ have() {
     command -v "$1" >/dev/null 2>&1
 }
 
+write_nofollow() {
+    _jks_wnf_path=$1
+    _jks_wnf_mode=$2
+    python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+mode = sys.argv[2]
+flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+if mode == "append":
+    flags |= os.O_APPEND
+else:
+    flags |= os.O_TRUNC
+try:
+    handle = os.open(path, flags, 0o600)
+except OSError:
+    raise SystemExit(1)
+try:
+    if not stat.S_ISREG(os.fstat(handle).st_mode):
+        raise SystemExit(1)
+    data = sys.stdin.buffer.read()
+    view = memoryview(data)
+    while view:
+        view = view[os.write(handle, view):]
+except OSError:
+    raise SystemExit(1)
+finally:
+    os.close(handle)
+' "$_jks_wnf_path" "$_jks_wnf_mode" 2>/dev/null
+}
+
 check() {
     detail=$3
     if [ "$2" != PASS ] && [ -z "$detail" ]; then
@@ -109,23 +137,23 @@ check() {
         _jks_chain=$(printf '%s%s\n' "$RUN_KEY$_jks_chain" "$_jks_doc" | sha256sum)
         _jks_chain=${_jks_chain%% *}
         if [ -n "$_jks_chain" ]; then
-            printf '%s\n' "$_jks_chain" >"$work/checks.tag"
+            printf '%s\n' "$_jks_chain" | write_nofollow "$work/checks.tag" truncate || return 1
         fi
     fi
-    printf '%s\n' "$_jks_doc" >>"$work/checks"
+    printf '%s\n' "$_jks_doc" | write_nofollow "$work/checks" append || return 1
 }
 
 seal_facts() {
     if [ -z "$1" ]; then
-        : >"$work/facts"
-        : >"$work/facts.tag"
+        : | write_nofollow "$work/facts" truncate || return 1
+        : | write_nofollow "$work/facts.tag" truncate || return 1
         return 0
     fi
-    printf '%s\n' "$1" >"$work/facts"
+    printf '%s\n' "$1" | write_nofollow "$work/facts" truncate || return 1
     if [ -n "$RUN_KEY" ]; then
         _jks_chain=$(printf '%s%s\n' "$RUN_KEY$_jks_chain" "$1" | sha256sum)
         _jks_chain=${_jks_chain%% *}
-        printf '%s\n' "$_jks_chain" >"$work/facts.tag"
+        printf '%s\n' "$_jks_chain" | write_nofollow "$work/facts.tag" truncate || return 1
     fi
 }
 
@@ -802,8 +830,13 @@ process_checks() {
 }
 
 agent_tool_evidence() {
-    : >"$work/tool.out"
-    : >"$work/tool.observation"
+    tool_output_ready=true
+    if ! : | write_nofollow "$work/tool.out" truncate; then
+        tool_output_ready=false
+    fi
+    if ! : | write_nofollow "$work/tool.observation" truncate; then
+        tool_output_ready=false
+    fi
     tool_attempted=false
     tool_succeeded=false
     tool_exit=
@@ -842,7 +875,7 @@ agent_tool_evidence() {
         done <<EOF
 $TOOL_ARGV
 EOF
-        if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ] && declared_configs_stat_unchanged; then
+        if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ] && declared_configs_stat_unchanged && [ "$tool_output_ready" = true ]; then
             (
                 ulimit -f 128
                 cd "$PROJECT" || exit 1
@@ -853,7 +886,7 @@ EOF
         else
             tool_exit=126
             if [ "$configs_pinned" = true ] && ! declared_configs_stat_unchanged; then
-                : >"$work/config-gate.refused"
+                : | write_nofollow "$work/config-gate.refused" truncate
             fi
         fi
         if [ "$configs_pinned" = true ]; then
@@ -973,8 +1006,9 @@ copy_bounded() {
 }
 
 capture_open_exec() {
-    RB_SRC=$1 RB_DST=$2 RB_CAP=$3 RB_LEN=$4 RB_NUL=$5 RB_BODY=$6 python3 -I -c 'import os, stat, sys
+    RB_SRC=$1 RB_DST=$2 RB_CAP=$3 RB_LEN=$4 RB_NUL=$5 RB_BODY=$6 python3 -I -c 'import os, stat, subprocess, sys
 src = os.environ["RB_SRC"]
+cap = int(os.environ["RB_CAP"])
 try:
     handle = os.open(src, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
 except OSError:
@@ -985,7 +1019,7 @@ if not stat.S_ISREG(opened.st_mode):
 named = os.lstat(src)
 if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
     raise SystemExit(1)
-if opened.st_size > int(os.environ["RB_CAP"]):
+if opened.st_size > cap:
     raise SystemExit(1)
 if os.environ["RB_NUL"] == "1" and b"\x00" in os.pread(handle, min(opened.st_size, int(os.environ["RB_LEN"])), 0):
     raise SystemExit(1)
@@ -993,7 +1027,19 @@ os.dup2(handle, 9)
 if handle != 9:
     os.close(handle)
 os.set_inheritable(9, True)
-os.execvp("sh", ["sh", "-c", os.environ["RB_BODY"]])
+completed = subprocess.run(["sh", "-c", os.environ["RB_BODY"]], pass_fds=(9,))
+try:
+    after = os.fstat(9)
+    renamed = os.lstat(src)
+except OSError:
+    raise SystemExit(3)
+if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+    raise SystemExit(3)
+if (renamed.st_dev, renamed.st_ino) != (after.st_dev, after.st_ino):
+    raise SystemExit(3)
+if completed.returncode < 0:
+    os.kill(os.getpid(), -completed.returncode)
+raise SystemExit(completed.returncode)
 ' 2>/dev/null
 }
 
@@ -1029,7 +1075,9 @@ fi
 printf "%s" "$cb_raw"
 printf x
 EOF_JKS_CAPTURE_BODY
-    _jks_capture=$(capture_open_exec "$1" "" "$2" "$3" 1 "$capture_body") || return 1
+    _jks_capture=$(capture_open_exec "$1" "" "$2" "$3" 1 "$capture_body")
+    _jks_capture_status=$?
+    [ "$_jks_capture_status" -eq 0 ] || return "$_jks_capture_status"
     _jks_capture=${_jks_capture%x}
     return 0
 }
@@ -1426,7 +1474,7 @@ def plain_root_scalars(text):
                 continue
         elif line.split("#", 1)[0].rstrip() == "...":
             continue
-        if not line.strip() or line[0] == "#":
+        if not line.strip() or line.lstrip(" \t").startswith("#"):
             continue
         if flow_collection_line(line):
             if not seen and line.lstrip().startswith("{"):
@@ -2056,40 +2104,100 @@ EOF_JKS_EXPECTED_MODEL
 }
 
 unseal_agent_home() {
-    _jks_home_dirs=${PIN_HOME_DIRS-}
-    if [ -z "$_jks_home_dirs" ] && [ -f "$work/agent-home.dirs" ]; then
-        _jks_home_dirs=$(cat "$work/agent-home.dirs" 2>/dev/null) || _jks_home_dirs=
-    fi
-    [ -n "$_jks_home_dirs" ] || return 0
-    while read -r home_dir home_mode home_dev home_ino; do
-        [ -n "$home_dir" ] || continue
-        case $home_dir in
-            "$work/agent-home") ;;
-            "$work/agent-home"/*) ;;
-            *) continue ;;
-        esac
-        python3 -I -c 'import os, stat, sys
-path = sys.argv[1]
-mode = int(sys.argv[2], 8)
-want_dev = int(sys.argv[3])
-want_ino = int(sys.argv[4])
+    _jks_home_root=$work/agent-home
+    [ -e "$_jks_home_root" ] || return 0
+    python3 -I -c 'import os, stat, sys
+root = sys.argv[1]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+depth_limit = 32
+entry_limit = 4096
+total_limit = 65536
+visit_limit = 4096
+visited = 0
+scanned = 0
+
+
+def unseal(fd):
+    try:
+        current = os.fstat(fd)
+        mode = stat.S_IMODE(current.st_mode)
+        os.fchmod(fd, mode | 0o700)
+    except OSError:
+        pass
+
+
+def unseal_named(fd, name):
+    try:
+        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(named.st_mode):
+        return None
+    try:
+        os.chmod(name, stat.S_IMODE(named.st_mode) | 0o700, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+    except OSError:
+        return None
+
+
+def descend(fd, depth):
+    global visited, scanned
+    if depth > depth_limit or visited >= visit_limit or scanned >= total_limit:
+        return
+    try:
+        scan = os.dup(fd)
+    except OSError:
+        return
+    try:
+        try:
+            entries = os.scandir(scan)
+        except OSError:
+            return
+        with entries:
+            seen = 0
+            for entry in entries:
+                seen += 1
+                scanned += 1
+                if seen > entry_limit or scanned > total_limit or visited >= visit_limit:
+                    break
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                try:
+                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+                except OSError:
+                    child = unseal_named(fd, entry.name)
+                if child is None:
+                    continue
+                try:
+                    visited += 1
+                    unseal(child)
+                    descend(child, depth + 1)
+                finally:
+                    os.close(child)
+    finally:
+        try:
+            os.close(scan)
+        except OSError:
+            pass
+
+
 try:
-    handle = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
 except OSError:
     raise SystemExit(0)
 try:
-    current = os.fstat(handle)
-    if (current.st_dev, current.st_ino) != (want_dev, want_ino):
-        raise SystemExit(0)
-    os.fchmod(handle, mode)
+    visited += 1
+    unseal(rootfd)
+    descend(rootfd, 1)
 finally:
-    os.close(handle)
-' "$home_dir" "$home_mode" "$home_dev" "$home_ino" 2>/dev/null || true
-    done <<EOF_JKS_HOME_DIRS
-$_jks_home_dirs
-EOF_JKS_HOME_DIRS
-    PIN_HOME_DIRS=
-    rm -f "$work/agent-home.dirs" 2>/dev/null || :
+    os.close(rootfd)
+' "$_jks_home_root" 2>/dev/null || :
     return 0
 }
 
@@ -2143,23 +2251,16 @@ stage_agent_home() {
     done <<EOF_JKS_STAGE_CONFIGS
 $stage_config_paths
 EOF_JKS_STAGE_CONFIGS
-    PIN_HOME_DIRS=$(python3 -I -c 'import os, stat, sys
+    python3 -I -c 'import os, stat, sys
 root = sys.argv[1]
-lines = []
 for dirpath, dirnames, filenames in os.walk(root, topdown=False):
     handle = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     try:
         current = os.fstat(handle)
-        mode = stat.S_IMODE(current.st_mode)
-        os.fchmod(handle, mode & ~0o222)
-        lines.append("%s %o %d %d" % (dirpath, mode, current.st_dev, current.st_ino))
+        os.fchmod(handle, stat.S_IMODE(current.st_mode) & ~0o222)
     finally:
         os.close(handle)
-if lines:
-    sys.stdout.write("\n".join(lines) + "\n")
-' "$stage_dir" 2>/dev/null) || return 1
-    printf '%s' "$PIN_HOME_DIRS" >"$work/agent-home.dirs" 2>/dev/null || return 1
-    chmod 0600 "$work/agent-home.dirs" 2>/dev/null || return 1
+' "$stage_dir" 2>/dev/null || return 1
     return 0
 }
 
@@ -2167,7 +2268,33 @@ agent_exec_seal() {
     [ -n "$RUN_KEY" ] || return 1
     _jks_agent_exec_seal=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
     _jks_agent_exec_seal=${_jks_agent_exec_seal%% *}
-    printf '%s\n' "$_jks_agent_exec_seal" >"$work/agent_exec.seal" || return 1
+    printf '%s\n' "$_jks_agent_exec_seal" | python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+except OSError:
+    raise SystemExit(1)
+try:
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
+except OSError:
+    raise SystemExit(1)
+try:
+    if not stat.S_ISREG(os.fstat(handle).st_mode):
+        raise SystemExit(1)
+    data = sys.stdin.buffer.read()
+    view = memoryview(data)
+    while view:
+        view = view[os.write(handle, view):]
+except OSError:
+    raise SystemExit(1)
+finally:
+    os.close(handle)
+' "$work/agent_exec.seal" 2>/dev/null || {
+        echo "$PROBE: the evidence seal could not be written through a no-follow descriptor; refusing to attest" >&2
+        return 1
+    }
     return 0
 }
 
@@ -2308,7 +2435,7 @@ EOF
         unseal_agent_home
         rm -rf "$work/agent-home" 2>/dev/null
     fi
-    printf '%s' "$why" >"$work/agent_exec.why"
+    printf '%s' "$why" | write_nofollow "$work/agent_exec.why" truncate
     unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
@@ -2588,7 +2715,7 @@ EOF
           answered: $answered, output_bytes: $bytes, config_refused: $config_refused,
           actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model,
           actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}') || exit 70
-    printf '%s\n' "$_jks_agent_exec_doc" >"$work/agent_exec.json" || exit 70
+    printf '%s\n' "$_jks_agent_exec_doc" | write_nofollow "$work/agent_exec.json" truncate || exit 70
     agent_exec_seal || exit 70
 }
 
@@ -4999,11 +5126,17 @@ main() {
         echo "$PROBE: no key material for the step seals; refusing to run" >&2
         exit 70
     fi
-    if capture_bounded "$spec" "$SPEC_BYTE_CAP" "$SPEC_BYTE_CAP"; then
+    capture_bounded "$spec" "$SPEC_BYTE_CAP" "$SPEC_BYTE_CAP"
+    _jks_spec_status=$?
+    if [ "$_jks_spec_status" -eq 0 ]; then
         SPEC_RAW=$_jks_capture
     else
         rm -rf "$spec_dir"
-        echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
+        if [ "$_jks_spec_status" -eq 3 ]; then
+            echo "$PROBE: the private probe specification changed while it was read" >&2
+        else
+            echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
+        fi
         exit 65
     fi
     if ! printf '%s\n' "$SPEC_RAW" | jq -e --arg scan "$SCAN_ROOT" '
@@ -5136,10 +5269,10 @@ EOF
                 fi
                 ;;
         esac
-        : >"$work/checks"
-        : >"$work/checks.tag"
-        : >"$work/facts"
-        : >"$work/facts.tag"
+        : | write_nofollow "$work/checks" truncate
+        : | write_nofollow "$work/checks.tag" truncate
+        : | write_nofollow "$work/facts" truncate
+        : | write_nofollow "$work/facts.tag" truncate
         _jks_chain=$RUN_SEED
         if [ "$mode" = host ]; then
             skip sandbox "not running in a sandbox (--host)"
