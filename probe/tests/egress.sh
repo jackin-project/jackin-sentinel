@@ -2723,14 +2723,17 @@ zai_model=
 finish_case
 
 mk j09_a_hostile_tmp_spec_dir_cannot_swap_the_expected_model
+case_spec_dir="$t/spec-dir"
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_model=glm-5.3-unreported
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+stale_spec_dir=$(mktemp -d /tmp/jackin-sentinel-probe-spec.stale.XXXXXX) || exit 70
+printf '%s\n' untouched >"$stale_spec_dir/marker"
 mv "$t/bin/omp" "$t/bin/omp.real"
 cat >"$t/bin/omp" <<EOF
 #!/bin/sh
-for d in /tmp/jackin-sentinel-probe-spec.*; do
+for d in "$t"/spec-dir.*; do
     if [ -d "\$d" ]; then
         printf '%s' glm-5.3 >"\$d/expected.model" 2>/dev/null || true
         printf '%s\n' "\$d" >>"$t/tampered"
@@ -2741,7 +2744,23 @@ EOF
 chmod +x "$t/bin/omp"
 begin j09_a_hostile_tmp_spec_dir_cannot_swap_the_expected_model step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'agent exec or tool evidence is incomplete (exit 0)'
-[ -s "$t/tampered" ] || problems="$problems hostile-write-not-observed"
+[ -s "$t/codex.ran" ] || problems="$problems hostile-agent-never-ran"
+hostile_seen=
+if [ -s "$t/tampered" ]; then
+    while IFS= read -r hostile_dir; do
+        [ -n "$hostile_dir" ] || continue
+        case $hostile_dir in
+            "$t"/spec-dir.*) hostile_seen=1 ;;
+            *) problems="$problems hostile-write-escaped-this-run:$hostile_dir" ;;
+        esac
+    done <"$t/tampered"
+fi
+[ -n "$hostile_seen" ] || problems="$problems hostile-write-not-observed"
+[ "$(cat "$stale_spec_dir/marker" 2>/dev/null)" = untouched ] || problems="$problems stale-spec-marker-was-rewritten"
+[ ! -e "$stale_spec_dir/expected.model" ] || problems="$problems stale-spec-was-tampered"
+rm -rf "$stale_spec_dir"
+stale_spec_dir=
+case_spec_dir=
 finish_case
 zai_model=
 
