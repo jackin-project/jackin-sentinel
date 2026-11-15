@@ -29,6 +29,7 @@ RAW_CREDENTIAL=0
 EXPECTED_PROVIDER=
 EXPECTED_MODEL=
 PIN_MODES=
+PIN_MODES_PRE=
 PIN_STATS=
 DECL_IDS=
 stage_config_paths=
@@ -1799,6 +1800,7 @@ PY_JKS_YAML_CODE
 
 pin_declared_configs() {
     PIN_MODES=
+    PIN_MODES_PRE=
     PIN_IDS=
     PIN_STATS=
     PIN_DIRS=
@@ -1865,6 +1867,8 @@ finally:
         if [ "$declared_pre_mode" = absent ]; then
             PIN_MODES="${PIN_MODES}absent
 "
+            PIN_MODES_PRE="${PIN_MODES_PRE}absent
+"
             PIN_IDS="${PIN_IDS}absent
 "
             PIN_STATS="${PIN_STATS}absent
@@ -1890,7 +1894,7 @@ finally:
         declared_pre_key=${declared_pre_id% *}
         declared_recorded_key=${declared_recorded_id% *}
         [ "$declared_pre_key" = "$declared_recorded_key" ] || return 1
-        PIN_MODES="${PIN_MODES}${declared_pre_mode}
+        PIN_MODES_PRE="${PIN_MODES_PRE}${declared_pre_mode}
 "
         PIN_IDS="${PIN_IDS}${declared_recorded_id}
 "
@@ -2000,7 +2004,20 @@ finally:
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
         declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 3p)
         declared_dir=$(printf '%s\n' "$declared_pin" | sed -n 4p)
+        case $declared_mode in
+            '' | *[!0-7]*)
+                declared_mode=
+                if [ "$declared_rc" -lt 128 ] 2>/dev/null; then
+                    declared_mode=none
+                fi
+                ;;
+        esac
+        PIN_MODES="${PIN_MODES}${declared_mode}
+"
         [ "$declared_rc" -eq 0 ] || return 1
+        case $declared_mode in
+            '' | none | *[!0-7]*) return 1 ;;
+        esac
         [ "$declared_mode" = "$declared_pre_mode" ] || return 1
         [ "$declared_id" = "$declared_pre_id" ] || return 1
         case $declared_stat in
@@ -2020,27 +2037,46 @@ finally:
 
 unpin_declared_configs() {
     unseal_agent_home
-    [ -n "${PIN_MODES-}" ] || return 0
+    [ -n "${PIN_MODES-}${PIN_MODES_PRE-}" ] || return 0
     declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 0
     declared_index=0
     while [ "$declared_index" -lt "$declared_count" ]; do
         declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 0
         declared_mode=$(printf '%s\n' "$PIN_MODES" | sed -n "$((declared_index + 1))p")
+        declared_mode_pre=$(printf '%s\n' "$PIN_MODES_PRE" | sed -n "$((declared_index + 1))p")
         case $declared_mode in
-            absent)
+            none)
+                declared_mode=
+                declared_mode_pre=
                 ;;
-            '' | *[!0-7]*) ;;
-            *)
-                declared_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((declared_index + 1))p")
-                declared_ident=$(printf '%s\n' "$PIN_IDS" | sed -n "$((declared_index + 1))p")
-                declared_dir=$(printf '%s\n' "$PIN_DIRS" | sed -n "$((declared_index + 1))p")
-                declared_dir_pre=$(printf '%s\n' "$PIN_DIRS_PRE" | sed -n "$((declared_index + 1))p")
-                python3 -I -c 'import os, stat, sys
+            absent | '' | *[!0-7]*) declared_mode= ;;
+        esac
+        case $declared_mode_pre in
+            absent | '' | *[!0-7]*) declared_mode_pre= ;;
+        esac
+        if [ -n "$declared_mode" ] || [ -n "$declared_mode_pre" ]; then
+            declared_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((declared_index + 1))p")
+            declared_ident=$(printf '%s\n' "$PIN_IDS" | sed -n "$((declared_index + 1))p")
+            declared_dir=$(printf '%s\n' "$PIN_DIRS" | sed -n "$((declared_index + 1))p")
+            declared_dir_pre=$(printf '%s\n' "$PIN_DIRS_PRE" | sed -n "$((declared_index + 1))p")
+            python3 -I -c 'import os, stat, sys
+def parse_mode(text):
+    if not text or any(ch not in "01234567" for ch in text):
+        return None
+    return int(text, 8)
+
+
 path = sys.argv[1]
-mode = int(sys.argv[2], 8)
-fields = sys.argv[3].split()
+mode = parse_mode(sys.argv[2])
+mode_pre = parse_mode(sys.argv[3])
+if mode is None:
+    mode = mode_pre
+if mode is None:
+    raise SystemExit(0)
+pinned = mode & ~0o222
+fields = sys.argv[4].split()
 if len(fields) < 2:
-    fields = sys.argv[4].split()
+    fields = sys.argv[5].split()
 if len(fields) < 2:
     raise SystemExit(0)
 try:
@@ -2048,8 +2084,8 @@ try:
     want_ino = int(fields[1])
 except ValueError:
     raise SystemExit(0)
-confirmed = sys.argv[5].split()
-pre = sys.argv[6].split()
+confirmed = sys.argv[6].split()
+pre = sys.argv[7].split()
 dirfields = confirmed if len(confirmed) >= 5 else pre
 parent, name = os.path.split(path)
 if not name:
@@ -2082,17 +2118,18 @@ try:
             try:
                 opened = os.fstat(handle)
                 if (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino) and (opened.st_dev, opened.st_ino) == (want_dev, want_ino):
-                    os.fchmod(handle, mode)
+                    if stat.S_IMODE(opened.st_mode) == pinned:
+                        os.fchmod(handle, mode)
             finally:
                 os.close(handle)
 finally:
     os.close(dirfd)
-' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" "$declared_dir" "$declared_dir_pre" 2>/dev/null || true
-                ;;
-        esac
+' "$declared_path" "$declared_mode" "$declared_mode_pre" "$declared_pinned" "$declared_ident" "$declared_dir" "$declared_dir_pre" 2>/dev/null || true
+        fi
         declared_index=$((declared_index + 1))
     done
     PIN_MODES=
+    PIN_MODES_PRE=
     PIN_IDS=
     PIN_STATS=
     PIN_DIRS=

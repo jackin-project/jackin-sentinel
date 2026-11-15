@@ -3358,6 +3358,38 @@ decoy_mode=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode 
 [ "$decoy_mode" = 644 ] || problems="$problems the-replacement-mode-changed=[$decoy_mode](want [644])"
 finish_case
 
+mk j09_a_concurrent_permission_change_is_not_reverted_by_the_rollback
+codex_says 'ready' 0
+chmod 0644 "$t/sandbox/.codex/config.toml"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+code=
+while [ "\$#" -gt 0 ]; do
+    case \$1 in
+        -c)
+            code=\$2
+            break
+            ;;
+    esac
+    shift
+done
+case \$code in
+    *chmodded*)
+        if chmod 0600 "$t/sandbox/.codex/config.toml" 2>/dev/null; then
+            : >"$t/concurrent.chmod"
+        fi
+        ;;
+esac
+exec "$scratch/tools/python3" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin j09_a_concurrent_permission_change_is_not_reverted_by_the_rollback step_J09 '' CODEX_AUTH_ACCESS_TOKEN="$PLACEHOLDER"
+[ -e "$t/concurrent.chmod" ] || problems="$problems the-concurrent-permission-change-never-ran"
+expect agent_reaches_api FAIL 'the launches were refused because the declared configuration was not validated and pinned'
+final_mode=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.codex/config.toml" 2>/dev/null)
+[ "$final_mode" = 600 ] || problems="$problems the-concurrent-permission-change-was-reverted=[$final_mode](want [600])"
+finish_case
+
 mk t09_a_decoy_configuration_root_is_rejected_before_the_launch
 name=t09_a_decoy_configuration_root_is_rejected_before_the_launch
 host_key=synthetic-T09-host-key-0123456789
