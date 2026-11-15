@@ -4994,7 +4994,9 @@ cat >"$t/bin/python3" <<EOF
 rewrite=
 for a in "\$@"; do
     if [ "\$rewrite" = 1 ]; then
+        before=\$(printf '%s' "\$a")
         a=\$(printf '%s' "\$a" | sed 's/os\.fchmod(handle, mode & ~0o222)/raise SystemExit(1)/')
+        [ "\$a" = "\$before" ] || : >"$t/injected"
         rewrite=
     fi
     case \$a in
@@ -5027,6 +5029,10 @@ EOF
 chmod +x "$t/bin/codex"
 begin pin_chmod_failure_restores_the_original_mode sh "$t/probe" --only J07
 expect_rc 0
+expect agent_exec FAIL 'the launches were refused because the declared configuration was not validated and pinned'
+if [ ! -f "$t/injected" ]; then
+    problems="$problems injection-not-applied"
+fi
 restored_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
 if [ "$restored_mode" != 600 ]; then
     problems="$problems config-mode=$restored_mode(want 600 restored)"
@@ -5050,7 +5056,9 @@ cat >"$t/bin/python3" <<EOF
 rewrite=
 for a in "\$@"; do
     if [ "\$rewrite" = 1 ]; then
+        before=\$(printf '%s' "\$a")
         a=\$(printf '%s' "\$a" | sed 's/os\.fchmod(dirfd, dir_mode & ~0o222)/raise SystemExit(1)/')
+        [ "\$a" = "\$before" ] || : >"$t/injected"
         rewrite=
     fi
     case \$a in
@@ -5083,6 +5091,10 @@ EOF
 chmod +x "$t/bin/codex"
 begin pin_failure_after_the_chmod_restores_the_original_content_and_mode sh "$t/probe" --only J07
 expect_rc 0
+expect agent_exec FAIL 'the launches were refused because the declared configuration was not validated and pinned'
+if [ ! -f "$t/injected" ]; then
+    problems="$problems injection-not-applied"
+fi
 mid_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
 if [ "$mid_mode" != 600 ]; then
     problems="$problems config-mode=$mid_mode(want 600 restored)"
@@ -5106,7 +5118,9 @@ cat >"$t/bin/python3" <<EOF
 rewrite=
 for a in "\$@"; do
     if [ "\$rewrite" = 1 ]; then
+        before=\$(printf '%s' "\$a")
         a=\$(printf '%s' "\$a" | sed 's/handle = os\.open(name, os\.O_RDONLY | os\.O_NOFOLLOW, dir_fd=dirfd)/raise FileNotFoundError/')
+        [ "\$a" = "\$before" ] || : >"$t/injected"
         rewrite=
     fi
     case \$a in
@@ -5139,6 +5153,10 @@ EOF
 chmod +x "$t/bin/codex"
 begin pin_rollback_leaves_a_recreated_absent_path_untouched sh "$t/probe" --only J07
 expect_rc 0
+expect agent_exec FAIL 'the launches were refused because the declared configuration was not validated and pinned'
+if [ ! -f "$t/injected" ]; then
+    problems="$problems injection-not-applied"
+fi
 if [ ! -e "$t/sandbox/.codex/config.toml" ]; then
     problems="$problems rollback-deleted-the-recreated-path"
 fi
