@@ -2357,6 +2357,24 @@ else
     finish_case
 fi
 
+mk host_mode_refuses_a_python3_without_tomllib
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+case " \$* " in
+    *tomllib*) exit 1 ;;
+esac
+exec "$python_real" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin host_mode_refuses_a_python3_without_tomllib sh "$t/probe" --host --only J08
+expect_rc 69
+case $(cat "$t/err") in
+    *tomllib*) ;;
+    *) problems="$problems stderr=[$(cat "$t/err")](want tomllib dependency message)" ;;
+esac
+[ ! -s "$t/out" ] || problems="$problems stdout-not-empty"
+finish_case
+
 mk outside_a_sandbox_the_probe_refuses
 ln -s "$real_uname" "$t/bin/uname" || exit 70
 ln -s "$real_id" "$t/bin/id" || exit 70

@@ -1280,10 +1280,141 @@ def strip_inline_comment(text):
     return text.strip()
 
 
+def flow_skip_space(text, i):
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\n\r":
+            i += 1
+            continue
+        if ch == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        break
+    return i
+
+
+def flow_value(text, i):
+    n = len(text)
+    if i >= n:
+        raise ValueError("truncated")
+    ch = text[i]
+    if ch in "{[":
+        depth = 0
+        while i < n:
+            cur = text[i]
+            if cur in "'\"":
+                quote = cur
+                i += 1
+                while i < n and text[i] != quote:
+                    if quote == '"' and text[i] == "\\":
+                        i += 1
+                    i += 1
+                if i >= n:
+                    raise ValueError("unterminated quote")
+                i += 1
+                continue
+            if cur in "{[":
+                depth += 1
+            elif cur in "}]":
+                depth -= 1
+                if depth == 0:
+                    return None, i + 1
+            i += 1
+        raise ValueError("unterminated collection")
+    if ch in "'\"":
+        quote = ch
+        i += 1
+        buf = []
+        while i < n:
+            cur = text[i]
+            if quote == '"' and cur == "\\" and i + 1 < n:
+                buf.append(cur)
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if cur == quote:
+                if quote == "'" and i + 1 < n and text[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                raw = "".join(buf)
+                return (decode_escapes(raw) if quote == '"' else raw), i + 1
+            buf.append(cur)
+            i += 1
+        raise ValueError("unterminated scalar")
+    buf = []
+    while i < n:
+        cur = text[i]
+        if cur == "#" and buf and buf[-1] in " \t":
+            break
+        if cur in ",}]":
+            break
+        if cur == "\n":
+            break
+        buf.append(cur)
+        i += 1
+    return " ".join("".join(buf).split()), i
+
+
+def flow_mapping_scalars(text):
+    n = len(text)
+    i = flow_skip_space(text, 0)
+    if i >= n or text[i] != "{":
+        raise ValueError("not a flow mapping")
+    i += 1
+    root = {}
+    while True:
+        i = flow_skip_space(text, i)
+        if i >= n:
+            raise ValueError("truncated")
+        if text[i] == "}":
+            i += 1
+            break
+        if text[i] == ",":
+            i += 1
+            continue
+        if text[i] in "'\"":
+            key, i = flow_value(text, i)
+        else:
+            start = i
+            while i < n and text[i] not in ":,}" and text[i] != "\n":
+                i += 1
+            if i >= n or text[i] != ":":
+                raise ValueError("bad key")
+            key = " ".join(text[start:i].split())
+        if not key:
+            raise ValueError("empty key")
+        i = flow_skip_space(text, i)
+        if i >= n or text[i] != ":":
+            raise ValueError("missing colon")
+        i += 1
+        i = flow_skip_space(text, i)
+        value, i = flow_value(text, i)
+        if key in root:
+            raise ValueError("duplicate key")
+        if value is not None:
+            root[key] = value
+        i = flow_skip_space(text, i)
+        if i < n and text[i] == ",":
+            i += 1
+            continue
+        if i < n and text[i] == "}":
+            i += 1
+            break
+        raise ValueError("bad mapping")
+    i = flow_skip_space(text, i)
+    if i != n:
+        raise ValueError("trailing content")
+    return root
+
+
 def plain_root_scalars(text):
     root = {}
     lines = text.split("\n")
     i = 0
+    seen = False
     while i < len(lines):
         line = lines[i]
         i += 1
@@ -1298,7 +1429,10 @@ def plain_root_scalars(text):
         if not line.strip() or line[0] == "#":
             continue
         if flow_collection_line(line):
+            if not seen and line.lstrip().startswith("{"):
+                return flow_mapping_scalars("\n".join(lines[i - 1:]))
             raise ValueError("flow collection")
+        seen = True
         if line[0] in " \t":
             continue
         match = key_re.match(line)
@@ -4828,6 +4962,10 @@ main() {
         echo "$PROBE: python3 is required" >&2
         exit 69
     }
+    python3 -I -c 'import tomllib' >/dev/null 2>&1 || {
+        echo "$PROBE: python3 with the tomllib module is required" >&2
+        exit 69
+    }
     if [ -z "$spec" ] || [ ! -f "$spec" ] || [ -L "$spec" ]; then
         echo "$PROBE: --spec must name a regular private probe specification" >&2
         exit 65
@@ -4936,9 +5074,6 @@ main() {
     declared_use_snapshot=
     if declared_provider_config; then
         prompt_configs_validated=true
-        if [ "$mode" != host ] && pin_declared_configs; then
-            prompt_configs_pinned=true
-        fi
     fi
     rm -f "$spec_dir"/config.snapshot "$spec_dir"/config.normalized "$spec_dir"/config.declared "$spec_dir"/config.required "$spec_dir"/config.forbidden "$spec_dir"/config.livecheck 2>/dev/null || exit 70
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
@@ -4988,8 +5123,19 @@ fi
 exit 0
 EOF
     report_steps=
+    pin_owner=
     for id in $ALL_STEPS; do
         selected "$id" || continue
+        case $id in
+            J07 | J09)
+                if [ -z "$pin_owner" ] && [ "$mode" != host ]; then
+                    if pin_declared_configs; then
+                        pin_owner=$id
+                        prompt_configs_pinned=true
+                    fi
+                fi
+                ;;
+        esac
         : >"$work/checks"
         : >"$work/checks.tag"
         : >"$work/facts"
@@ -5001,6 +5147,11 @@ EOF
             "step_$id" || true
         fi
         finish "$id"
+        if [ "$pin_owner" = "$id" ]; then
+            unpin_declared_configs
+            pin_owner=
+            prompt_configs_pinned=false
+        fi
     done
     for artifact in "$work"/step.*; do
         [ -e "$artifact" ] || continue

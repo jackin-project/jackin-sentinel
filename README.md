@@ -8,11 +8,11 @@ Jackin builds the image and creates the sandbox. This repository does not publis
 
 ## What the image contains
 
-The `Dockerfile` ends in a stage that starts `FROM construct`. One `RUN` layer installs `jackin-sentinel-probe` at `/usr/local/bin/jackin-sentinel-probe`, owned by root. The layer prints its own lines, so the build output shows the sentinel layer.
+The `Dockerfile` ends in a stage that starts `FROM construct`. One `RUN` layer installs `python3` and checks that the interpreter can import `tomllib`, so the image carries the interpreter the probe needs. A second `RUN` layer installs `jackin-sentinel-probe` at `/usr/local/bin/jackin-sentinel-probe`, owned by root. The layer prints its own lines, so the build output shows the sentinel layer.
 
 Jackin adds the selected agent binaries, `jackin-start`, and the two hooks when it derives the final image (decisions D05 and D11).
 
-The probe is a POSIX `sh` script that needs `jq` and `python3`. It checks both at startup and exits 69 when either is missing. The construct image has `jq`.
+The probe is a POSIX `sh` script that needs `jq` and a `python3` that can import `tomllib`. It checks both at startup and exits 69 when either is missing. The construct image has `jq`; the role layer adds the interpreter.
 
 ## Egress policy
 

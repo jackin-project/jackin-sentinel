@@ -3552,11 +3552,17 @@ mk t09_a_the_cleanup_restores_the_frozen_parent_after_the_config_disappears
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
 zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0755 "$t/sandbox/.omp" "$t/sandbox/.omp/agent"
+parent_mode_before=$(stat -c '%a' "$t/sandbox/.omp" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.omp" 2>/dev/null)
 cat >"$t/bin/omp" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
-chmod 0700 "$t/sandbox/.omp" 2>/dev/null || :
-rm -f "$t/sandbox/.omp/config.toml" 2>/dev/null || :
+if chmod 0700 "$t/sandbox/.omp" 2>/dev/null; then
+    printf '%s\n' parent-chmod-ok >>"$t/attack.seen"
+fi
+if rm -f "$t/sandbox/.omp/config.toml" 2>/dev/null; then
+    printf '%s\n' config-removed >>"$t/attack.seen"
+fi
 case " \$* " in
     *"Use one shell tool"*)
         printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
@@ -3571,8 +3577,37 @@ exit 0
 EOF
 chmod +x "$t/bin/omp"
 begin t09_a_the_cleanup_restores_the_frozen_parent_after_the_config_disappears step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+[ "$parent_mode_before" = 755 ] || problems="$problems the-parent-mode-before=[$parent_mode_before](want [755])"
+grep -q -x 'parent-chmod-ok' "$t/attack.seen" 2>/dev/null || problems="$problems the-parent-chmod-never-landed"
+grep -q -x 'config-removed' "$t/attack.seen" 2>/dev/null || problems="$problems the-config-was-never-removed"
 parent_mode=$(stat -c '%a' "$t/sandbox/.omp" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.omp" 2>/dev/null)
-[ "$parent_mode" = 755 ] || problems="$problems the-parent-mode-after=[$parent_mode](want [755])"
+[ "$parent_mode" = "$parent_mode_before" ] || problems="$problems the-parent-mode-after=[$parent_mode](want [$parent_mode_before])"
+finish_case
+
+mk t09_a_a_root_flow_mapping_config_is_parsed
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '#!/bin/sh\nexec %s -S "$@"\n' "$python_bin" >"$t/bin/python3"
+chmod +x "$t/bin/python3"
+printf '%s\n' '{baseUrl: https://api.z.ai/api/anthropic, credentialEnv: ZAI_API_KEY, default: zai/glm-5.3}' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' '{baseUrl: https://api.z.ai/api/anthropic, api: anthropic-messages, apiKey: ZAI_API_KEY}' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_a_root_flow_mapping_config_is_parsed step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+fact '.agent_exec.actual_endpoint' 'https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_a_a_root_flow_mapping_nested_decoy_is_not_a_root_key
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '#!/bin/sh\nexec %s -S "$@"\n' "$python_bin" >"$t/bin/python3"
+chmod +x "$t/bin/python3"
+printf '%s\n' '{outer: {baseUrl: https://api.z.ai/api/anthropic, credentialEnv: ZAI_API_KEY, default: zai/glm-5.3}}' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' '{outer: {baseUrl: https://api.z.ai/api/anthropic, api: anthropic-messages, apiKey: ZAI_API_KEY}}' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_a_root_flow_mapping_nested_decoy_is_not_a_root_key step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+expect_codex_not_run
 finish_case
 
 echo "$total cases, $failures failed"
