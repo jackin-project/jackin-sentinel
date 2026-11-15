@@ -1966,6 +1966,37 @@ begin t09_a_crlf_config_is_parsed_normalized step_J09 '' ZAI_API_KEY=openshell:r
 expect agent_reaches_api PASS 'completed the declared tool'
 finish_case
 
+mk t09_a_merged_provider_config_is_bound
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'defaults: &defaults' '  baseUrl: https://api.z.ai/api/anthropic' '  credentialEnv: ZAI_API_KEY' '  default: zai/glm-5.3' '<<: *defaults' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'defaults: &defaults' '  baseUrl: https://api.z.ai/api/anthropic' '  api: anthropic-messages' '  apiKey: ZAI_API_KEY' '<<: *defaults' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_merged_provider_config_is_bound step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
+mk t09_a_merged_provider_config_with_a_hostile_base_url_is_not_bound
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'defaults: &defaults' '  baseUrl: http://127.0.0.1:9/v1' '  credentialEnv: ZAI_API_KEY' '  default: zai/glm-5.3' '<<: *defaults' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'defaults: &defaults' '  baseUrl: http://127.0.0.1:9/v1' '  api: anthropic-messages' '  apiKey: ZAI_API_KEY' '<<: *defaults' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_merged_provider_config_with_a_hostile_base_url_is_not_bound step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_a_merged_provider_config_with_a_comment_in_the_block_is_not_bound
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+printf '%s\n' 'defaults: &defaults' '  inner: &inner' '    baseUrl: https://api.z.ai/api/anthropic' '  <<: *inner' '# a column-zero comment inside the merged block' '  baseUrl: http://127.0.0.1:9/v1' '<<: *defaults' 'credentialEnv: ZAI_API_KEY' 'default: zai/glm-5.3' >"$t/sandbox/.omp/config.toml"
+printf '%s\n' 'defaults: &defaults' '  inner: &inner' '    baseUrl: https://api.z.ai/api/anthropic' '  <<: *inner' '# a column-zero comment inside the merged block' '  baseUrl: http://127.0.0.1:9/v1' '<<: *defaults' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"$t/sandbox/.omp/agent/models.yml"
+begin t09_a_merged_provider_config_with_a_comment_in_the_block_is_not_bound step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+fact '.agent_exec.attempted' 'false'
+finish_case
+
 mk j04_an_oversized_target_model_still_emits_the_report
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
