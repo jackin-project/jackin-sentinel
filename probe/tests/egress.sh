@@ -3751,5 +3751,35 @@ expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoin
 expect_codex_not_run
 finish_case
 
+mk t01_a_the_staged_copy_refuses_a_symlinked_destination
+with_curl
+codex_says 'ready' 0
+auth_json "{\"tokens\":{\"access_token\":\"$PLACEHOLDER\"}}"
+answer "$OUTSIDE" 7 000
+answer "$METADATA" 7 000
+answer "$PROVIDER" 7 000
+printf '%s\n' 'the redirected file keeps its content' >"$t/redirected"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+if [ -n "\${RB_DST-}" ]; then
+    "$python_bin" -c 'import os, sys
+try:
+    os.unlink(sys.argv[2])
+except OSError:
+    pass
+os.symlink(sys.argv[1], sys.argv[2])' "$t/redirected" "\$RB_DST" 2>/dev/null || :
+    printf '%s\n' "\$RB_DST" >"$t/redirected.at"
+fi
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin t01_a_the_staged_copy_refuses_a_symlinked_destination step_J09 ''
+[ -f "$t/redirected.at" ] || problems="$problems the-staged-copy-was-never-attempted"
+expect agent_reaches_api SKIP 'could not stage the validated credential home'
+expect_codex_not_run
+redirected=$(cat "$t/redirected" 2>/dev/null)
+[ "$redirected" = 'the redirected file keeps its content' ] || problems="$problems the-staged-copy-was-written-through-the-symlink"
+finish_case
+
 echo "$total cases, $failures failed"
 [ "$failures" -eq 0 ]

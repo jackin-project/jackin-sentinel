@@ -972,30 +972,19 @@ read_bounded() {
         read_body="$read_body$_jks_body_line
 "
     done <<'EOF_JKS_READ_BODY'
-read_bytes=
 if command -v head >/dev/null 2>&1; then
     if command -v timeout >/dev/null 2>&1; then
-        timeout 10 head -c $((RB_CAP + 1)) -- /dev/fd/9 >"$RB_DST" 2>/dev/null || exit 1
+        timeout 10 head -c $((RB_CAP + 1)) -- /dev/fd/9 >&8 2>/dev/null || exit 1
     else
-        head -c $((RB_CAP + 1)) -- /dev/fd/9 >"$RB_DST" 2>/dev/null || exit 1
+        head -c $((RB_CAP + 1)) -- /dev/fd/9 >&8 2>/dev/null || exit 1
     fi
 else
     if command -v dd >/dev/null 2>&1; then
-        dd if=/dev/fd/9 of="$RB_DST" bs="$((RB_CAP + 1))" count=1 2>/dev/null || exit 1
+        dd if=/dev/fd/9 bs="$((RB_CAP + 1))" count=1 2>/dev/null >&8 || exit 1
     else
         exit 1
     fi
 fi
-[ -f "$RB_DST" ] || exit 1
-if command -v wc >/dev/null 2>&1; then
-    read_bytes=$(wc -c <"$RB_DST" 2>/dev/null | tr -d "[:space:]") || exit 1
-else
-    read_bytes=$(jq -Rrn --rawfile d "$RB_DST" '$d | utf8bytelength' 2>/dev/null) || exit 1
-fi
-case $read_bytes in
-    "" | *[!0-9]*) exit 1 ;;
-esac
-[ "$read_bytes" -le "$RB_CAP" ] || exit 1
 exit 0
 EOF_JKS_READ_BODY
     capture_open_exec "$read_src" "$read_dst" "$read_cap" "$read_cap" 0 "$read_body"
@@ -1008,6 +997,7 @@ copy_bounded() {
 capture_open_exec() {
     RB_SRC=$1 RB_DST=$2 RB_CAP=$3 RB_LEN=$4 RB_NUL=$5 RB_BODY=$6 python3 -I -c 'import os, stat, subprocess, sys
 src = os.environ["RB_SRC"]
+dst = os.environ["RB_DST"]
 cap = int(os.environ["RB_CAP"])
 try:
     handle = os.open(src, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
@@ -1027,7 +1017,35 @@ os.dup2(handle, 9)
 if handle != 9:
     os.close(handle)
 os.set_inheritable(9, True)
-completed = subprocess.run(["sh", "-c", os.environ["RB_BODY"]], pass_fds=(9,))
+pass_fds = (9,)
+parentfd = -1
+destname = ""
+if dst:
+    parent, name = os.path.split(dst)
+    if not name:
+        raise SystemExit(1)
+    if not parent:
+        parent = "."
+    try:
+        parentfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise SystemExit(1)
+    try:
+        dest = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=parentfd)
+    except OSError:
+        os.close(parentfd)
+        raise SystemExit(1)
+    destname = name
+    if dest == 9 or not stat.S_ISREG(os.fstat(dest).st_mode):
+        os.close(dest)
+        os.close(parentfd)
+        raise SystemExit(1)
+    os.dup2(dest, 8)
+    if dest != 8:
+        os.close(dest)
+    os.set_inheritable(8, True)
+    pass_fds = (9, 8)
+completed = subprocess.run(["sh", "-c", os.environ["RB_BODY"]], pass_fds=pass_fds)
 try:
     after = os.fstat(9)
     renamed = os.lstat(src)
@@ -1037,6 +1055,18 @@ if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime
     raise SystemExit(3)
 if (renamed.st_dev, renamed.st_ino) != (after.st_dev, after.st_ino):
     raise SystemExit(3)
+if dst:
+    try:
+        written = os.fstat(8)
+        named_dst = os.stat(destname, dir_fd=parentfd, follow_symlinks=False)
+    except OSError:
+        raise SystemExit(1)
+    if not stat.S_ISREG(written.st_mode):
+        raise SystemExit(1)
+    if written.st_size > cap:
+        raise SystemExit(1)
+    if (named_dst.st_dev, named_dst.st_ino) != (written.st_dev, written.st_ino):
+        raise SystemExit(1)
 if completed.returncode < 0:
     os.kill(os.getpid(), -completed.returncode)
 raise SystemExit(completed.returncode)
