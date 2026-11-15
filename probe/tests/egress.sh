@@ -3584,6 +3584,72 @@ parent_mode=$(stat -c '%a' "$t/sandbox/.omp" 2>/dev/null || stat -f '%Lp' "$t/sa
 [ "$parent_mode" = "$parent_mode_before" ] || problems="$problems the-parent-mode-after=[$parent_mode](want [$parent_mode_before])"
 finish_case
 
+mk t09_a_the_agent_cannot_destroy_the_parent_cleanup_state
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+work=\${CODEX_HOME%/agent-home}
+printf '%s\n' "\$work" >"$t/attack.work"
+rm -f "\$work/agent-home.dirs" 2>/dev/null || :
+printf '%s\n' 'state-deleted' >>"$t/attack.seen"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_the_agent_cannot_destroy_the_parent_cleanup_state step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+grep -q -x 'state-deleted' "$t/attack.seen" 2>/dev/null || problems="$problems the-cleanup-state-attack-never-landed"
+grep -q 'refusing to unseal' "$t/err" 2>/dev/null && problems="$problems the-parent-refused-to-unseal"
+attack_work=$(cat "$t/attack.work" 2>/dev/null)
+[ -n "$attack_work" ] || problems="$problems the-agent-never-ran"
+[ -n "$attack_work" ] && [ ! -e "$attack_work/agent-home" ] || problems="$problems the-staged-home-tree-was-left-behind=[$attack_work]"
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
+mk t09_a_the_agent_cannot_stall_the_parent_cleanup_with_a_huge_state_file
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+work=\${CODEX_HOME%/agent-home}
+printf '%s\n' "\$work" >"$t/attack.work"
+dd if=/dev/zero of="\$work/agent-home.dirs" bs=1 count=1 seek=1073741824 2>/dev/null || :
+printf '%s\n' 'state-replaced' >>"$t/attack.seen"
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_the_agent_cannot_stall_the_parent_cleanup_with_a_huge_state_file step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+grep -q -x 'state-replaced' "$t/attack.seen" 2>/dev/null || problems="$problems the-cleanup-state-attack-never-landed"
+grep -q 'refusing to unseal' "$t/err" 2>/dev/null && problems="$problems the-parent-refused-to-unseal"
+attack_work=$(cat "$t/attack.work" 2>/dev/null)
+[ -n "$attack_work" ] || problems="$problems the-agent-never-ran"
+[ -n "$attack_work" ] && [ ! -e "$attack_work/agent-home" ] || problems="$problems the-staged-home-tree-was-left-behind=[$attack_work]"
+expect agent_reaches_api PASS 'completed the declared tool'
+finish_case
+
 mk t09_a_a_root_flow_mapping_config_is_parsed
 host_key=synthetic-T09-host-key-0123456789
 fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
