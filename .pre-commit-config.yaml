@@ -2,50 +2,59 @@ repos:
   - repo: local
     hooks:
       - id: gitleaks
+        priority: 0
         name: gitleaks
         language: system
         entry: sh hooks/gitleaks.sh
         types: []
         types_or: [file, symlink]
       - id: gitleaks-cases
+        priority: 0
         name: staged gitleaks cases
         language: system
         entry: sh tests/gitleaks.sh
         files: ^(.pre-commit-config.yaml|tests/gitleaks\.sh|hooks/gitleaks\.sh|hooks/gitleaks-(trace2|stderr)\.jq)$
         pass_filenames: false
       - id: gitleaks-filter-syntax
+        priority: 0
         name: gitleaks filter syntax
         language: system
         entry: sh -c 'for file; do jq -nR --argjson expected "[]" --arg mode git -f "$file" </dev/null >/dev/null || exit 1; done' gitleaks-filter-syntax
         files: ^hooks/gitleaks-(trace2|stderr)\.jq$
       - id: shellcheck
+        priority: 0
         name: shellcheck
         language: system
         entry: shellcheck
         files: ^(probe/jackin-sentinel-probe|probe/tests/[^/]+\.sh|hooks/[^/]+\.sh)$
       - id: shfmt
+        priority: 0
         name: shfmt
         language: system
         entry: shfmt -d -i 4 -ci
         files: ^(probe/jackin-sentinel-probe|probe/tests/[^/]+\.sh|hooks/[^/]+\.sh)$
       - id: hadolint
+        priority: 0
         name: hadolint
         language: system
         entry: hadolint
         files: ^Dockerfile$
       - id: probe-j08
+        priority: 0
         name: probe J08 cases
         language: system
         entry: sh probe/tests/j08.sh
         files: ^probe/(jackin-sentinel-probe|tests/j08\.sh)$
         pass_filenames: false
       - id: hooks-setup
+        priority: 0
         name: setup hook cases
         language: system
         entry: sh probe/tests/hooks.sh
         files: ^(hooks/setup\.sh|probe/tests/hooks\.sh)$
         pass_filenames: false
       - id: probe-egress
+        priority: 0
         name: probe egress cases
         language: system
         entry: sh probe/tests/egress.sh
