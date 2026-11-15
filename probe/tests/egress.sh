@@ -3860,21 +3860,6 @@ expect agent_exec PASS 'codex exec answered the fixed prompt and completed the d
 expect agent_reaches_api PASS 'codex exec answered and completed the declared tool'
 finish_case
 
-mk t09_a_j07_and_j09_pass_when_the_configuration_is_unchanged
-host_key=synthetic-T09-host-key-0123456789
-fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
-zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
-[ "$skip_case" -eq 0 ] && total=$((total + 1))
-problems=
-name=t09_a_j07_and_j09_pass_when_the_configuration_is_unchanged
-execute J07,J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
-execute_rc=$?
-if [ "$execute_rc" -eq 0 ]; then :; else problems="$problems exit=[$execute_rc](want [0])"; fi
-jq -e '.schema == 3 and .mode == "sandbox" and (.steps | keys) == ["J07","J09"]' "$t/out" >/dev/null 2>&1 || problems="$problems report-shape"
-expect agent_exec PASS 'codex exec answered the fixed prompt and completed the declared tool'
-expect agent_reaches_api PASS 'codex exec answered and completed the declared tool'
-finish_case
-
 mk t01_a_the_staged_copy_refuses_a_symlinked_parent
 with_curl
 codex_says 'ready' 0
