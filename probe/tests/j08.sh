@@ -4969,14 +4969,14 @@ case $(cat "$t/err") in
 esac
 finish_case
 
-mk pin_write_failure_restores_the_original_mode
+mk pin_chmod_failure_restores_the_original_mode
 real_python3_probe=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 rewrite=
 for a in "\$@"; do
     if [ "\$rewrite" = 1 ]; then
-        a=\$(printf '%s' "\$a" | sed 's/os\.ftruncate(writer, 0)/raise SystemExit(1)/')
+        a=\$(printf '%s' "\$a" | sed 's/os\.fchmod(handle, mode & ~0o222)/raise SystemExit(1)/')
         rewrite=
     fi
     case \$a in
@@ -5007,22 +5007,32 @@ echo ready
 exit 0
 EOF
 chmod +x "$t/bin/codex"
-begin pin_write_failure_restores_the_original_mode sh "$t/probe" --only J07
+begin pin_chmod_failure_restores_the_original_mode sh "$t/probe" --only J07
 expect_rc 0
 restored_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
 if [ "$restored_mode" != 600 ]; then
     problems="$problems config-mode=$restored_mode(want 600 restored)"
 fi
+restored_content=$(cat "$t/sandbox/.codex/config.toml")
+expected_content='model = "gpt-6.1-sol"
+model_provider = "codex"
+
+[model_providers.codex]
+name = "codex"
+base_url = "http://127.0.0.1:9/v1"'
+if [ "$restored_content" != "$expected_content" ]; then
+    problems="$problems config-content-not-restored"
+fi
 finish_case
 
-mk pin_mid_write_failure_restores_the_original_content_and_mode
+mk pin_failure_after_the_chmod_restores_the_original_content_and_mode
 real_python3_mid=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 rewrite=
 for a in "\$@"; do
     if [ "\$rewrite" = 1 ]; then
-        a=\$(printf '%s' "\$a" | sed 's/view = view\[os\.write(writer, view):\]/raise SystemExit(1)/')
+        a=\$(printf '%s' "\$a" | sed 's/os\.fchmod(dirfd, dir_mode & ~0o222)/raise SystemExit(1)/')
         rewrite=
     fi
     case \$a in
@@ -5053,7 +5063,7 @@ echo ready
 exit 0
 EOF
 chmod +x "$t/bin/codex"
-begin pin_mid_write_failure_restores_the_original_content_and_mode sh "$t/probe" --only J07
+begin pin_failure_after_the_chmod_restores_the_original_content_and_mode sh "$t/probe" --only J07
 expect_rc 0
 mid_mode=$(stat -c '%a' "$t/sandbox/.codex/config.toml" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.codex/config.toml" 2>/dev/null)
 if [ "$mid_mode" != 600 ]; then
@@ -5120,14 +5130,14 @@ if [ "$absent_mode" != 600 ]; then
 fi
 finish_case
 
-mk pin_failed_write_restorer_skips_a_replaced_identity
+mk pin_failed_restorer_skips_a_replaced_identity
 real_python3_replace=$python_real
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
 rewrite=
 for a in "\$@"; do
     if [ "\$rewrite" = 1 ]; then
-        a=\$(printf '%s' "\$a" | sed 's@os\.ftruncate(writer, 0)@os.rename(name, name + ".moved") or os.close(os.open(name, os.O_CREAT | os.O_WRONLY, 0o644)) or os.chmod(name, 0o644) or (_ for _ in ()).throw(SystemExit(1))@')
+        a=\$(printf '%s' "\$a" | sed 's@os\.fchmod(dirfd, dir_mode & ~0o222)@os.rename(name, name + ".moved") or os.close(os.open(name, os.O_CREAT | os.O_WRONLY, 0o644)) or os.chmod(name, 0o644) or (_ for _ in ()).throw(SystemExit(1))@')
         rewrite=
     fi
     case \$a in
@@ -5158,7 +5168,7 @@ echo ready
 exit 0
 EOF
 chmod +x "$t/bin/codex"
-begin pin_failed_write_restorer_skips_a_replaced_identity sh "$t/probe" --only J07
+begin pin_failed_restorer_skips_a_replaced_identity sh "$t/probe" --only J07
 expect_rc 0
 if [ ! -e "$t/sandbox/.codex/config.toml.moved" ]; then
     problems="$problems original-identity-not-preserved"

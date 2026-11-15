@@ -102,6 +102,16 @@ skip_case=0
 mk() {
     t=$scratch/$1
     rm -rf "$t"
+    decoy_dir=
+    zai_adapter=
+    zai_agent=
+    zai_comm=
+    zai_version=
+    zai_kind=
+    zai_env_name=
+    zai_provider_url=
+    zai_auth_state=
+    zai_fingerprint=
     if [ -n "$EGRESS_ONLY" ] && [ "$1" != "$EGRESS_ONLY" ]; then
         skip_case=1
         name=$1
@@ -2759,8 +2769,33 @@ zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/
 chmod 0600 "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"
 cat >"$t/bin/python3" <<EOF
 #!/bin/sh
-case " \$* " in
-    *agent/models.yml*) exit 1 ;;
+script=
+target=
+prev=
+seen=
+for a in "\$@"; do
+    if [ "\$seen" = 1 ]; then
+        target=\$a
+        seen=2
+    fi
+    if [ "\$prev" = -c ]; then
+        script=\$a
+        seen=1
+    fi
+    prev=\$a
+done
+case \$script in
+    *freeze_parent*) ;;
+    *) exec "$python_bin" "\$@" ;;
+esac
+case \$target in
+    *agent/models.yml)
+        printf '%s\n' abort-models >>"$t/pin.log"
+        exit 1
+        ;;
+    *config.toml)
+        printf '%s\n' pin-config >>"$t/pin.log"
+        ;;
 esac
 exec "$python_bin" "\$@"
 EOF
@@ -2768,6 +2803,16 @@ chmod +x "$t/bin/python3"
 begin j09_a_pinning_abort_restores_the_declared_config_modes step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
 expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
 [ ! -e "$t/codex.ran" ] || problems="$problems the-agent-was-executed"
+[ -s "$t/pin.log" ] || problems="$problems the-pin-transaction-never-ran"
+grep -q -x 'pin-config' "$t/pin.log" 2>/dev/null || problems="$problems the-first-pin-transaction-never-ran"
+grep -q -x 'abort-models' "$t/pin.log" 2>/dev/null || problems="$problems the-injection-never-happened"
+pin_config_line=$(grep -n -x 'pin-config' "$t/pin.log" 2>/dev/null | head -n 1 | cut -d: -f1)
+pin_abort_line=$(grep -n -x 'abort-models' "$t/pin.log" 2>/dev/null | head -n 1 | cut -d: -f1)
+if [ -n "$pin_config_line" ] && [ -n "$pin_abort_line" ] && [ "$pin_config_line" -lt "$pin_abort_line" ]; then
+    :
+else
+    problems="$problems the-injection-was-not-in-the-second-pin-transaction=[$pin_config_line][$pin_abort_line]"
+fi
 for declared_mode_file in "$t/sandbox/.omp/config.toml" "$t/sandbox/.omp/agent/models.yml"; do
     declared_mode_after=$(python3 -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$declared_mode_file" 2>/dev/null)
     [ "$declared_mode_after" = 600 ] || problems="$problems mode-after-run=[$declared_mode_after](want [600])"
@@ -2987,10 +3032,11 @@ fi
 finish_case
 
 mk t09_pinned_modes_restored_when_the_probe_is_signalled
-host_key=synthetic-T09-host-key-0123456789
-fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
-zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
-cat >"$t/bin/omp" <<EOF
+if [ "$skip_case" -eq 0 ]; then
+    host_key=synthetic-T09-host-key-0123456789
+    fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+    zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+    cat >"$t/bin/omp" <<EOF
 #!/bin/sh
 echo ran >>"$t/codex.ran"
 case " \$* " in
@@ -3003,38 +3049,39 @@ esac
 echo ready
 exit 0
 EOF
-chmod +x "$t/bin/omp"
-prepare_probe || exit 70
-zai_spec t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint" || exit 70
-mode_before=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
-mode_before_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
-env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY sh "$t/probe" --only J09 >"$t/out" 2>"$t/err" &
-probe_pid=$!
-ticks=0
-while [ ! -f "$t/tool.ran" ] && kill -0 "$probe_pid" 2>/dev/null && [ "$ticks" -lt 200 ]; do
-    sleep 0.1
-    ticks=$((ticks + 1))
-done
-sleep 0.2
-collect_descendants "$probe_pid"
-kill -TERM "$probe_pid" 2>/dev/null
-kill_status=$?
-for tree_child in $descendants; do
-    kill -TERM "$tree_child" 2>/dev/null
-done
-wait "$probe_pid" 2>/dev/null
-probe_status=$?
-name=t09_pinned_modes_restored_when_the_probe_is_signalled
-problems=
-[ "$skip_case" -eq 0 ] && total=$((total + 1))
-[ "$kill_status" -eq 0 ] || problems="$problems the-probe-signal-failed"
-[ "$probe_status" -eq 70 ] || problems="$problems the-probe-exit=$probe_status(want 70)"
-mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
-mode_after_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
-[ "$mode_after" = "$mode_before" ] || problems="$problems config-mode=$mode_after(want $mode_before)"
-[ "$mode_after_2" = "$mode_before_2" ] || problems="$problems models-mode=$mode_after_2(want $mode_before_2)"
-[ -s "$t/tool.ran" ] || problems="$problems attack-fixture-never-ran"
-finish_case
+    chmod +x "$t/bin/omp"
+    prepare_probe || exit 70
+    zai_spec t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint" || exit 70
+    mode_before=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
+    mode_before_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
+    env -i HOME="$t/home" PATH="$pathvar" TMPDIR="$t/tmp" STUB_TABLE="$t/table" STUB_LOG="$t/curl.log" ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY sh "$t/probe" --only J09 >"$t/out" 2>"$t/err" &
+    probe_pid=$!
+    ticks=0
+    while [ ! -f "$t/tool.ran" ] && kill -0 "$probe_pid" 2>/dev/null && [ "$ticks" -lt 200 ]; do
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+    sleep 0.2
+    collect_descendants "$probe_pid"
+    kill -TERM "$probe_pid" 2>/dev/null
+    kill_status=$?
+    for tree_child in $descendants; do
+        kill -TERM "$tree_child" 2>/dev/null
+    done
+    wait "$probe_pid" 2>/dev/null
+    probe_status=$?
+    name=t09_pinned_modes_restored_when_the_probe_is_signalled
+    problems=
+    [ "$skip_case" -eq 0 ] && total=$((total + 1))
+    [ "$kill_status" -eq 0 ] || problems="$problems the-probe-signal-failed"
+    [ "$probe_status" -eq 70 ] || problems="$problems the-probe-exit=$probe_status(want 70)"
+    mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/config.toml")
+    mode_after_2=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$t/sandbox/.omp/agent/models.yml")
+    [ "$mode_after" = "$mode_before" ] || problems="$problems config-mode=$mode_after(want $mode_before)"
+    [ "$mode_after_2" = "$mode_before_2" ] || problems="$problems models-mode=$mode_after_2(want $mode_before_2)"
+    [ -s "$t/tool.ran" ] || problems="$problems attack-fixture-never-ran"
+    finish_case
+fi
 
 mk t09_a_detached_helper_cannot_forge_the_final_evidence
 host_key=synthetic-T09-host-key-0123456789
@@ -3376,6 +3423,156 @@ stat_after=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout
 mode_after=$(python3 -I -c 'import os, sys; sys.stdout.write(oct(os.stat(sys.argv[1]).st_mode & 0o7777)[2:])' "$host_config" 2>/dev/null)
 [ "$stat_before" = "$stat_after" ] || problems="$problems the-host-config-was-mutated"
 [ "$mode_before" = "$mode_after" ] || problems="$problems the-host-config-mode-changed=$mode_after(want $mode_before)"
+finish_case
+
+mk t14_a_the_pin_refuses_a_config_replaced_after_the_precheck
+host_key=synthetic-T14-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t14-claude-zai-v1 claude claude '2.1.311 (Claude Code)' Bash ANTHROPIC_AUTH_TOKEN https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0600 "$t/sandbox/.claude/settings.json"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+script=
+prev=
+for a in "\$@"; do
+    if [ "\$prev" = -c ]; then script=\$a; fi
+    prev=\$a
+done
+case \$script in
+    *freeze_parent*) ;;
+    *) exec "$python_bin" "\$@" ;;
+esac
+"$python_bin" -I -c 'import os, sys
+path = sys.argv[1]
+tmp = path + ".replacement"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, sys.argv[2].encode())
+os.close(fd)
+os.replace(tmp, path)
+' "$t/sandbox/.claude/settings.json" '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9/anthropic"}}' 2>/dev/null || :
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin t14_a_the_pin_refuses_a_config_replaced_after_the_precheck step_J09 '' ANTHROPIC_AUTH_TOKEN=openshell:resolve:env:ANTHROPIC_AUTH_TOKEN
+replaced=$(cat "$t/sandbox/.claude/settings.json" 2>/dev/null)
+case $replaced in
+    *127.0.0.1:9*) ;;
+    *) problems="$problems the-replacement-was-overwritten=[$replaced]" ;;
+esac
+expect_codex_not_run
+finish_case
+
+mk t14_a_the_pin_refuses_a_config_rewritten_after_the_precheck
+host_key=synthetic-T14-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t14-claude-zai-v1 claude claude '2.1.311 (Claude Code)' Bash ANTHROPIC_AUTH_TOKEN https://api.z.ai/api/anthropic present "$fingerprint"
+chmod 0600 "$t/sandbox/.claude/settings.json"
+cat >"$t/bin/python3" <<EOF
+#!/bin/sh
+script=
+prev=
+for a in "\$@"; do
+    if [ "\$prev" = -c ]; then script=\$a; fi
+    prev=\$a
+done
+case \$script in
+    *freeze_parent*) ;;
+    *) exec "$python_bin" "\$@" ;;
+esac
+printf '%s\n' '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9/anthropic"}}' >"$t/sandbox/.claude/settings.json" 2>/dev/null || :
+exec "$python_bin" "\$@"
+EOF
+chmod +x "$t/bin/python3"
+begin t14_a_the_pin_refuses_a_config_rewritten_after_the_precheck step_J09 '' ANTHROPIC_AUTH_TOKEN=openshell:resolve:env:ANTHROPIC_AUTH_TOKEN
+rewritten=$(cat "$t/sandbox/.claude/settings.json" 2>/dev/null)
+case $rewritten in
+    *127.0.0.1:9*) ;;
+    *) problems="$problems the-rewrite-was-overwritten=[$rewritten]" ;;
+esac
+expect_codex_not_run
+finish_case
+
+mk t09_a_the_second_staged_config_is_pinned_and_tracked
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+staged="\${CODEX_HOME:-/nonexistent}/.omp/agent/models.yml"
+if [ -f "\$staged" ] && [ ! -f "$t/staged.mode" ]; then
+    staged_mode=\$(python3 -I -c 'import os, stat, sys; sys.stdout.write("%o" % stat.S_IMODE(os.stat(sys.argv[1]).st_mode))' "\$staged" 2>/dev/null) || staged_mode=
+    printf '%s\n' "\$staged_mode" >"$t/staged.mode"
+fi
+if [ -f "\$staged" ]; then
+    cp "\$staged" "$t/staged.save" 2>/dev/null || :
+    chmod u+w "\$staged" 2>/dev/null || :
+    printf '%s\n' 'baseUrl: http://127.0.0.1:9/v1' 'api: anthropic-messages' 'apiKey: ZAI_API_KEY' >"\$staged" 2>/dev/null || :
+    cat "$t/staged.save" >"\$staged" 2>/dev/null || :
+fi
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_the_second_staged_config_is_pinned_and_tracked step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+[ -f "$t/staged.mode" ] || problems="$problems the-second-staged-config-was-not-reached"
+staged_mode=$(cat "$t/staged.mode" 2>/dev/null)
+[ "$staged_mode" = 444 ] || problems="$problems the-second-staged-mode=[$staged_mode](want [444])"
+expect agent_reaches_api FAIL 'the provider endpoint is not the contract endpoint https://api.z.ai/api/anthropic'
+finish_case
+
+mk t09_a_the_staged_home_leaves_no_read_only_tree_behind
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+leaked_before=0
+for leaked_dir in /tmp/jackin-sentinel-probe.*/agent-home; do
+    [ -d "$leaked_dir" ] || continue
+    leaked_before=$((leaked_before + 1))
+done
+begin t09_a_the_staged_home_leaves_no_read_only_tree_behind step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+leaked_after=0
+for leaked_dir in /tmp/jackin-sentinel-probe.*/agent-home; do
+    [ -d "$leaked_dir" ] || continue
+    leaked_after=$((leaked_after + 1))
+done
+[ "$leaked_after" = "$leaked_before" ] || problems="$problems the-staged-home-tree-was-left-behind=[$leaked_before]->[$leaked_after]"
+finish_case
+
+mk t09_a_the_cleanup_restores_the_frozen_parent_after_the_config_disappears
+host_key=synthetic-T09-host-key-0123456789
+fingerprint=$(printf '%s' "$host_key" | sha256sum | cut -d' ' -f1)
+zai_case t09-omp-zai-v1 omp omp 'omp/18.18.3' bash ZAI_API_KEY https://api.z.ai/api/anthropic present "$fingerprint"
+cat >"$t/bin/omp" <<EOF
+#!/bin/sh
+echo ran >>"$t/codex.ran"
+chmod 0700 "$t/sandbox/.omp" 2>/dev/null || :
+rm -f "$t/sandbox/.omp/config.toml" 2>/dev/null || :
+case " \$* " in
+    *"Use one shell tool"*)
+        printf '%s\n' '{"type":"turn_context","provider":"zai","model":"glm-5.3"}'
+        printf '%s\n' '{"type":"tool_call","name":"bash","workdir":"$t/sandbox/project"}'
+        printf '%s\n' '{"type":"tool_result","isError":false,"content":"AGENTS.md Dockerfile instructions jackin.role.toml probe tests"}'
+        printf '%s\n' '{"type":"assistant","text":"ready"}'
+        exit 0
+        ;;
+esac
+echo ready
+exit 0
+EOF
+chmod +x "$t/bin/omp"
+begin t09_a_the_cleanup_restores_the_frozen_parent_after_the_config_disappears step_J09 '' ZAI_API_KEY=openshell:resolve:env:ZAI_API_KEY
+parent_mode=$(stat -c '%a' "$t/sandbox/.omp" 2>/dev/null || stat -f '%Lp' "$t/sandbox/.omp" 2>/dev/null)
+[ "$parent_mode" = 755 ] || problems="$problems the-parent-mode-after=[$parent_mode](want [755])"
 finish_case
 
 echo "$total cases, $failures failed"

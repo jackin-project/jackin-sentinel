@@ -32,8 +32,8 @@ PIN_MODES=
 PIN_STATS=
 PIN_HOME_DIRS=
 DECL_IDS=
-stage_config_stat=
-stage_config_path=
+stage_config_paths=
+stage_config_stats=
 EXPECTED_AGENT=
 ADAPTER=
 AUTH_REQUIRED=present
@@ -893,10 +893,16 @@ EOF
 $TOOL_OBSERVATION
 EOF
     fi
-    if [ -n "$stage_config_stat" ] || { [ -n "${stage_config_path-}" ] && [ -e "$stage_config_path" ]; }; then
-        stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "${stage_config_path-}" 2>/dev/null) || stage_stat_now=
-        [ -n "$stage_config_stat" ] && [ "$stage_stat_now" = "$stage_config_stat" ] || sandbox_conflict=true
-    fi
+    stage_config_index=0
+    while IFS= read -r stage_config_path; do
+        stage_config_index=$((stage_config_index + 1))
+        [ -n "$stage_config_path" ] || continue
+        stage_config_want=$(printf '%s\n' "$stage_config_stats" | sed -n "$((stage_config_index))p")
+        stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_config_path" 2>/dev/null) || stage_stat_now=
+        [ -n "$stage_config_want" ] && [ "$stage_stat_now" = "$stage_config_want" ] || sandbox_conflict=true
+    done <<EOF_JKS_STAGE_CONFIGS
+$stage_config_paths
+EOF_JKS_STAGE_CONFIGS
     if [ "$EXPECTED_AGENT" = codex ]; then
         if [ "$configs_pinned" != true ]; then
             actual_endpoint=
@@ -1535,7 +1541,7 @@ try:
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise SystemExit(1)
         dirst = os.fstat(dirfd)
-        sys.stdout.write("%o\n%d %d %d %d %d\n%o %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, stat.S_IMODE(dirst.st_mode), dirst.st_dev, dirst.st_ino))
+        sys.stdout.write("%o\n%d %d %d %d %d\n%o %o %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, stat.S_IMODE(dirst.st_mode), stat.S_IMODE(dirst.st_mode) & ~0o222, dirst.st_dev, dirst.st_ino))
     finally:
         os.close(handle)
 finally:
@@ -1581,6 +1587,7 @@ finally:
         declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 freeze_parent = len(sys.argv) > 2 and sys.argv[2] == "1"
+expected = sys.argv[3].split() if len(sys.argv) > 3 else []
 data = sys.stdin.buffer.read()
 parent, name = os.path.split(path)
 if not name:
@@ -1593,10 +1600,10 @@ except OSError:
     raise SystemExit(1)
 os.chdir(parent)
 mode = None
+identity = None
 dir_mode = None
 frozen = False
-written = False
-truncated = False
+chmodded = False
 done = False
 try:
     dirst = os.fstat(dirfd)
@@ -1614,61 +1621,41 @@ try:
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise SystemExit(1)
         mode = stat.S_IMODE(opened.st_mode)
+        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        if len(expected) != 5 or tuple(int(v) for v in expected) != identity:
+            raise SystemExit(1)
+        current = b""
+        while len(current) <= len(data):
+            chunk = os.read(handle, 65536)
+            if not chunk:
+                break
+            current += chunk
+        if current != data:
+            raise SystemExit(1)
+        again = os.fstat(handle)
+        if (again.st_dev, again.st_ino, again.st_size, again.st_mtime_ns, again.st_ctime_ns) != identity:
+            raise SystemExit(1)
         sys.stdout.write("%o\n%d %d %d %d %d\n" % (mode, opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
         sys.stdout.flush()
+        os.fchmod(handle, mode & ~0o222)
+        chmodded = True
+        final = os.fstat(handle)
     finally:
         os.close(handle)
-    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-    try:
-        opened = os.fstat(handle)
-        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
-        if not stat.S_ISREG(opened.st_mode):
-            raise SystemExit(1)
-        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
-            raise SystemExit(1)
-        os.fchmod(handle, mode | 0o200)
-    finally:
-        os.close(handle)
-    writer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-    try:
-        opened = os.fstat(writer)
-        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
-            raise SystemExit(1)
-        os.ftruncate(writer, 0)
-        truncated = True
-        view = memoryview(data)
-        while view:
-            view = view[os.write(writer, view):]
-        os.fchmod(writer, mode & ~0o222)
-        final = os.fstat(writer)
-    finally:
-        os.close(writer)
-    written = True
     if freeze_parent:
         os.fchmod(dirfd, dir_mode & ~0o222)
         frozen = True
     sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
-    sys.stdout.write("%o %d %d %d\n" % (dir_mode, dirst.st_dev, dirst.st_ino, 1 if frozen else 0))
+    sys.stdout.write("%o %o %d %d %d\n" % (dir_mode, dir_mode & ~0o222, dirst.st_dev, dirst.st_ino, 1 if frozen else 0))
     done = True
     raise SystemExit(0)
 except SystemExit as ex:
-    if ex.code and mode is not None and not written:
+    if ex.code and chmodded:
         try:
             restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
             try:
                 restored = os.fstat(restorer)
-                if (restored.st_dev, restored.st_ino) == (named.st_dev, named.st_ino):
-                    if truncated:
-                        fixer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-                        try:
-                            swapped = os.fstat(fixer)
-                            if (swapped.st_dev, swapped.st_ino) == (named.st_dev, named.st_ino):
-                                os.ftruncate(fixer, 0)
-                                view = memoryview(data)
-                                while view:
-                                    view = view[os.write(fixer, view):]
-                        finally:
-                            os.close(fixer)
+                if (restored.st_dev, restored.st_ino) == identity[:2]:
                     os.fchmod(restorer, mode)
             finally:
                 os.close(restorer)
@@ -1676,23 +1663,12 @@ except SystemExit as ex:
             pass
     raise
 except BaseException:
-    if mode is not None and not written:
+    if chmodded:
         try:
             restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
             try:
                 restored = os.fstat(restorer)
-                if (restored.st_dev, restored.st_ino) == (named.st_dev, named.st_ino):
-                    if truncated:
-                        fixer = os.open(name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-                        try:
-                            swapped = os.fstat(fixer)
-                            if (swapped.st_dev, swapped.st_ino) == (named.st_dev, named.st_ino):
-                                os.ftruncate(fixer, 0)
-                                view = memoryview(data)
-                                while view:
-                                    view = view[os.write(fixer, view):]
-                        finally:
-                            os.close(fixer)
+                if (restored.st_dev, restored.st_ino) == identity[:2]:
                     os.fchmod(restorer, mode)
             finally:
                 os.close(restorer)
@@ -1706,7 +1682,7 @@ finally:
         except OSError:
             pass
     os.close(dirfd)
-' "$declared_path" "$declared_freeze" 2>/dev/null)
+' "$declared_path" "$declared_freeze" "$declared_recorded_id" 2>/dev/null)
         declared_rc=$?
         declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
         declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
@@ -1760,9 +1736,9 @@ try:
     want_ino = int(fields[1])
 except ValueError:
     raise SystemExit(0)
-dirfields = sys.argv[5].split()
-if len(dirfields) < 4:
-    dirfields = sys.argv[6].split()
+confirmed = sys.argv[5].split()
+pre = sys.argv[6].split()
+dirfields = confirmed if len(confirmed) >= 5 else pre
 parent, name = os.path.split(path)
 if not name:
     raise SystemExit(0)
@@ -1774,35 +1750,29 @@ except OSError:
     raise SystemExit(0)
 try:
     try:
+        dirst = os.fstat(dirfd)
+        if len(dirfields) >= 5 and dirfields[4] == "1":
+            if (dirst.st_dev, dirst.st_ino) == (int(dirfields[2]), int(dirfields[3])):
+                if len(confirmed) >= 5 or stat.S_IMODE(dirst.st_mode) == int(dirfields[1], 8):
+                    os.fchmod(dirfd, int(dirfields[0], 8))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
         named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
     except OSError:
-        raise SystemExit(0)
-    if not stat.S_ISREG(named.st_mode):
-        raise SystemExit(0)
-    try:
-        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-    except OSError:
-        raise SystemExit(0)
-    try:
-        opened = os.fstat(handle)
-        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
-            raise SystemExit(0)
-        if (opened.st_dev, opened.st_ino) != (want_dev, want_ino):
-            raise SystemExit(0)
+        named = None
+    if named is not None and stat.S_ISREG(named.st_mode):
         try:
-            dirst = os.fstat(dirfd)
-            if len(dirfields) < 4:
-                raise OSError
-            if dirfields[3] != "1":
-                raise OSError
-            if (dirst.st_dev, dirst.st_ino) != (int(dirfields[1]), int(dirfields[2])):
-                raise OSError
-            os.fchmod(dirfd, int(dirfields[0], 8))
+            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
         except OSError:
-            pass
-        os.fchmod(handle, mode)
-    finally:
-        os.close(handle)
+            handle = None
+        if handle is not None:
+            try:
+                opened = os.fstat(handle)
+                if (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino) and (opened.st_dev, opened.st_ino) == (want_dev, want_ino):
+                    os.fchmod(handle, mode)
+            finally:
+                os.close(handle)
 finally:
     os.close(dirfd)
 ' "$declared_path" "$declared_mode" "$declared_pinned" "$declared_ident" "$declared_dir" "$declared_dir_pre" 2>/dev/null || true
@@ -1952,9 +1922,18 @@ EOF_JKS_EXPECTED_MODEL
 }
 
 unseal_agent_home() {
-    [ -n "${PIN_HOME_DIRS-}" ] || return 0
+    _jks_home_dirs=${PIN_HOME_DIRS-}
+    if [ -z "$_jks_home_dirs" ] && [ -f "$work/agent-home.dirs" ]; then
+        _jks_home_dirs=$(cat "$work/agent-home.dirs" 2>/dev/null) || _jks_home_dirs=
+    fi
+    [ -n "$_jks_home_dirs" ] || return 0
     while read -r home_dir home_mode home_dev home_ino; do
         [ -n "$home_dir" ] || continue
+        case $home_dir in
+            "$work/agent-home") ;;
+            "$work/agent-home"/*) ;;
+            *) continue ;;
+        esac
         python3 -I -c 'import os, stat, sys
 path = sys.argv[1]
 mode = int(sys.argv[2], 8)
@@ -1973,9 +1952,10 @@ finally:
     os.close(handle)
 ' "$home_dir" "$home_mode" "$home_dev" "$home_ino" 2>/dev/null || true
     done <<EOF_JKS_HOME_DIRS
-${PIN_HOME_DIRS}
+$_jks_home_dirs
 EOF_JKS_HOME_DIRS
     PIN_HOME_DIRS=
+    rm -f "$work/agent-home.dirs" 2>/dev/null || :
     return 0
 }
 
@@ -1993,10 +1973,11 @@ stage_agent_home() {
         copy_bounded "$AUTH_FILE" "$stage_dir/$stage_name" || return 1
     fi
     stage_provider_config "$stage_dir/config.toml" || return 1
-    stage_config_stat=
-    stage_config_path=
+    stage_config_paths=
+    stage_config_stats=
     if [ -f "$stage_dir/config.toml" ]; then
-        stage_config_path=$stage_dir/config.toml
+        stage_config_paths="$stage_dir/config.toml
+"
     else
         stage_declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
         stage_declared_index=0
@@ -2014,16 +1995,20 @@ stage_agent_home() {
             [ -n "$stage_parent" ] && [ "$stage_parent" != "$stage_rel" ] || return 1
             mkdir -p "$stage_dir/$stage_parent" 2>/dev/null || return 1
             printf '%s' "$stage_snapshot" >"$stage_dir/$stage_rel" 2>/dev/null || return 1
-            if [ -z "$stage_config_path" ]; then
-                stage_config_path=$stage_dir/$stage_rel
-            fi
+            stage_config_paths="${stage_config_paths}$stage_dir/$stage_rel
+"
             stage_declared_index=$((stage_declared_index + 1))
         done
     fi
-    if [ -n "$stage_config_path" ]; then
+    while IFS= read -r stage_config_path; do
+        [ -n "$stage_config_path" ] || continue
         chmod 0444 "$stage_config_path" 2>/dev/null || return 1
         stage_config_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_config_path" 2>/dev/null) || return 1
-    fi
+        stage_config_stats="${stage_config_stats}${stage_config_stat}
+"
+    done <<EOF_JKS_STAGE_CONFIGS
+$stage_config_paths
+EOF_JKS_STAGE_CONFIGS
     PIN_HOME_DIRS=$(python3 -I -c 'import os, stat, sys
 root = sys.argv[1]
 lines = []
@@ -2039,6 +2024,8 @@ for dirpath, dirnames, filenames in os.walk(root, topdown=False):
 if lines:
     sys.stdout.write("\n".join(lines) + "\n")
 ' "$stage_dir" 2>/dev/null) || return 1
+    printf '%s' "$PIN_HOME_DIRS" >"$work/agent-home.dirs" 2>/dev/null || return 1
+    chmod 0600 "$work/agent-home.dirs" 2>/dev/null || return 1
     return 0
 }
 
