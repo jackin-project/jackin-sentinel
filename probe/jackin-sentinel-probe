@@ -28,6 +28,12 @@ CREDENTIAL_FINGERPRINT=
 RAW_CREDENTIAL=0
 EXPECTED_PROVIDER=
 EXPECTED_MODEL=
+PIN_MODES=
+PIN_MODES_PRE=
+PIN_STATS=
+DECL_IDS=
+stage_config_paths=
+stage_config_stats=
 EXPECTED_AGENT=
 ADAPTER=
 AUTH_REQUIRED=present
@@ -44,6 +50,8 @@ SCAN_MAX_FILES=20000
 SCAN_DEADLINE_SECONDS=300
 SCAN_ERR_MAX=65536
 AGENT_HOME_MAX_BYTES=1048576
+CONFIG_BYTE_CAP=1048576
+SPEC_BYTE_CAP=1048576
 SCAN_GREP_SECONDS=20
 LOG_BYTE_CAP=1048576
 LOG_READ_SECONDS=10
@@ -87,6 +95,35 @@ have() {
     command -v "$1" >/dev/null 2>&1
 }
 
+write_nofollow() {
+    _jks_wnf_path=$1
+    _jks_wnf_mode=$2
+    python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+mode = sys.argv[2]
+flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+if mode == "append":
+    flags |= os.O_APPEND
+else:
+    flags |= os.O_TRUNC
+try:
+    handle = os.open(path, flags, 0o600)
+except OSError:
+    raise SystemExit(1)
+try:
+    if not stat.S_ISREG(os.fstat(handle).st_mode):
+        raise SystemExit(1)
+    data = sys.stdin.buffer.read()
+    view = memoryview(data)
+    while view:
+        view = view[os.write(handle, view):]
+except OSError:
+    raise SystemExit(1)
+finally:
+    os.close(handle)
+' "$_jks_wnf_path" "$_jks_wnf_mode" 2>/dev/null
+}
+
 check() {
     detail=$3
     if [ "$2" != PASS ] && [ -z "$detail" ]; then
@@ -101,23 +138,23 @@ check() {
         _jks_chain=$(printf '%s%s\n' "$RUN_KEY$_jks_chain" "$_jks_doc" | sha256sum)
         _jks_chain=${_jks_chain%% *}
         if [ -n "$_jks_chain" ]; then
-            printf '%s\n' "$_jks_chain" >"$work/checks.tag"
+            printf '%s\n' "$_jks_chain" | write_nofollow "$work/checks.tag" truncate || return 1
         fi
     fi
-    printf '%s\n' "$_jks_doc" >>"$work/checks"
+    printf '%s\n' "$_jks_doc" | write_nofollow "$work/checks" append || return 1
 }
 
 seal_facts() {
     if [ -z "$1" ]; then
-        : >"$work/facts"
-        : >"$work/facts.tag"
+        : | write_nofollow "$work/facts" truncate || return 1
+        : | write_nofollow "$work/facts.tag" truncate || return 1
         return 0
     fi
-    printf '%s\n' "$1" >"$work/facts"
+    printf '%s\n' "$1" | write_nofollow "$work/facts" truncate || return 1
     if [ -n "$RUN_KEY" ]; then
         _jks_chain=$(printf '%s%s\n' "$RUN_KEY$_jks_chain" "$1" | sha256sum)
         _jks_chain=${_jks_chain%% *}
-        printf '%s\n' "$_jks_chain" >"$work/facts.tag"
+        printf '%s\n' "$_jks_chain" | write_nofollow "$work/facts.tag" truncate || return 1
     fi
 }
 
@@ -794,14 +831,21 @@ process_checks() {
 }
 
 agent_tool_evidence() {
-    : >"$work/tool.out"
-    : >"$work/tool.observation"
+    tool_output_ready=true
+    if ! : | write_nofollow "$work/tool.out" truncate; then
+        tool_output_ready=false
+    fi
+    if ! : | write_nofollow "$work/tool.observation" truncate; then
+        tool_output_ready=false
+    fi
     tool_attempted=false
     tool_succeeded=false
     tool_exit=
     actual_provider=
     actual_model=
     actual_endpoint=
+    configs_stat_ok=true
+    configs_pinned=false
     sandbox_endpoint=
     sandbox_conflict=false
     if [ "$EXPECTED_AGENT" = codex ]; then
@@ -813,8 +857,16 @@ agent_tool_evidence() {
         else
             sandbox_conflict=true
         fi
+    else
+        declared_use_snapshot=1
+        if [ "${prompt_configs_validated-}" = true ] && declared_provider_config; then
+            actual_endpoint=$declared_effective
+        fi
     fi
     tool_workdir=
+    if [ "${prompt_configs_validated-}" = true ] && [ "${prompt_configs_pinned-}" = true ]; then
+        configs_pinned=true
+    fi
     if [ "$launch_kind" != none ]; then
         set --
         while IFS= read -r encoded; do
@@ -824,13 +876,23 @@ agent_tool_evidence() {
         done <<EOF
 $TOOL_ARGV
 EOF
-        (
-            ulimit -f 128
-            cd "$PROJECT" || exit 1
-            sanitize_launch_environment || exit 1
-            CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
-        )
-        tool_exit=$?
+        if [ "$configs_pinned" = true ] && [ "${declared_effective-}" = "$PROVIDER_URL" ] && declared_configs_stat_unchanged && [ "$tool_output_ready" = true ]; then
+            (
+                ulimit -f 128
+                cd "$PROJECT" || exit 1
+                sanitize_launch_environment || exit 1
+                HOME="$work/agent-home" CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" >"$work/tool.out" 2>/dev/null </dev/null
+            )
+            tool_exit=$?
+        else
+            tool_exit=126
+            if [ "$configs_pinned" = true ] && ! declared_configs_stat_unchanged; then
+                : | write_nofollow "$work/config-gate.refused" truncate
+            fi
+        fi
+        if [ "$configs_pinned" = true ]; then
+            declared_configs_stat_unchanged || configs_stat_ok=false
+        fi
         events=$(jq -Rs '[split("\n")[] | select(length > 0) | fromjson?]' "$work/tool.out" 2>/dev/null) || events='[]'
         actual_provider=$(printf '%s' "$events" | jq -r '[.. | objects | .provider? // .provider_name? // .model_provider? // empty | select(type == "string" and length > 0)] | .[0] // ""')
         actual_model=$(printf '%s' "$events" | jq -r '[.. | objects | .model? // .canonicalModel? // (.modelUsage? | if type == "object" then keys[] else empty end) // empty | select(type == "string" and length > 0)] | .[0] // ""')
@@ -865,6 +927,31 @@ EOF
 $TOOL_OBSERVATION
 EOF
     fi
+    stage_config_index=0
+    while IFS= read -r stage_config_path; do
+        stage_config_index=$((stage_config_index + 1))
+        [ -n "$stage_config_path" ] || continue
+        stage_config_want=$(printf '%s\n' "$stage_config_stats" | sed -n "$((stage_config_index))p")
+        stage_stat_now=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_config_path" 2>/dev/null) || stage_stat_now=
+        [ -n "$stage_config_want" ] && [ "$stage_stat_now" = "$stage_config_want" ] || sandbox_conflict=true
+    done <<EOF_JKS_STAGE_CONFIGS
+$stage_config_paths
+EOF_JKS_STAGE_CONFIGS
+    if [ "$EXPECTED_AGENT" = codex ]; then
+        if [ "$configs_pinned" != true ]; then
+            actual_endpoint=
+            sandbox_conflict=true
+        elif [ "$configs_stat_ok" != true ] || ! declared_configs_match_snapshot; then
+            actual_endpoint=
+        fi
+    elif [ -n "$actual_endpoint" ]; then
+        declared_use_snapshot=1
+        declared_provider_config || actual_endpoint=
+        declared_use_snapshot=
+        if [ -n "$actual_endpoint" ] && { [ "$configs_stat_ok" != true ] || ! declared_configs_match_snapshot; }; then
+            actual_endpoint=
+        fi
+    fi
     observation=$(jq -Rn '[inputs]' <"$work/tool.observation")
     jq -cn --arg provider "$actual_provider" --arg model "$actual_model" --arg kind "$TOOL_KIND" \
         --arg endpoint "$actual_endpoint" --arg sandbox "$sandbox_endpoint" --argjson conflict "$sandbox_conflict" \
@@ -877,39 +964,1327 @@ EOF
                  workdir: $workdir, observation: $observation}}'
 }
 
+read_bounded() {
+    read_src=$1
+    read_dst=$2
+    read_cap=$3
+    read_body=
+    while IFS= read -r _jks_body_line; do
+        read_body="$read_body$_jks_body_line
+"
+    done <<'EOF_JKS_READ_BODY'
+if command -v head >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 10 head -c $((RB_CAP + 1)) -- /dev/fd/9 >&8 2>/dev/null || exit 1
+    else
+        head -c $((RB_CAP + 1)) -- /dev/fd/9 >&8 2>/dev/null || exit 1
+    fi
+else
+    if command -v dd >/dev/null 2>&1; then
+        dd if=/dev/fd/9 bs="$((RB_CAP + 1))" count=1 2>/dev/null >&8 || exit 1
+    else
+        exit 1
+    fi
+fi
+exit 0
+EOF_JKS_READ_BODY
+    capture_open_exec "$read_src" "$read_dst" "$read_cap" "$read_cap" 0 "$read_body"
+}
+
 copy_bounded() {
-    copy_src=$1
-    copy_dst=$2
-    [ -f "$copy_src" ] || return 1
-    timeout 10 head -c $((AGENT_HOME_MAX_BYTES + 1)) -- "$copy_src" >"$copy_dst" || return 1
-    [ -f "$copy_dst" ] || return 1
-    copy_bytes=$(wc -c <"$copy_dst" 2>/dev/null | tr -d '[:space:]') || return 1
-    case $copy_bytes in
-        '' | *[!0-9]*) return 1 ;;
+    read_bounded "$1" "$2" "$AGENT_HOME_MAX_BYTES"
+}
+
+capture_open_exec() {
+    RB_SRC=$1 RB_DST=$2 RB_CAP=$3 RB_LEN=$4 RB_NUL=$5 RB_BODY=$6 python3 -I -c 'import os, stat, subprocess, sys
+src = os.environ["RB_SRC"]
+dst = os.environ["RB_DST"]
+cap = int(os.environ["RB_CAP"])
+try:
+    handle = os.open(src, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+opened = os.fstat(handle)
+if not stat.S_ISREG(opened.st_mode):
+    raise SystemExit(1)
+named = os.lstat(src)
+if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+    raise SystemExit(1)
+if opened.st_size > cap:
+    raise SystemExit(1)
+if os.environ["RB_NUL"] == "1" and b"\x00" in os.pread(handle, min(opened.st_size, int(os.environ["RB_LEN"])), 0):
+    raise SystemExit(1)
+os.dup2(handle, 9)
+if handle != 9:
+    os.close(handle)
+os.set_inheritable(9, True)
+pass_fds = (9,)
+parentfd = -1
+destname = ""
+if dst:
+    parent, name = os.path.split(dst)
+    if not name:
+        raise SystemExit(1)
+    if not parent:
+        parent = "."
+    try:
+        parentfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise SystemExit(1)
+    try:
+        dest = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=parentfd)
+    except OSError:
+        os.close(parentfd)
+        raise SystemExit(1)
+    destname = name
+    if dest == 9 or not stat.S_ISREG(os.fstat(dest).st_mode):
+        os.close(dest)
+        os.close(parentfd)
+        raise SystemExit(1)
+    os.dup2(dest, 8)
+    if dest != 8:
+        os.close(dest)
+    os.set_inheritable(8, True)
+    pass_fds = (9, 8)
+completed = subprocess.run(["sh", "-c", os.environ["RB_BODY"]], pass_fds=pass_fds)
+try:
+    after = os.fstat(9)
+    renamed = os.lstat(src)
+except OSError:
+    raise SystemExit(3)
+if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+    raise SystemExit(3)
+if (renamed.st_dev, renamed.st_ino) != (after.st_dev, after.st_ino):
+    raise SystemExit(3)
+if dst:
+    try:
+        written = os.fstat(8)
+        named_dst = os.stat(destname, dir_fd=parentfd, follow_symlinks=False)
+    except OSError:
+        raise SystemExit(1)
+    if not stat.S_ISREG(written.st_mode):
+        raise SystemExit(1)
+    if written.st_size > cap:
+        raise SystemExit(1)
+    if (named_dst.st_dev, named_dst.st_ino) != (written.st_dev, written.st_ino):
+        raise SystemExit(1)
+if completed.returncode < 0:
+    os.kill(os.getpid(), -completed.returncode)
+raise SystemExit(completed.returncode)
+' 2>/dev/null
+}
+
+capture_bounded() {
+    _jks_capture=
+    capture_body=
+    while IFS= read -r _jks_body_line; do
+        capture_body="$capture_body$_jks_body_line
+"
+    done <<'EOF_JKS_CAPTURE_BODY'
+cb_raw=$(
+    if command -v head >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 10 head -c "$RB_LEN" <&9 || exit 1
+        else
+            head -c "$RB_LEN" <&9 || exit 1
+        fi
+    elif command -v dd >/dev/null 2>&1; then
+        dd bs="$RB_LEN" count=1 <&9 2>/dev/null || exit 1
+    else
+        exit 1
+    fi
+    printf x
+) || exit 1
+cb_raw=${cb_raw%x}
+if command -v wc >/dev/null 2>&1; then
+    cb_len=$(printf "%s" "$cb_raw" | wc -c | tr -d "[:space:]") || exit 1
+else
+    cb_len=$(printf "%s" "$cb_raw" | python3 -I -c "import sys; sys.stdout.write(str(len(sys.stdin.buffer.read())))" 2>/dev/null) || exit 1
+fi
+[ -n "$cb_len" ] || exit 1
+[ "$cb_len" -le "$RB_CAP" ] 2>/dev/null || exit 1
+printf "%s" "$cb_raw"
+printf x
+EOF_JKS_CAPTURE_BODY
+    _jks_capture=$(capture_open_exec "$1" "" "$2" "$3" 1 "$capture_body")
+    _jks_capture_status=$?
+    [ "$_jks_capture_status" -eq 0 ] || return "$_jks_capture_status"
+    _jks_capture=${_jks_capture%x}
+    return 0
+}
+
+capture_config_identity() {
+    python3 -I -c 'import os, stat, sys
+try:
+    handle = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(handle)
+    if not stat.S_ISREG(opened.st_mode):
+        raise SystemExit(1)
+    named = os.lstat(sys.argv[1])
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    sys.stdout.write("%d %d %d %d %d" % (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
+finally:
+    os.close(handle)
+' "$1" 2>/dev/null
+}
+
+entropy_encode() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 2>/dev/null
+    else
+        python3 -I -c 'import base64, sys
+raw = sys.stdin.buffer.read()
+if len(raw) != 32:
+    raise SystemExit(1)
+sys.stdout.write(base64.b64encode(raw).decode())' 2>/dev/null
+    fi
+}
+
+entropy_decode() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -d 2>/dev/null
+    else
+        python3 -I -c 'import base64, sys
+raw = base64.b64decode(sys.stdin.buffer.read())
+if len(raw) != 32:
+    raise SystemExit(1)
+sys.stdout.buffer.write(raw)' 2>/dev/null
+    fi
+}
+
+entropy_wire_valid() {
+    case $1 in
+        *[!A-Za-z0-9+/=]*) return 1 ;;
     esac
-    [ "$copy_bytes" -le "$AGENT_HOME_MAX_BYTES" ] || return 1
+    [ "${#1}" -eq 44 ] || return 1
+    [ "${1%=}" != "$1" ] || return 1
+    [ "${1%==}" = "$1" ] || return 1
+}
+
+read_entropy() {
+    entropy_wire=
+    if command -v head >/dev/null 2>&1; then
+        entropy_wire=$(head -c 32 /dev/urandom 2>/dev/null | entropy_encode) || entropy_wire=
+        entropy_wire_valid "$entropy_wire" || entropy_wire=
+    fi
+    if [ -z "$entropy_wire" ] && command -v python3 >/dev/null 2>&1; then
+        entropy_wire=$(python3 -I -c 'import base64, os, sys
+handle = os.open("/dev/urandom", os.O_RDONLY)
+collected = b""
+try:
+    while len(collected) < 32:
+        chunk = os.read(handle, 32 - len(collected))
+        if not chunk:
+            break
+        collected += chunk
+finally:
+    os.close(handle)
+sys.stdout.write(base64.b64encode(collected).decode())
+' 2>/dev/null) || entropy_wire=
+        entropy_wire_valid "$entropy_wire" || entropy_wire=
+    fi
+    if [ -z "$entropy_wire" ] && command -v dd >/dev/null 2>&1; then
+        entropy_wire=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | entropy_encode) || entropy_wire=
+        entropy_wire_valid "$entropy_wire" || entropy_wire=
+    fi
+    entropy_wire_valid "$entropy_wire" || return 1
+    printf '%s' "$entropy_wire"
+}
+
+root_toml_selection() {
+    python3 -I -c 'import json, sys, tomllib
+try:
+    doc = tomllib.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(doc, dict):
+    raise SystemExit(1)
+out = {}
+for key in ("model", "model_provider"):
+    value = doc.get(key)
+    if isinstance(value, str):
+        out[key] = value
+sys.stdout.write(json.dumps(out))
+' 2>/dev/null
+}
+
+declared_provider_config() {
+    declared_effective=
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    [ "$declared_count" -ge 1 ] || return 1
+    if [ -z "${declared_use_snapshot-}" ]; then
+        DECL_IDS=
+    fi
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
+        [ -n "$declared_path" ] || return 1
+        if [ -z "${declared_use_snapshot-}" ]; then
+            _jks_vcfg_ident=$(capture_config_identity "$declared_path") || return 1
+            [ -n "$_jks_vcfg_ident" ] || return 1
+            capture_bounded "$declared_path" "$CONFIG_BYTE_CAP" "$((CONFIG_BYTE_CAP + 1))" || return 1
+            _jks_vcfg_st=$_jks_capture
+            case $declared_index in
+                0) _jks_vcfg_0=$_jks_vcfg_st ;;
+                1) _jks_vcfg_1=$_jks_vcfg_st ;;
+                *) return 1 ;;
+            esac
+            DECL_IDS="${DECL_IDS}${_jks_vcfg_ident}
+"
+        fi
+        case $declared_index in
+            0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+            1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+            *) return 1 ;;
+        esac
+        [ -n "$_jks_vcfg_sel" ] || return 1
+        _jks_declared_required=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].required_text // [] | .[]') || return 1
+        while IFS= read -r declared_line; do
+            [ -n "$declared_line" ] || continue
+            printf '%s' "$_jks_vcfg_sel" | grep -Fq -- "$declared_line" || return 1
+        done <<EOF_JKS_DECLARED_REQUIRED
+$_jks_declared_required
+EOF_JKS_DECLARED_REQUIRED
+        _jks_declared_forbidden=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].forbidden_text // [] | .[]') || return 1
+        while IFS= read -r declared_line; do
+            [ -n "$declared_line" ] || continue
+            printf '%s' "$_jks_vcfg_sel" | grep -Fq -- "$declared_line" && return 1
+        done <<EOF_JKS_DECLARED_FORBIDDEN
+$_jks_declared_forbidden
+EOF_JKS_DECLARED_FORBIDDEN
+        _jks_norm=$(printf '%s' "$_jks_vcfg_sel" | sed 's/\r$//') || return 1
+        case $ADAPTER in
+            t09-omp-zai-v1)
+                if [ -z "${_jks_yaml_code-}" ]; then
+                    _jks_yaml_code=
+                    while IFS= read -r _jks_yaml_line; do
+                        _jks_yaml_code="$_jks_yaml_code$_jks_yaml_line
+"
+                    done <<'PY_JKS_YAML_CODE'
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+url_re = re.compile(r'^https?://[^\s"<>]+\Z')
+key_re = re.compile(r'^("(?:[^"\\]|\\.)*"|\'[^\']*\'|[^:#\s][^:]*?)\s*:(?:[ \t]+(.*))?$')
+ESCAPE_MAP = {"0": "\0", "a": "\a", "b": "\b", "t": "\t", "n": "\n", "v": "\v", "f": "\f", "r": "\r", "e": "\x1b", " ": " ", '"': '"', "/": "/", "\\": "\\", "N": "\u0085", "_": "\u00a0", "L": "\u2028", "P": "\u2029"}
+
+
+def decode_escapes(text):
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        i += 1
+        if ch != "\\":
+            out.append(ch)
+            continue
+        if i >= len(text):
+            raise ValueError("trailing escape")
+        esc = text[i]
+        i += 1
+        if esc in ("x", "u", "U"):
+            width = {"x": 2, "u": 4, "U": 8}[esc]
+            digits = text[i:i + width]
+            if len(digits) != width:
+                raise ValueError("bad escape")
+            i += width
+            out.append(chr(int(digits, 16)))
+        elif esc == "\n":
+            while i < len(text) and text[i] in " \t":
+                i += 1
+        elif esc in ESCAPE_MAP:
+            out.append(ESCAPE_MAP[esc])
+        else:
+            raise ValueError("bad escape")
+    return "".join(out)
+
+
+def flow_collection_line(line):
+    quote_ch = ""
+    esc = False
+    at_sep = False
+    for ch in line:
+        if quote_ch == "'":
+            if ch == "'":
+                quote_ch = ""
+            continue
+        if quote_ch == "\"":
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                quote_ch = ""
+            continue
+        if ch == "#" and at_sep:
+            return False
+        if ch in "'\"":
+            quote_ch = ch
+        elif ch in "{}[]":
+            return True
+        at_sep = ch in " \t"
+    return False
+
+
+def strip_inline_comment(text):
+    quote_ch = None
+    escaped = False
+    for i in range(len(text)):
+        ch = text[i]
+        if quote_ch == "\"":
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == "\"":
+                quote_ch = None
+            continue
+        if quote_ch == "'":
+            if ch == "'":
+                quote_ch = None
+            continue
+        if ch in "\"'":
+            quote_ch = ch
+        elif ch == "#" and i > 0 and text[i - 1] in " \t":
+            return text[:i].strip()
+    return text.strip()
+
+
+def flow_skip_space(text, i):
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in " \t\n\r":
+            i += 1
+            continue
+        if ch == "#":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        break
+    return i
+
+
+def flow_value(text, i):
+    n = len(text)
+    if i >= n:
+        raise ValueError("truncated")
+    ch = text[i]
+    if ch in "{[":
+        depth = 0
+        while i < n:
+            cur = text[i]
+            if cur in "'\"":
+                quote = cur
+                i += 1
+                while i < n and text[i] != quote:
+                    if quote == '"' and text[i] == "\\":
+                        i += 1
+                    i += 1
+                if i >= n:
+                    raise ValueError("unterminated quote")
+                i += 1
+                continue
+            if cur in "{[":
+                depth += 1
+            elif cur in "}]":
+                depth -= 1
+                if depth == 0:
+                    return None, i + 1
+            i += 1
+        raise ValueError("unterminated collection")
+    if ch in "'\"":
+        quote = ch
+        i += 1
+        buf = []
+        while i < n:
+            cur = text[i]
+            if quote == '"' and cur == "\\" and i + 1 < n:
+                buf.append(cur)
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if cur == quote:
+                if quote == "'" and i + 1 < n and text[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                raw = "".join(buf)
+                return (decode_escapes(raw) if quote == '"' else raw), i + 1
+            buf.append(cur)
+            i += 1
+        raise ValueError("unterminated scalar")
+    buf = []
+    while i < n:
+        cur = text[i]
+        if cur == "#" and buf and buf[-1] in " \t":
+            break
+        if cur in ",}]":
+            break
+        if cur == "\n":
+            break
+        buf.append(cur)
+        i += 1
+    return " ".join("".join(buf).split()), i
+
+
+def flow_mapping_scalars(text):
+    n = len(text)
+    i = flow_skip_space(text, 0)
+    if i >= n or text[i] != "{":
+        raise ValueError("not a flow mapping")
+    i += 1
+    root = {}
+    while True:
+        i = flow_skip_space(text, i)
+        if i >= n:
+            raise ValueError("truncated")
+        if text[i] == "}":
+            i += 1
+            break
+        if text[i] == ",":
+            i += 1
+            continue
+        if text[i] in "'\"":
+            key, i = flow_value(text, i)
+        else:
+            start = i
+            while i < n and text[i] not in ":,}" and text[i] != "\n":
+                i += 1
+            if i >= n or text[i] != ":":
+                raise ValueError("bad key")
+            key = " ".join(text[start:i].split())
+        if not key:
+            raise ValueError("empty key")
+        i = flow_skip_space(text, i)
+        if i >= n or text[i] != ":":
+            raise ValueError("missing colon")
+        i += 1
+        i = flow_skip_space(text, i)
+        value, i = flow_value(text, i)
+        if key in root:
+            raise ValueError("duplicate key")
+        if value is not None:
+            root[key] = value
+        i = flow_skip_space(text, i)
+        if i < n and text[i] == ",":
+            i += 1
+            continue
+        if i < n and text[i] == "}":
+            i += 1
+            break
+        raise ValueError("bad mapping")
+    i = flow_skip_space(text, i)
+    if i != n:
+        raise ValueError("trailing content")
+    return root
+
+
+def comment_line(line):
+    return line.lstrip(" \t").startswith("#")
+
+
+def dedent_block(block):
+    indent = None
+    for line in block:
+        if not line.strip() or comment_line(line):
+            continue
+        width = len(line) - len(line.lstrip(" "))
+        if indent is None or width < indent:
+            indent = width
+    if indent is None:
+        return ""
+    out = []
+    for line in block:
+        if not line.strip() or comment_line(line):
+            out.append("")
+            continue
+        if len(line) - len(line.lstrip(" ")) < indent:
+            raise ValueError("bad block indent")
+        out.append(line[indent:])
+    return "\n".join(out)
+
+
+def indented_block(lines, i):
+    block = []
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip() or comment_line(line):
+            block.append(line)
+            i += 1
+            continue
+        if line[0] in " \t":
+            block.append(line)
+            i += 1
+            continue
+        break
+    while block and (not block[-1].strip() or comment_line(block[-1])):
+        block.pop()
+    return block, i
+
+
+def merge_sources(anchors, rest):
+    value = strip_inline_comment(rest).strip()
+    if value.startswith("["):
+        if not value.endswith("]"):
+            raise ValueError("bad merge")
+        names = []
+        for part in value[1:-1].split(","):
+            part = part.strip()
+            if not part.startswith("*") or len(part) < 2:
+                raise ValueError("bad merge")
+            names.append(part[1:])
+        if not names:
+            raise ValueError("bad merge")
+    elif value.startswith("*") and len(value) >= 2:
+        names = [value[1:]]
+    else:
+        raise ValueError("bad merge")
+    sources = []
+    for name in names:
+        source = anchors.get(name)
+        if not isinstance(source, dict):
+            raise ValueError("bad merge")
+        sources.append(source)
+    return sources
+
+
+def merged_scalars(groups):
+    merged = {}
+    owners = {}
+    for index, sources in enumerate(groups):
+        for source in sources:
+            for merge_key, merge_value in source.items():
+                if merge_key in owners:
+                    if owners[merge_key] != index:
+                        raise ValueError("duplicate key")
+                    continue
+                owners[merge_key] = index
+                merged[merge_key] = merge_value
+    return merged
+
+
+def plain_root_scalars(text, anchors=None):
+    root = {}
+    if anchors is None:
+        anchors = {}
+    merge_groups = []
+    lines = text.split("\n")
+    i = 0
+    seen = False
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.startswith("%") and not root:
+            continue
+        if line.startswith("---") and line[3:4] in ("", " ", "\t"):
+            line = line[3:].lstrip(" \t")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+        elif line.split("#", 1)[0].rstrip() == "...":
+            continue
+        if not line.strip() or line.lstrip(" \t").startswith("#"):
+            continue
+        if line[0] not in " \t":
+            merge_match = key_re.match(line)
+            if merge_match is not None and merge_match.group(1) == "<<":
+                merge_groups.append(merge_sources(anchors, merge_match.group(2) or ""))
+                seen = True
+                continue
+        if flow_collection_line(line):
+            if not seen and line.lstrip().startswith("{"):
+                return flow_mapping_scalars("\n".join(lines[i - 1:]))
+            raise ValueError("flow collection")
+        seen = True
+        if line[0] in " \t":
+            continue
+        match = key_re.match(line)
+        if match is None:
+            raise ValueError("unsupported line")
+        raw_key = match.group(1)
+        key = decode_escapes(raw_key[1:-1]) if raw_key[0] == '"' else (raw_key[1:-1] if raw_key[0] == "'" else raw_key)
+        rest = match.group(2) or ""
+        if key in root:
+            raise ValueError("duplicate key")
+        anchor = re.match(r"^&([A-Za-z0-9_-]+)(?:[ \t]+(.*))?$", rest)
+        if anchor is not None:
+            name = anchor.group(1)
+            value = anchor.group(2)
+            if name in anchors:
+                raise ValueError("duplicate anchor")
+            anchors[name] = None
+            if value is None or not value.strip():
+                block, i = indented_block(lines, i)
+                if block:
+                    anchors[name] = plain_root_scalars(dedent_block(block), anchors)
+                root[key] = None
+                continue
+            rest = value
+        if not rest.strip() or rest.lstrip().startswith("#"):
+            root[key] = None
+            continue
+        rest = strip_inline_comment(rest)
+        if rest[0] in "|>":
+            header = re.match(r"^[|>](?:([+-])([0-9])?|([0-9])([+-])?)?(?:[ \t]+#.*)?$", rest)
+            if header is None:
+                raise ValueError("bad block header")
+            chomp = header.group(1) or header.group(4) or ""
+            indent_hint = header.group(2) or header.group(3) or ""
+            block = []
+            while i < len(lines):
+                line = lines[i]
+                if line.strip() == "":
+                    block.append("")
+                    i += 1
+                    continue
+                if line[0] in " \t":
+                    block.append(line)
+                    i += 1
+                    continue
+                break
+            trailing = 0
+            while block and block[-1] == "":
+                block.pop()
+                trailing += 1
+            indent = int(indent_hint) if indent_hint else None
+            if indent is None:
+                for line in block:
+                    if line.strip():
+                        indent = len(line) - len(line.lstrip(" "))
+                        break
+            if indent is None:
+                indent = 0
+            content = []
+            for line in block:
+                if not line.strip():
+                    content.append("")
+                elif len(line) - len(line.lstrip(" ")) < indent:
+                    raise ValueError("bad block indent")
+                else:
+                    content.append(line[indent:])
+            if rest[0] == "|":
+                value = "\n".join(content)
+            else:
+                parts = []
+                prev_blank = False
+                first = True
+                for line in content:
+                    if line == "":
+                        parts.append("\n")
+                        prev_blank = True
+                    else:
+                        if not first and not prev_blank:
+                            parts.append(" ")
+                        parts.append(line)
+                        prev_blank = False
+                    first = False
+                value = "".join(parts)
+            if chomp == "+":
+                value += "\n" + "\n" * trailing
+            elif chomp != "-":
+                value += "\n"
+            root[key] = value
+            continue
+        if rest[0] in "\"'":
+            value = None
+            quote = rest[0]
+            buf = rest[1:]
+            out = []
+            j = 0
+            while value is None:
+                while j < len(buf):
+                    ch = buf[j]
+                    j += 1
+                    if quote == "'":
+                        if ch == "'":
+                            if buf[j:j + 1] == "'":
+                                out.append("'")
+                                j += 1
+                                continue
+                            tail = buf[j:].strip()
+                            if tail and not tail.startswith("#"):
+                                raise ValueError("trailing content")
+                            value = "".join(out)
+                            break
+                        out.append(ch)
+                    else:
+                        if ch == "\\" and j < len(buf):
+                            out.append(ch)
+                            out.append(buf[j])
+                            j += 1
+                            continue
+                        if ch == '"':
+                            tail = buf[j:].strip()
+                            if tail and not tail.startswith("#"):
+                                raise ValueError("trailing content")
+                            value = decode_escapes("".join(out))
+                            break
+                        out.append(ch)
+                if value is None:
+                    if i >= len(lines):
+                        raise ValueError("unterminated scalar")
+                    out.append("\n")
+                    buf = lines[i]
+                    i += 1
+                    j = 0
+        else:
+            value = rest
+            while i < len(lines) and lines[i] and lines[i][0] in " \t" and not lines[i].lstrip().startswith("#"):
+                if flow_collection_line(lines[i]):
+                    raise ValueError("flow collection")
+                value += " " + lines[i].strip()
+                i += 1
+        root[key] = value
+    for merge_key, merge_value in merged_scalars(merge_groups).items():
+        if merge_key not in root:
+            root[merge_key] = merge_value
+    return root
+
+
+text = sys.stdin.buffer.read().decode("utf-8-sig")
+try:
+    if yaml is not None:
+
+        class Loader(yaml.SafeLoader):
+            pass
+
+        def merge_source(node):
+            if isinstance(node, yaml.SequenceNode):
+                sources = []
+                for item in node.value:
+                    if not isinstance(item, yaml.MappingNode):
+                        raise ValueError("bad merge")
+                    sources.append(item)
+                return sources
+            if not isinstance(node, yaml.MappingNode):
+                raise ValueError("bad merge")
+            return [node]
+
+        def construct_mapping(loader, node, deep=False):
+            merged = []
+            explicit = []
+            for key_node, value_node in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    merged.append(merge_source(value_node))
+                else:
+                    explicit.append((key_node, value_node))
+            mapping = {}
+            owners = {}
+            for sources in merged:
+                for source in sources:
+                    for key, value in construct_mapping(loader, source, deep=deep).items():
+                        if key in owners:
+                            if owners[key] is not sources:
+                                raise ValueError("duplicate key")
+                            continue
+                        owners[key] = sources
+                        mapping[key] = value
+            explicit_keys = {}
+            for key_node, value_node in explicit:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in explicit_keys:
+                    raise ValueError("duplicate key")
+                explicit_keys[key] = True
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+        doc = yaml.load(text, Loader=Loader)
+    else:
+        doc = plain_root_scalars(text)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(doc, dict) or "baseUrl" not in doc:
+    raise SystemExit(1)
+value = doc["baseUrl"]
+if not isinstance(value, str) or url_re.match(value) is None:
+    raise SystemExit(1)
+sys.stdout.write(value)
+PY_JKS_YAML_CODE
+                fi
+                declared_parsed=$(printf '%s' "$_jks_norm" | python3 -I -c "$_jks_yaml_code" 2>/dev/null) || return 1
+                [ -n "$declared_parsed" ] || return 1
+                ;;
+            t14-claude-zai-v1)
+                declared_parsed=$(printf '%s' "$_jks_norm" | jq -er '.env.ANTHROPIC_BASE_URL | select(type == "string" and length > 0)' 2>/dev/null) || return 1
+                [ -n "$declared_parsed" ] || return 1
+                ;;
+            t01-codex-v1 | t18-codex-zai-v1)
+                declared_parsed=$(printf '%s' "$_jks_norm" | provider_endpoint - "$EXPECTED_PROVIDER" 2>/dev/null) || return 1
+                [ -n "$declared_parsed" ] || return 1
+                declared_root=$(printf '%s' "$_jks_norm" | root_toml_selection 2>/dev/null) || return 1
+                [ -n "$declared_root" ] || return 1
+                declared_root_provider=$(printf '%s' "$declared_root" | jq -r '.model_provider // ""' 2>/dev/null) || return 1
+                [ "$declared_root_provider" = "$EXPECTED_PROVIDER" ] || return 1
+                declared_root_model=$(printf '%s' "$declared_root" | jq -r '.model // ""' 2>/dev/null) || return 1
+                [ "$declared_root_model" = "$EXPECTED_MODEL" ] || return 1
+                ;;
+            *) return 1 ;;
+        esac
+        if [ -z "$declared_effective" ]; then
+            declared_effective=$declared_parsed
+        elif [ "$declared_effective" != "$declared_parsed" ]; then
+            return 1
+        fi
+        declared_index=$((declared_index + 1))
+    done
+    [ -n "$declared_effective" ] || return 1
+    return 0
+}
+
+pin_declared_configs() {
+    PIN_MODES=
+    PIN_MODES_PRE=
+    PIN_IDS=
+    PIN_STATS=
+    PIN_DIRS=
+    PIN_DIRS_PRE=
+    pin_declared_configs_run || {
+        unpin_declared_configs
+        return 1
+    }
+    return 0
+}
+
+pin_declared_configs_run() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    declared_freeze=1
+    case $ADAPTER in
+        t14-claude-zai-v1) declared_freeze=0 ;;
+    esac
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
+        case $declared_index in
+            0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+            1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+            *) return 1 ;;
+        esac
+        [ -n "$_jks_vcfg_sel" ] || return 1
+        declared_pre=$(python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+parent, name = os.path.split(path)
+if not name:
+    raise SystemExit(1)
+if not parent:
+    parent = "."
+try:
+    dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+try:
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except FileNotFoundError:
+        sys.stdout.write("absent\n")
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(handle)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(1)
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise SystemExit(1)
+        dirst = os.fstat(dirfd)
+        sys.stdout.write("%o\n%d %d %d %d %d\n%o %o %d %d\n" % (stat.S_IMODE(opened.st_mode), opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, stat.S_IMODE(dirst.st_mode), stat.S_IMODE(dirst.st_mode) & ~0o222, dirst.st_dev, dirst.st_ino))
+    finally:
+        os.close(handle)
+finally:
+    os.close(dirfd)
+' "$declared_path" 2>/dev/null) || return 1
+        declared_pre_mode=$(printf '%s\n' "$declared_pre" | sed -n 1p)
+        declared_pre_id=$(printf '%s\n' "$declared_pre" | sed -n 2p)
+        declared_pre_dir=$(printf '%s\n' "$declared_pre" | sed -n 3p)
+        declared_recorded_id=$(printf '%s\n' "$DECL_IDS" | sed -n "$((declared_index + 1))p")
+        [ -n "$declared_recorded_id" ] || return 1
+        if [ "$declared_pre_mode" = absent ]; then
+            PIN_MODES="${PIN_MODES}absent
+"
+            PIN_MODES_PRE="${PIN_MODES_PRE}absent
+"
+            PIN_IDS="${PIN_IDS}absent
+"
+            PIN_STATS="${PIN_STATS}absent
+"
+            PIN_DIRS="${PIN_DIRS}absent
+"
+            PIN_DIRS_PRE="${PIN_DIRS_PRE}absent
+"
+            return 1
+        fi
+        case $declared_pre_mode in
+            '' | *[!0-7]*) return 1 ;;
+        esac
+        case $declared_pre_id in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        case $declared_pre_dir in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        case $declared_recorded_id in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        declared_pre_key=${declared_pre_id% *}
+        declared_recorded_key=${declared_recorded_id% *}
+        [ "$declared_pre_key" = "$declared_recorded_key" ] || return 1
+        PIN_MODES_PRE="${PIN_MODES_PRE}${declared_pre_mode}
+"
+        PIN_IDS="${PIN_IDS}${declared_recorded_id}
+"
+        PIN_DIRS_PRE="${PIN_DIRS_PRE}${declared_pre_dir} ${declared_freeze}
+"
+        declared_pin=$(printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+freeze_parent = len(sys.argv) > 2 and sys.argv[2] == "1"
+expected = sys.argv[3].split() if len(sys.argv) > 3 else []
+data = sys.stdin.buffer.read()
+parent, name = os.path.split(path)
+if not name:
+    raise SystemExit(1)
+if not parent:
+    parent = "."
+try:
+    dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(1)
+os.chdir(parent)
+mode = None
+identity = None
+dir_mode = None
+frozen = False
+chmodded = False
+done = False
+try:
+    dirst = os.fstat(dirfd)
+    dir_mode = stat.S_IMODE(dirst.st_mode)
+    try:
+        handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except FileNotFoundError:
+        sys.stdout.write("absent\nabsent\n")
+        raise SystemExit(0)
+    try:
+        opened = os.fstat(handle)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SystemExit(1)
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise SystemExit(1)
+        mode = stat.S_IMODE(opened.st_mode)
+        identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        if len(expected) != 5 or tuple(int(v) for v in expected[:4]) != identity[:4]:
+            raise SystemExit(1)
+        current = b""
+        while len(current) <= len(data):
+            chunk = os.read(handle, 65536)
+            if not chunk:
+                break
+            current += chunk
+        if current != data:
+            raise SystemExit(1)
+        again = os.fstat(handle)
+        if (again.st_dev, again.st_ino, again.st_size, again.st_mtime_ns, again.st_ctime_ns) != identity:
+            raise SystemExit(1)
+        sys.stdout.write("%o\n%d %d %d %d %d\n" % (mode, opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns))
+        sys.stdout.flush()
+        os.fchmod(handle, mode & ~0o222)
+        chmodded = True
+        final = os.fstat(handle)
+    finally:
+        os.close(handle)
+    if freeze_parent:
+        os.fchmod(dirfd, dir_mode & ~0o222)
+        frozen = True
+    sys.stdout.write("%d %d %d %d %d\n" % (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns))
+    sys.stdout.write("%o %o %d %d %d\n" % (dir_mode, dir_mode & ~0o222, dirst.st_dev, dirst.st_ino, 1 if frozen else 0))
+    done = True
+    raise SystemExit(0)
+except SystemExit as ex:
+    if ex.code and chmodded:
+        try:
+            restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            try:
+                restored = os.fstat(restorer)
+                if (restored.st_dev, restored.st_ino) == identity[:2]:
+                    os.fchmod(restorer, mode)
+            finally:
+                os.close(restorer)
+        except OSError:
+            pass
+    raise
+except BaseException:
+    if chmodded:
+        try:
+            restorer = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            try:
+                restored = os.fstat(restorer)
+                if (restored.st_dev, restored.st_ino) == identity[:2]:
+                    os.fchmod(restorer, mode)
+            finally:
+                os.close(restorer)
+        except OSError:
+            pass
+    raise SystemExit(1)
+finally:
+    if frozen and not done:
+        try:
+            os.fchmod(dirfd, dir_mode)
+        except OSError:
+            pass
+    os.close(dirfd)
+' "$declared_path" "$declared_freeze" "$declared_recorded_id" 2>/dev/null)
+        declared_rc=$?
+        declared_mode=$(printf '%s\n' "$declared_pin" | sed -n 1p)
+        declared_id=$(printf '%s\n' "$declared_pin" | sed -n 2p)
+        declared_stat=$(printf '%s\n' "$declared_pin" | sed -n 3p)
+        declared_dir=$(printf '%s\n' "$declared_pin" | sed -n 4p)
+        case $declared_mode in
+            '' | *[!0-7]*)
+                declared_mode=
+                if [ "$declared_rc" -lt 128 ] 2>/dev/null; then
+                    declared_mode=none
+                fi
+                ;;
+        esac
+        PIN_MODES="${PIN_MODES}${declared_mode}
+"
+        [ "$declared_rc" -eq 0 ] || return 1
+        case $declared_mode in
+            '' | none | *[!0-7]*) return 1 ;;
+        esac
+        [ "$declared_mode" = "$declared_pre_mode" ] || return 1
+        [ "$declared_id" = "$declared_pre_id" ] || return 1
+        case $declared_stat in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        case $declared_dir in
+            '' | *[!0-9\ ]*) return 1 ;;
+        esac
+        PIN_STATS="${PIN_STATS}${declared_stat}
+"
+        PIN_DIRS="${PIN_DIRS}${declared_dir}
+"
+        declared_index=$((declared_index + 1))
+    done
+    return 0
+}
+
+unpin_declared_configs() {
+    unseal_agent_home
+    [ -n "${PIN_MODES-}${PIN_MODES_PRE-}" ] || return 0
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 0
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 0
+        declared_mode=$(printf '%s\n' "$PIN_MODES" | sed -n "$((declared_index + 1))p")
+        declared_mode_pre=$(printf '%s\n' "$PIN_MODES_PRE" | sed -n "$((declared_index + 1))p")
+        case $declared_mode in
+            none)
+                declared_mode=
+                declared_mode_pre=
+                ;;
+            absent | '' | *[!0-7]*) declared_mode= ;;
+        esac
+        case $declared_mode_pre in
+            absent | '' | *[!0-7]*) declared_mode_pre= ;;
+        esac
+        if [ -n "$declared_mode" ] || [ -n "$declared_mode_pre" ]; then
+            declared_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((declared_index + 1))p")
+            declared_ident=$(printf '%s\n' "$PIN_IDS" | sed -n "$((declared_index + 1))p")
+            declared_dir=$(printf '%s\n' "$PIN_DIRS" | sed -n "$((declared_index + 1))p")
+            declared_dir_pre=$(printf '%s\n' "$PIN_DIRS_PRE" | sed -n "$((declared_index + 1))p")
+            python3 -I -c 'import os, stat, sys
+def parse_mode(text):
+    if not text or any(ch not in "01234567" for ch in text):
+        return None
+    return int(text, 8)
+
+
+path = sys.argv[1]
+mode = parse_mode(sys.argv[2])
+mode_pre = parse_mode(sys.argv[3])
+if mode is None:
+    mode = mode_pre
+if mode is None:
+    raise SystemExit(0)
+pinned = mode & ~0o222
+fields = sys.argv[4].split()
+if len(fields) < 2:
+    fields = sys.argv[5].split()
+if len(fields) < 2:
+    raise SystemExit(0)
+try:
+    want_dev = int(fields[0])
+    want_ino = int(fields[1])
+except ValueError:
+    raise SystemExit(0)
+confirmed = sys.argv[6].split()
+pre = sys.argv[7].split()
+dirfields = confirmed if len(confirmed) >= 5 else pre
+parent, name = os.path.split(path)
+if not name:
+    raise SystemExit(0)
+if not parent:
+    parent = "."
+try:
+    dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+except OSError:
+    raise SystemExit(0)
+try:
+    try:
+        dirst = os.fstat(dirfd)
+        if len(dirfields) >= 5 and dirfields[4] == "1":
+            if (dirst.st_dev, dirst.st_ino) == (int(dirfields[2]), int(dirfields[3])):
+                if len(confirmed) >= 5 or stat.S_IMODE(dirst.st_mode) == int(dirfields[1], 8):
+                    os.fchmod(dirfd, int(dirfields[0], 8))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        named = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except OSError:
+        named = None
+    if named is not None and stat.S_ISREG(named.st_mode):
+        try:
+            handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except OSError:
+            handle = None
+        if handle is not None:
+            try:
+                opened = os.fstat(handle)
+                if (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino) and (opened.st_dev, opened.st_ino) == (want_dev, want_ino):
+                    if stat.S_IMODE(opened.st_mode) == pinned:
+                        os.fchmod(handle, mode)
+            finally:
+                os.close(handle)
+finally:
+    os.close(dirfd)
+' "$declared_path" "$declared_mode" "$declared_mode_pre" "$declared_pinned" "$declared_ident" "$declared_dir" "$declared_dir_pre" 2>/dev/null || true
+        fi
+        declared_index=$((declared_index + 1))
+    done
+    PIN_MODES=
+    PIN_MODES_PRE=
+    PIN_IDS=
+    PIN_STATS=
+    PIN_DIRS=
+    PIN_DIRS_PRE=
+    return 0
+}
+
+declared_configs_match_snapshot() {
+    declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    declared_index=0
+    while [ "$declared_index" -lt "$declared_count" ]; do
+        declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$declared_index" '.behavior.credential.config_files[$i].path') || return 1
+        case $declared_index in
+            0) _jks_vcfg_sel=${_jks_vcfg_0-} ;;
+            1) _jks_vcfg_sel=${_jks_vcfg_1-} ;;
+            *) return 1 ;;
+        esac
+        [ -n "$_jks_vcfg_sel" ] || return 1
+        printf '%s' "$_jks_vcfg_sel" | python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+expected = sys.stdin.buffer.read()
+try:
+    handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+except OSError:
+    raise SystemExit(1)
+try:
+    opened = os.fstat(handle)
+    if not stat.S_ISREG(opened.st_mode):
+        raise SystemExit(1)
+    named = os.lstat(path)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise SystemExit(1)
+    data = b""
+    while len(data) <= len(expected):
+        chunk = os.read(handle, 65536)
+        if not chunk:
+            break
+        data += chunk
+finally:
+    os.close(handle)
+if data != expected:
+    raise SystemExit(1)
+' "$declared_path" 2>/dev/null || return 1
+        declared_index=$((declared_index + 1))
+    done
+    return 0
+}
+
+declared_configs_stat_unchanged() {
+    stat_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+    stat_index=0
+    while [ "$stat_index" -lt "$stat_count" ]; do
+        stat_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$stat_index" '.behavior.credential.config_files[$i].path') || return 1
+        [ -n "$stat_path" ] || return 1
+        stat_pinned=$(printf '%s\n' "$PIN_STATS" | sed -n "$((stat_index + 1))p")
+        [ -n "$stat_pinned" ] || return 1
+        if [ "$stat_pinned" = absent ]; then
+            if [ -e "$stat_path" ] || [ -L "$stat_path" ]; then
+                return 1
+            fi
+            stat_index=$((stat_index + 1))
+            continue
+        fi
+        stat_now=$(python3 -I -c 'import os, stat, sys
+handle = os.lstat(sys.argv[1])
+if not stat.S_ISREG(handle.st_mode):
+    raise SystemExit(1)
+sys.stdout.write("%d %d %d %d %d" % (handle.st_dev, handle.st_ino, handle.st_size, handle.st_mtime_ns, handle.st_ctime_ns))
+' "$stat_path" 2>/dev/null) || return 1
+        [ "$stat_now" = "$stat_pinned" ] || return 1
+        stat_index=$((stat_index + 1))
+    done
+    return 0
 }
 
 provider_endpoint() {
     endpoint_file=$1
     endpoint_provider=$2
-    [ -f "$endpoint_file" ] || return 0
+    [ "$endpoint_file" = - ] || [ -f "$endpoint_file" ] || return 0
     case $endpoint_provider in
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
-    endpoint_value=$(jq -Rrn --arg want "$endpoint_provider" '
-        [inputs] as $lines
-        | [$lines | to_entries[] | select(.value | test("^[[:space:]]*\\[model_providers\\." + $want + "\\][[:space:]]*$")) | .key] as $tables
-        | if ($tables | length) == 0 then ""
-        elif ($tables | length) > 1 then "conflict"
-        else
-            [$lines[$tables[0] + 1:][] | select(test("^[[:space:]]*\\[") | not)] as $body
-            | [$body[] | select(test("^[[:space:]]*base_url[[:space:]]*="))] as $setters
-            | [$body[] | try (capture("^[[:space:]]*base_url[[:space:]]*=[[:space:]]*\"(?<u>[^\"]*)\"[[:space:]]*$").u)] as $urls
-            | if ($urls | length) > 1 or ($setters | length) != ($urls | length) then "conflict"
-            elif ($urls | length) == 0 then ""
-            else $urls[0] end
-        end' "$endpoint_file" 2>/dev/null) || return 1
+    endpoint_value=$(python3 -I -c 'import sys, tomllib
+want = sys.argv[2]
+try:
+    if sys.argv[1] == "-":
+        data = sys.stdin.buffer.read()
+    else:
+        with open(sys.argv[1], "rb") as handle:
+            data = handle.read()
+    doc = tomllib.loads(data.decode("utf-8-sig"))
+except Exception:
+    raise SystemExit(1)
+providers = doc.get("model_providers")
+if providers is None:
+    entry = None
+elif not isinstance(providers, dict):
+    sys.stdout.write("conflict")
+    raise SystemExit(0)
+else:
+    entry = providers.get(want)
+if entry is None:
+    sys.stdout.write("")
+elif not isinstance(entry, dict):
+    sys.stdout.write("conflict")
+elif "base_url" not in entry:
+    sys.stdout.write("")
+elif not isinstance(entry["base_url"], str):
+    sys.stdout.write("conflict")
+else:
+    sys.stdout.write(entry["base_url"])
+' "$endpoint_file" "$endpoint_provider" 2>/dev/null) || return 1
     [ "$endpoint_value" = conflict ] && return 1
     printf '%s' "$endpoint_value"
 }
@@ -920,8 +2295,8 @@ stage_provider_config() {
     case $EXPECTED_PROVIDER in
         '' | *[!A-Za-z0-9_-]*) return 1 ;;
     esac
-    jq -r --arg path "${AUTH_FILE%/*}/config.toml" --arg provider "$EXPECTED_PROVIDER" \
-        --arg model "$EXPECTED_MODEL" --arg endpoint "$PROVIDER_URL" '
+    printf '%s\n' "$SPEC_JSON" | jq -r --arg path "${AUTH_FILE%/*}/config.toml" --arg provider "$EXPECTED_PROVIDER" \
+        --rawfile model /dev/fd/3 --arg endpoint "$PROVIDER_URL" '
         [.behavior.credential.config_files // [] | .[] | select(.path == $path) | (.required_text // [])[]] as $lines
         | ([$lines[] | select(test("^model_provider[[:space:]]*=")) | capture("^model_provider[[:space:]]*=[[:space:]]*\"(?<v>[^\"]*)\"[[:space:]]*$").v]) as $wired
         | if any($lines[]; test("^[[:space:]]*\\[") or test("[[:cntrl:]]")) then empty
@@ -929,15 +2304,116 @@ stage_provider_config() {
         else
             ([$lines[] | select(test("^(model|model_provider)[[:space:]]*="))]) as $top
             | ([$lines[] | select(test("^(model|model_provider)[[:space:]]*=") | not)]) as $table
-            | (if ($top | length) == 0 then ["model = " + ($model | tojson), "model_provider = " + ($provider | tojson)] else $top end) as $top
+            | (if ($top | length) == 0 then ["model = " + (($model | rtrimstr("\n")) | tojson), "model_provider = " + ($provider | tojson)] else $top end) as $top
             | (if ($table | length) == 0 then ["name = " + ($provider | tojson), "base_url = " + ($endpoint | tojson)] else $table end) as $table
             | $top[], "", "[model_providers." + $provider + "]", $table[]
-        end' "$spec" >"$stage_target" 2>/dev/null || return 1
+        end' >"$stage_target" 2>/dev/null 3<<EOF_JKS_EXPECTED_MODEL || return 1
+$EXPECTED_MODEL
+EOF_JKS_EXPECTED_MODEL
     [ -s "$stage_target" ] || return 1
+}
+
+unseal_agent_home() {
+    _jks_home_root=$work/agent-home
+    [ -e "$_jks_home_root" ] || return 0
+    python3 -I -c 'import os, stat, sys
+root = sys.argv[1]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+depth_limit = 32
+entry_limit = 4096
+total_limit = 65536
+visit_limit = 4096
+visited = 0
+scanned = 0
+
+
+def unseal(fd):
+    try:
+        current = os.fstat(fd)
+        mode = stat.S_IMODE(current.st_mode)
+        os.fchmod(fd, mode | 0o700)
+    except OSError:
+        pass
+
+
+def unseal_named(fd, name):
+    try:
+        named = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(named.st_mode):
+        return None
+    try:
+        os.chmod(name, stat.S_IMODE(named.st_mode) | 0o700, dir_fd=fd, follow_symlinks=False)
+    except OSError:
+        return None
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+    except OSError:
+        return None
+
+
+def descend(fd, depth):
+    global visited, scanned
+    if depth > depth_limit or visited >= visit_limit or scanned >= total_limit:
+        return
+    try:
+        scan = os.dup(fd)
+    except OSError:
+        return
+    try:
+        try:
+            entries = os.scandir(scan)
+        except OSError:
+            return
+        with entries:
+            seen = 0
+            for entry in entries:
+                seen += 1
+                scanned += 1
+                if seen > entry_limit or scanned > total_limit or visited >= visit_limit:
+                    break
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                try:
+                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=fd)
+                except OSError:
+                    child = unseal_named(fd, entry.name)
+                if child is None:
+                    continue
+                try:
+                    visited += 1
+                    unseal(child)
+                    descend(child, depth + 1)
+                finally:
+                    os.close(child)
+    finally:
+        try:
+            os.close(scan)
+        except OSError:
+            pass
+
+
+try:
+    rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
+except OSError:
+    raise SystemExit(0)
+try:
+    visited += 1
+    unseal(rootfd)
+    descend(rootfd, 1)
+finally:
+    os.close(rootfd)
+' "$_jks_home_root" 2>/dev/null || :
+    return 0
 }
 
 stage_agent_home() {
     stage_dir=$work/agent-home
+    unseal_agent_home
     rm -rf "$stage_dir" 2>/dev/null || return 1
     mkdir -p "$stage_dir" 2>/dev/null || return 1
     if [ -e "$AUTH_FILE" ] || [ -L "$AUTH_FILE" ]; then
@@ -949,11 +2425,109 @@ stage_agent_home() {
         copy_bounded "$AUTH_FILE" "$stage_dir/$stage_name" || return 1
     fi
     stage_provider_config "$stage_dir/config.toml" || return 1
+    stage_config_paths=
+    stage_config_stats=
+    if [ -f "$stage_dir/config.toml" ]; then
+        stage_config_paths="$stage_dir/config.toml
+"
+    else
+        stage_declared_count=$(printf '%s\n' "$SPEC_JSON" | jq -r '.behavior.credential.config_files // [] | length') || return 1
+        stage_declared_index=0
+        while [ "$stage_declared_index" -lt "$stage_declared_count" ]; do
+            stage_declared_path=$(printf '%s\n' "$SPEC_JSON" | jq -r --argjson i "$stage_declared_index" '.behavior.credential.config_files[$i].path') || return 1
+            case $stage_declared_index in
+                0) stage_snapshot=${_jks_vcfg_0-} ;;
+                1) stage_snapshot=${_jks_vcfg_1-} ;;
+                *) return 1 ;;
+            esac
+            [ -n "$stage_snapshot" ] || return 1
+            stage_rel=${stage_declared_path#"$SCAN_ROOT"/}
+            [ -n "$stage_rel" ] && [ "$stage_rel" != "$stage_declared_path" ] || return 1
+            stage_parent=${stage_rel%/*}
+            [ -n "$stage_parent" ] && [ "$stage_parent" != "$stage_rel" ] || return 1
+            mkdir -p "$stage_dir/$stage_parent" 2>/dev/null || return 1
+            printf '%s' "$stage_snapshot" >"$stage_dir/$stage_rel" 2>/dev/null || return 1
+            stage_config_paths="${stage_config_paths}$stage_dir/$stage_rel
+"
+            stage_declared_index=$((stage_declared_index + 1))
+        done
+    fi
+    while IFS= read -r stage_config_path; do
+        [ -n "$stage_config_path" ] || continue
+        chmod 0444 "$stage_config_path" 2>/dev/null || return 1
+        stage_config_stat=$(python3 -I -c 'import os, sys; s = os.stat(sys.argv[1]); sys.stdout.write("%d %d %d %d %d" % (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns))' "$stage_config_path" 2>/dev/null) || return 1
+        stage_config_stats="${stage_config_stats}${stage_config_stat}
+"
+    done <<EOF_JKS_STAGE_CONFIGS
+$stage_config_paths
+EOF_JKS_STAGE_CONFIGS
+    python3 -I -c 'import os, stat, sys
+root = sys.argv[1]
+for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+    handle = os.open(dirpath, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        current = os.fstat(handle)
+        os.fchmod(handle, stat.S_IMODE(current.st_mode) & ~0o222)
+    finally:
+        os.close(handle)
+' "$stage_dir" 2>/dev/null || return 1
     return 0
 }
 
+agent_exec_seal() {
+    [ -n "$RUN_KEY" ] || return 1
+    _jks_agent_exec_seal=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
+    _jks_agent_exec_seal=${_jks_agent_exec_seal%% *}
+    printf '%s\n' "$_jks_agent_exec_seal" | python3 -I -c 'import os, stat, sys
+path = sys.argv[1]
+try:
+    os.unlink(path)
+except FileNotFoundError:
+    pass
+except OSError:
+    raise SystemExit(1)
+try:
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600)
+except OSError:
+    raise SystemExit(1)
+try:
+    if not stat.S_ISREG(os.fstat(handle).st_mode):
+        raise SystemExit(1)
+    data = sys.stdin.buffer.read()
+    view = memoryview(data)
+    while view:
+        view = view[os.write(handle, view):]
+except OSError:
+    raise SystemExit(1)
+finally:
+    os.close(handle)
+' "$work/agent_exec.seal" 2>/dev/null || {
+        echo "$PROBE: the evidence seal could not be written through a no-follow descriptor; refusing to attest" >&2
+        return 1
+    }
+    return 0
+}
+
+agent_exec_verified() {
+    [ -f "$work/agent_exec.json" ] && [ -f "$work/agent_exec.seal" ] || return 1
+    [ -n "$RUN_KEY" ] || return 1
+    capture_bounded "$work/agent_exec.json" "$CONFIG_BYTE_CAP" "$((CONFIG_BYTE_CAP + 1))" || return 1
+    _jks_agent_exec_doc=$(printf '%s' "$_jks_capture")
+    capture_bounded "$work/agent_exec.seal" 256 257 || return 1
+    _jks_agent_exec_want=$(printf '%s' "$_jks_capture")
+    _jks_agent_exec_got=$(printf '%s%s\n' "$RUN_KEY" "$_jks_agent_exec_doc" | sha256sum 2>/dev/null) || return 1
+    _jks_agent_exec_got=${_jks_agent_exec_got%% *}
+    [ "$_jks_agent_exec_got" = "$_jks_agent_exec_want" ]
+}
+
 ensure_agent_exec() {
-    [ -f "$work/agent_exec.json" ] && return 0
+    if [ -f "$work/agent_exec.json" ]; then
+        if [ "${pin_state-}" != pinned ] && [ "${prompt_configs_validated-}" = true ]; then
+            agent_exec_reuse_refused=1
+            return 1
+        fi
+        return 0
+    fi
     launch_kind=none
     why="the sandbox holds no credential"
     if stage_agent_home; then
@@ -1064,14 +2638,20 @@ EOF
     elif [ -f "$cred_path" ] && jq -e --arg re "$PLACEHOLDER_RE" '.OPENAI_API_KEY | type == "string" and test($re + "\\z")' "$cred_path" >/dev/null 2>&1; then
         launch_kind=api_key
     fi
+    if [ "${prompt_configs_validated-}" != true ] || [ "${prompt_configs_pinned-}" != true ] || [ "${declared_effective-}" != "$PROVIDER_URL" ] || ! declared_configs_stat_unchanged; then
+        config_gate_refused=1
+        launch_kind=none
+        why="codex exec was not run: the declared configuration was not validated and pinned"
+    fi
     if [ "$launch_kind" != none ] && ! (sanitize_launch_environment); then
         launch_kind=none
         why="codex exec was not run: the probe could not build a sanitized environment for the launch"
     fi
-    if [ "$launch_kind" = none ]; then
+    if [ "$launch_kind" = none ] && [ "${prompt_configs_pinned-}" != true ]; then
+        unseal_agent_home
         rm -rf "$work/agent-home" 2>/dev/null
     fi
-    printf '%s' "$why" >"$work/agent_exec.why"
+    printf '%s' "$why" | write_nofollow "$work/agent_exec.why" truncate
     unset _jks_stdout_capture _jks_stdout_capture_status _jks_stdout_encoded _jks_stdout_producer_status
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
@@ -1095,7 +2675,7 @@ EOF
             exec 3>&1 || exit 1
             (
                 _jks_stdout_producer_status=0
-                if (cd "$SCAN_ROOT" && sanitize_launch_environment && CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
+                if (cd "$SCAN_ROOT" && sanitize_launch_environment && HOME="$work/agent-home" CODEX_HOME="$work/agent-home" timeout --kill-after=5 240 "$@" 3>&- 2>/dev/null </dev/null); then
                     :
                 else
                     _jks_stdout_producer_status=$?
@@ -1337,13 +2917,22 @@ EOF
     unset _jks_stdout_od_status _jks_stdout_drain_status _jks_stdout_encoded_bytes _jks_stdout_count_status
     unset _jks_stdout_parsed _jks_stdout_parse_status _jks_stdout_parsed_exit _jks_stdout_parsed_bytes
     unset _jks_stdout_parsed_answer _jks_stdout_extra
+    if [ "${prompt_configs_pinned-}" = true ] && ! declared_configs_stat_unchanged; then
+        config_gate_refused=1
+    fi
     evidence=$(agent_tool_evidence) || evidence='{"actual_provider":"","actual_model":"","actual_endpoint":"","sandbox_endpoint":"","tool":{"kind":"","attempted":false,"succeeded":false,"exit_code":null,"workdir":"","observation":[]}}'
-    jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
+    if [ -f "$work/config-gate.refused" ]; then
+        config_gate_refused=1
+    fi
+    _jks_agent_exec_doc=$(jq -n --arg credential "$launch_kind" --argjson attempted "$attempted" --arg exit_code "$exit_code" \
         --argjson answered "$answered" --argjson bytes "$bytes" --argjson evidence "$evidence" \
+        --argjson config_refused "$((${config_gate_refused:-0} + 0))" \
         "$JQN"'{attempted: $attempted, credential: $credential, exit_code: ($exit_code | n | if . == null then null else tonumber end),
-          answered: $answered, output_bytes: $bytes,
+          answered: $answered, output_bytes: $bytes, config_refused: $config_refused,
           actual_provider: $evidence.actual_provider, actual_model: $evidence.actual_model,
-          actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}' >"$work/agent_exec.json"
+          actual_endpoint: $evidence.actual_endpoint, sandbox_endpoint: $evidence.sandbox_endpoint, tool: $evidence.tool}') || exit 70
+    printf '%s\n' "$_jks_agent_exec_doc" | write_nofollow "$work/agent_exec.json" truncate || exit 70
+    agent_exec_seal || exit 70
 }
 
 egress() {
@@ -1423,7 +3012,7 @@ token_kinds() {
 }
 
 auth_file_fields() {
-    jq -cn --slurpfile parsed "$1" --slurpfile selected "$spec" --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
+    printf '%s\n' "$SPEC_JSON" | jq -cn --slurpfile parsed "$1" --slurpfile selected /dev/stdin --arg re "$PLACEHOLDER_RE" --arg id_token "$PLACEHOLDER_ID_TOKEN" '
         def pointer($name): $name | split("/") | map(select(length > 0));
         def kind($value; $jwt):
             if $value == null then "absent"
@@ -2333,37 +3922,75 @@ step_J07() (
     if [ -n "$launcher_pid" ] && [ -n "$launcher_interp" ]; then
         launcher_identity=$(proc_launcher_identity_record "$launcher_pid" "$launcher_interp" "$launcher_interp_arg" "$launcher_stat_pre" "$launcher_exe_pre" "$launcher_uid_pre" "$launcher_comm_pre") || launcher_identity=null
     fi
-    attempted=$(jq -r '.attempted' "$work/agent_exec.json")
-    codex_target=false
-    [ "$EXPECTED_AGENT" = codex ] && codex_target=true
-    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --argjson codex "$codex_target" '
-        .answered == true and .actual_provider == $provider and .actual_model == $model and
-        ($codex == false or (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint)))) and
-        .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
-        .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
-    endpoint_mismatch=false
-    if [ "$codex_target" = true ]; then
-        endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
-            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
-             (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
+    if [ "${agent_exec_reuse_refused-}" = 1 ]; then
+        fail agent_exec "the agent exec evidence is not bound to a successful configuration pin"
+        _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0], agent_exec: null}')
+        seal_facts "$_jks_facts_doc"
+        return 0
     fi
+    if ! agent_exec_verified; then
+        fail agent_exec "the agent exec evidence is not authentic"
+        _jks_facts_doc=$(jq -n --slurpfile p "$work/processes.json" '{processes: $p[0], agent_exec: null}')
+        seal_facts "$_jks_facts_doc"
+        return 0
+    fi
+    attempted=$(
+        jq -r '.attempted' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
+    ae_answered=$(
+        jq -r '.answered' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
+    ae_exit=$(
+        jq -r '.exit_code' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
+    complete=$(
+        printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+            --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
+        .answered == true and .actual_provider == $provider and .actual_model == ($model | rtrimstr("\n")) and
+        (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
+        .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
+        .tool.exit_code == 0 and .tool.workdir == $workdir and
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' /dev/fd/4 3<<EOF_JKS_EXPECTED_MODEL 4<<EOF_JKS_AGENT_EXEC
+$EXPECTED_MODEL
+EOF_JKS_EXPECTED_MODEL
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
+    endpoint_mismatch=$(
+        jq -r --arg endpoint "$PROVIDER_URL" \
+            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
     if [ "$attempted" = true ]; then
         if [ "$complete" = true ]; then
             pass agent_exec "codex exec answered the fixed prompt and completed the declared tool"
-        elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
-            fail agent_exec "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
+        elif [ "$ae_answered" != true ]; then
+            fail agent_exec "codex exec exit $ae_exit gave no answer"
         elif [ "$endpoint_mismatch" = true ]; then
             fail agent_exec "the provider endpoint is not the contract endpoint $PROVIDER_URL"
         else
-            fail agent_exec "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
+            fail agent_exec "agent exec or tool evidence is incomplete (exit $ae_exit)"
         fi
+    elif [ "${config_gate_refused-}" = 1 ]; then
+        fail agent_exec "the provider endpoint is not the contract endpoint $PROVIDER_URL; the launches were refused because the declared configuration was not validated and pinned"
     else
         skip agent_exec "$(cat "$work/agent_exec.why")"
     fi
-    _jks_facts_doc=$(jq -n --argjson launcher "$launcher_identity" \
-        --slurpfile p "$work/processes.json" --slurpfile x "$work/agent_exec.json" \
-        '{processes: $p[0], agent_exec: $x[0], launcher_identity: $launcher}')
+    _jks_facts_doc=$(
+        jq -n --argjson launcher "$launcher_identity" \
+            --slurpfile p "$work/processes.json" --slurpfile x /dev/fd/4 \
+            '{processes: $p[0], agent_exec: $x[0], launcher_identity: $launcher}' 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+    )
     seal_facts "$_jks_facts_doc"
 )
 
@@ -2694,7 +4321,10 @@ EOF
             auth_state=malformed
             auth_problem=1
         else
-            fields=$(auth_file_fields "$auth") || fields='[]'
+            fields=$(auth_file_fields "$auth") || {
+                fields='[]'
+                auth_problem=1
+            }
         fi
         auth_file=$(jq -n --arg state "$auth_state" --arg path "$auth" --arg mode "$mode" --argjson fields "$fields" \
             '{state: $state, path: $path, mode: $mode, fields: $fields}')
@@ -2835,32 +4465,69 @@ step_J09() (
             provider=$(printf '%s' "$provider" | jq -c '.body = "other"')
         fi
     fi
-    codex_target=false
-    [ "$EXPECTED_AGENT" = codex ] && codex_target=true
-    complete=$(jq -r --arg provider "$EXPECTED_PROVIDER" --arg model "$EXPECTED_MODEL" --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
-        --arg endpoint "$PROVIDER_URL" --argjson codex "$codex_target" '
-        .answered == true and .actual_provider == $provider and .actual_model == $model and
-        ($codex == false or (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint)))) and
+    if [ "${agent_exec_reuse_refused-}" = 1 ]; then
+        _jks_ae_facts_doc=null
+        fail agent_reaches_api "the agent exec evidence is not bound to a successful configuration pin"
+    elif agent_exec_verified; then
+        _jks_ae_facts_doc=$_jks_agent_exec_doc
+        attempted=$(
+            jq -r '.attempted' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        ae_answered=$(
+            jq -r '.answered' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        ae_exit=$(
+            jq -r '.exit_code' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        complete=$(
+            printf '%s\n' "$TOOL_OBSERVATION_EXPECTED" | jq -r --arg provider "$EXPECTED_PROVIDER" --rawfile model /dev/fd/3 --arg kind "$TOOL_KIND" --arg workdir "$TOOL_WORKDIR" \
+                --arg endpoint "$PROVIDER_URL" --slurpfile expected /dev/stdin '
+        .answered == true and .actual_provider == $provider and .actual_model == ($model | rtrimstr("\n")) and
+        (.actual_endpoint == $endpoint and (.sandbox_endpoint | IN("", $endpoint))) and
         .tool.kind == $kind and .tool.attempted == true and .tool.succeeded == true and
-        .tool.exit_code == 0 and .tool.workdir == $workdir and (.tool.observation | length > 0)' "$work/agent_exec.json")
-    endpoint_mismatch=false
-    if [ "$codex_target" = true ]; then
-        endpoint_mismatch=$(jq -r --arg endpoint "$PROVIDER_URL" \
-            '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
-             (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' "$work/agent_exec.json")
-    fi
-    if [ "$(jq -r '.attempted' "$work/agent_exec.json")" = true ]; then
-        if [ "$complete" = true ]; then
-            pass agent_reaches_api "codex exec answered and completed the declared tool"
-        elif [ "$(jq -r '.answered' "$work/agent_exec.json")" != true ]; then
-            fail agent_reaches_api "codex exec exit $(jq -r '.exit_code' "$work/agent_exec.json") gave no answer"
-        elif [ "$endpoint_mismatch" = true ]; then
-            fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL"
+        .tool.exit_code == 0 and .tool.workdir == $workdir and
+        ([.tool.observation[]] as $obs | $expected[0] | all(. as $entry | $obs | index($entry) != null))' /dev/fd/4 3<<EOF_JKS_EXPECTED_MODEL 4<<EOF_JKS_AGENT_EXEC
+$EXPECTED_MODEL
+EOF_JKS_EXPECTED_MODEL
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        endpoint_mismatch=$(
+            jq -r --arg endpoint "$PROVIDER_URL" \
+                '.actual_endpoint != $endpoint or .sandbox_endpoint == null or
+         (.sandbox_endpoint != "" and .sandbox_endpoint != $endpoint)' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        ae_refused=$(
+            jq -r '.config_refused // 0' /dev/fd/4 4<<EOF_JKS_AGENT_EXEC
+$_jks_agent_exec_doc
+EOF_JKS_AGENT_EXEC
+        )
+        if [ "$attempted" = true ]; then
+            if [ "$complete" = true ]; then
+                pass agent_reaches_api "codex exec answered and completed the declared tool"
+            elif [ "$ae_answered" != true ]; then
+                fail agent_reaches_api "codex exec exit $ae_exit gave no answer"
+            elif [ "$endpoint_mismatch" = true ]; then
+                fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL"
+            else
+                fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $ae_exit)"
+            fi
+        elif [ "${config_gate_refused-}" = 1 ] || [ "$ae_refused" = 1 ]; then
+            fail agent_reaches_api "the provider endpoint is not the contract endpoint $PROVIDER_URL; the launches were refused because the declared configuration was not validated and pinned"
         else
-            fail agent_reaches_api "agent exec or tool evidence is incomplete (exit $(jq -r '.exit_code' "$work/agent_exec.json"))"
+            skip agent_reaches_api "$(cat "$work/agent_exec.why")"
         fi
     else
-        skip agent_reaches_api "$(cat "$work/agent_exec.why")"
+        _jks_ae_facts_doc=null
+        fail agent_reaches_api "the agent exec evidence is not authentic"
     fi
     if [ -n "$proxies" ]; then
         fail outside_host_denied "proxy variables are set: $proxies"
@@ -2888,8 +4555,12 @@ step_J09() (
         fi
     fi
     rm -f "$work/provider.body"
-    _jks_facts_doc=$(jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x "$work/agent_exec.json" \
-        '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}')
+    _jks_facts_doc=$(
+        jq -n --argjson outside "$outside" --argjson metadata "$metadata" --argjson provider "$provider" --slurpfile x /dev/fd/4 \
+            '{outside_host: $outside, metadata_host: $metadata, provider_host: $provider, agent_exec: $x[0]}' 4<<EOF_JKS_AGENT_EXEC
+$_jks_ae_facts_doc
+EOF_JKS_AGENT_EXEC
+    )
     seal_facts "$_jks_facts_doc"
 )
 
@@ -3639,11 +5310,61 @@ main() {
         echo "$PROBE: jq is required" >&2
         exit 69
     }
+    command -v python3 >/dev/null 2>&1 || {
+        echo "$PROBE: python3 is required" >&2
+        exit 69
+    }
+    python3 -I -c 'import tomllib' >/dev/null 2>&1 || {
+        echo "$PROBE: python3 with the tomllib module is required" >&2
+        exit 69
+    }
     if [ -z "$spec" ] || [ ! -f "$spec" ] || [ -L "$spec" ]; then
         echo "$PROBE: --spec must name a regular private probe specification" >&2
         exit 65
     fi
-    if ! jq -e '
+    work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
+    spec_dir=$(mktemp -d /tmp/jackin-sentinel-probe-spec.XXXXXX) || exit 70
+    chmod 700 "$spec_dir" 2>/dev/null || :
+    trap 'unpin_declared_configs; rm -rf "$work" "$spec_dir"' EXIT
+    trap 'exit 70' INT TERM HUP
+    RUN_KEY=
+    run_entropy_wire=$(read_entropy 2>/dev/null) || run_entropy_wire=
+    if [ -n "$run_entropy_wire" ]; then
+        RUN_KEY=$(printf '%s' "$run_entropy_wire" | entropy_decode | sha256sum 2>/dev/null)
+        RUN_KEY=${RUN_KEY%% *}
+    fi
+    case $RUN_KEY in
+        '' | *[!0-9a-f]*) RUN_KEY= ;;
+    esac
+    [ "${#RUN_KEY}" -eq 64 ] || RUN_KEY=
+    [ "$RUN_KEY" != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ] || RUN_KEY=
+    RUN_SEED=
+    if [ -n "$RUN_KEY" ]; then
+        RUN_SEED=$(printf '%s' "$RUN_KEY" | sha256sum 2>/dev/null)
+        RUN_SEED=${RUN_SEED%% *}
+        case $RUN_SEED in
+            '' | *[!0-9a-f]*) RUN_KEY= ;;
+        esac
+        [ "${#RUN_SEED}" -eq 64 ] || RUN_KEY=
+    fi
+    if [ -z "$RUN_KEY" ] && [ "$mode" != host ]; then
+        echo "$PROBE: no key material for the step seals; refusing to run" >&2
+        exit 70
+    fi
+    capture_bounded "$spec" "$SPEC_BYTE_CAP" "$SPEC_BYTE_CAP"
+    _jks_spec_status=$?
+    if [ "$_jks_spec_status" -eq 0 ]; then
+        SPEC_RAW=$_jks_capture
+    else
+        rm -rf "$spec_dir"
+        if [ "$_jks_spec_status" -eq 3 ]; then
+            echo "$PROBE: the private probe specification changed while it was read" >&2
+        else
+            echo "$PROBE: the private probe specification is unreadable or beyond $SPEC_BYTE_CAP bytes" >&2
+        fi
+        exit 65
+    fi
+    if ! printf '%s\n' "$SPEC_RAW" | jq -e --arg scan "$SCAN_ROOT" '
         (.target | type == "object" and (.model | type == "string" and length > 0) and
             (.provider | type == "string" and length > 0) and
             (.adapter | type == "string" and length > 0) and
@@ -3663,6 +5384,10 @@ main() {
         (.behavior.prompt.tool.workdir | type == "string" and length > 0) and
         (.behavior.prompt.tool.observation.directory_contains.entries | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)) and
         (.behavior.credential.classification | type == "string" and (IN("oauth_login", "static_key", "api_key"))) and
+        ((.target.tuple == "T01" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.codex/config.toml"] | sort))) or
+         (.target.tuple == "T09" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.omp/config.toml", $scan + "/.omp/agent/models.yml"] | sort))) or
+         (.target.tuple == "T14" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.claude/settings.json"] | sort))) or
+         (.target.tuple == "T18" and (([.behavior.credential.config_files // [] | .[].path] | sort) == ([$scan + "/.codex/config.toml"] | sort)))) and
         (.behavior.credential.environment | type == "array" and length > 0 and (.[0].name | test("^[A-Za-z_][A-Za-z0-9_]*$"))) and
         ((.behavior.credential.classification == "static_key" and (.credential_sha256 | test("^[0-9a-f]{64}$"))) or
          (.behavior.credential.classification != "static_key")) and
@@ -3671,29 +5396,45 @@ main() {
         (.behavior.credential.auth_file.fields | type == "array") and
         ((.behavior.provider.accepted_status == null and .behavior.provider.accepted_body == null) or
          (.behavior.provider.accepted_status | type == "number") and .behavior.provider.accepted_body.json_error_code.code == "invalid_api_key")
-    ' "$spec" >/dev/null 2>&1; then
+    ' >/dev/null 2>&1; then
         echo "$PROBE: the private probe specification is malformed or unsupported" >&2
         exit 65
     fi
-    AGENT_BIN=$(jq -r '.behavior.version.binary' "$spec") || exit 65
-    EXPECTED_VERSION=$(jq -r '.behavior.version.exact_output' "$spec") || exit 65
-    AGENT_COMM=$(jq -r '.behavior.process.comm' "$spec") || exit 65
-    AUTH_FILE=$(jq -r '.behavior.credential.auth_file.path' "$spec") || exit 65
-    AUTH_REQUIRED=$(jq -r '.behavior.credential.auth_file.required_state' "$spec") || exit 65
-    PROVIDER_URL=$(jq -r '.behavior.provider.probe_url' "$spec") || exit 65
-    PROVIDER_STATUS=$(jq -r '.behavior.provider.accepted_status // 0' "$spec") || exit 65
-    PROMPT_ARGV=$(jq -r '.behavior.prompt.argv[] | @base64' "$spec") || exit 65
-    TOOL_ARGV=$(jq -r '.behavior.prompt.tool.argv[] | @base64' "$spec") || exit 65
-    TOOL_KIND=$(jq -r '.behavior.prompt.tool.kind' "$spec") || exit 65
-    TOOL_WORKDIR=$(jq -r '.behavior.prompt.tool.workdir' "$spec") || exit 65
-    TOOL_OBSERVATION=$(jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64' "$spec") || exit 65
-    CREDENTIAL_CLASS=$(jq -r '.behavior.credential.classification' "$spec") || exit 65
-    CREDENTIAL_ENV=$(jq -r '.behavior.credential.environment[0].name' "$spec") || exit 65
-    CREDENTIAL_FINGERPRINT=$(jq -r '.credential_sha256 // ""' "$spec") || exit 65
-    EXPECTED_PROVIDER=$(jq -r '.target.provider' "$spec") || exit 65
-    EXPECTED_MODEL=$(jq -r '.target.model' "$spec") || exit 65
-    EXPECTED_AGENT=$(jq -r '.target.agent' "$spec") || exit 65
-    ADAPTER=$(jq -r '.target.adapter' "$spec") || exit 65
+    AGENT_BIN=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.version.binary') || exit 65
+    EXPECTED_VERSION=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.version.exact_output') || exit 65
+    AGENT_COMM=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.process.comm') || exit 65
+    AUTH_FILE=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.auth_file.path') || exit 65
+    AUTH_REQUIRED=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.auth_file.required_state') || exit 65
+    PROVIDER_URL=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.provider.probe_url') || exit 65
+    PROVIDER_STATUS=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.provider.accepted_status // 0') || exit 65
+    PROMPT_ARGV=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.argv[] | @base64') || exit 65
+    TOOL_ARGV=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.argv[] | @base64') || exit 65
+    TOOL_KIND=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.kind') || exit 65
+    TOOL_WORKDIR=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.workdir') || exit 65
+    TOOL_OBSERVATION=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.prompt.tool.observation.directory_contains.entries[] | @base64') || exit 65
+    TOOL_OBSERVATION_EXPECTED=$(printf '%s\n' "$SPEC_RAW" | jq -c '[.behavior.prompt.tool.observation.directory_contains.entries[]]') || exit 65
+    CREDENTIAL_CLASS=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.classification') || exit 65
+    CREDENTIAL_ENV=$(printf '%s\n' "$SPEC_RAW" | jq -r '.behavior.credential.environment[0].name') || exit 65
+    CREDENTIAL_FINGERPRINT=$(printf '%s\n' "$SPEC_RAW" | jq -r '.credential_sha256 // ""') || exit 65
+    EXPECTED_PROVIDER=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.provider') || exit 65
+    EXPECTED_MODEL=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.model') || exit 65
+    EXPECTED_AGENT=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.agent') || exit 65
+    ADAPTER=$(printf '%s\n' "$SPEC_RAW" | jq -r '.target.adapter') || exit 65
+    SPEC_TARGET_JSON=$(printf '%s\n' "$SPEC_RAW" | jq -c '.target') || exit 65
+    [ -n "$SPEC_TARGET_JSON" ] || exit 65
+    SPEC_JSON=$(printf '%s\n' "$SPEC_RAW" | jq -c '.' 2>/dev/null) || exit 65
+    [ -n "$SPEC_JSON" ] || exit 65
+    SPEC_RAW=
+    rm -f "$spec_dir/spec.snapshot" "$spec_dir/spec.capped" 2>/dev/null || exit 70
+    spec=
+    prompt_configs_validated=false
+    prompt_configs_pinned=false
+    pin_state=none
+    declared_use_snapshot=
+    if declared_provider_config; then
+        prompt_configs_validated=true
+    fi
+    rm -f "$spec_dir"/config.snapshot "$spec_dir"/config.normalized "$spec_dir"/config.declared "$spec_dir"/config.required "$spec_dir"/config.forbidden "$spec_dir"/config.livecheck 2>/dev/null || exit 70
     if [ "$CREDENTIAL_CLASS" = static_key ] && [ -n "$CREDENTIAL_FINGERPRINT" ]; then
         eval "selected_value=\${$CREDENTIAL_ENV-}"
         if [ -n "$selected_value" ] && [ "$(printf '%s' "$selected_value" | sha256sum | cut -d' ' -f1)" = "$CREDENTIAL_FINGERPRINT" ]; then
@@ -3701,28 +5442,6 @@ main() {
         fi
     fi
     [ "$mode" = host ] || require_sandbox
-    work=$(mktemp -d /tmp/jackin-sentinel-probe.XXXXXX) || exit 70
-    trap 'rm -rf "$work"' EXIT
-    trap 'exit 70' INT TERM HUP
-    RUN_KEY=$(head -c 32 /dev/urandom 2>/dev/null | sha256sum 2>/dev/null)
-    RUN_KEY=${RUN_KEY%% *}
-    case $RUN_KEY in
-        '' | *[!0-9a-f]*) RUN_KEY= ;;
-    esac
-    [ "${#RUN_KEY}" -eq 64 ] || RUN_KEY=
-    RUN_SEED=
-    if [ -n "$RUN_KEY" ]; then
-        RUN_SEED=$(printf '%s' "$RUN_KEY" | sha256sum 2>/dev/null)
-        RUN_SEED=${RUN_SEED%% *}
-        case $RUN_SEED in
-            '' | *[!0-9a-f]*) RUN_KEY= ;;
-        esac
-        [ "${#RUN_SEED}" -eq 64 ] || RUN_KEY=
-    fi
-    if [ -z "$RUN_KEY" ] && [ "$mode" != host ]; then
-        echo "$PROBE: no key material for the step seals; refusing to run" >&2
-        exit 70
-    fi
     cat >"$work/bounded-copy.sh" <<'EOF'
 copy_source=$1
 copy_target=$2
@@ -3763,12 +5482,26 @@ fi
 exit 0
 EOF
     report_steps=
+    pin_owner=
     for id in $ALL_STEPS; do
         selected "$id" || continue
-        : >"$work/checks"
-        : >"$work/checks.tag"
-        : >"$work/facts"
-        : >"$work/facts.tag"
+        case $id in
+            J07 | J09)
+                if [ -z "$pin_owner" ] && [ "$mode" != host ]; then
+                    if pin_declared_configs; then
+                        pin_owner=$id
+                        prompt_configs_pinned=true
+                        pin_state=pinned
+                    else
+                        pin_state=failed
+                    fi
+                fi
+                ;;
+        esac
+        : | write_nofollow "$work/checks" truncate
+        : | write_nofollow "$work/checks.tag" truncate
+        : | write_nofollow "$work/facts" truncate
+        : | write_nofollow "$work/facts.tag" truncate
         _jks_chain=$RUN_SEED
         if [ "$mode" = host ]; then
             skip sandbox "not running in a sandbox (--host)"
@@ -3776,6 +5509,11 @@ EOF
             "step_$id" || true
         fi
         finish "$id"
+        if [ "$pin_owner" = "$id" ]; then
+            unpin_declared_configs
+            pin_owner=
+            prompt_configs_pinned=false
+        fi
     done
     for artifact in "$work"/step.*; do
         [ -e "$artifact" ] || continue
@@ -3783,9 +5521,11 @@ EOF
         exit 70
     done
     printf '%s' "$report_steps" | jq -cMs --arg mode "$mode" --arg docker "$docker" --arg engine "$engine" \
-        --slurpfile spec "$spec" \
-        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $spec[0].target,
-          mode: $mode, docker: $docker, engine: ($engine | n), steps: add}'
+        --slurpfile target /dev/fd/3 \
+        "$JQN"'{schema: 3, probe: "jackin-sentinel-probe", target: $target[0],
+          mode: $mode, docker: $docker, engine: ($engine | n), steps: add}' 3<<EOF
+$SPEC_TARGET_JSON
+EOF
 }
 
 main "$@"
