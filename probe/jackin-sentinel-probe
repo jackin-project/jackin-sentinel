@@ -1532,24 +1532,52 @@ def indented_block(lines, i):
     return block, i
 
 
-def merge_anchors(anchors, merged, rest):
-    alias = rest.strip()
-    if not alias.startswith("*") or len(alias) < 2:
+def merge_sources(anchors, rest):
+    value = strip_inline_comment(rest).strip()
+    if value.startswith("["):
+        if not value.endswith("]"):
+            raise ValueError("bad merge")
+        names = []
+        for part in value[1:-1].split(","):
+            part = part.strip()
+            if not part.startswith("*") or len(part) < 2:
+                raise ValueError("bad merge")
+            names.append(part[1:])
+        if not names:
+            raise ValueError("bad merge")
+    elif value.startswith("*") and len(value) >= 2:
+        names = [value[1:]]
+    else:
         raise ValueError("bad merge")
-    source = anchors.get(alias[1:])
-    if not isinstance(source, dict):
-        raise ValueError("bad merge")
-    for merge_key, merge_value in source.items():
-        if merge_key in merged:
-            raise ValueError("duplicate key")
-        merged[merge_key] = merge_value
+    sources = []
+    for name in names:
+        source = anchors.get(name)
+        if not isinstance(source, dict):
+            raise ValueError("bad merge")
+        sources.append(source)
+    return sources
+
+
+def merged_scalars(groups):
+    merged = {}
+    owners = {}
+    for index, sources in enumerate(groups):
+        for source in sources:
+            for merge_key, merge_value in source.items():
+                if merge_key in owners:
+                    if owners[merge_key] != index:
+                        raise ValueError("duplicate key")
+                    continue
+                owners[merge_key] = index
+                merged[merge_key] = merge_value
+    return merged
 
 
 def plain_root_scalars(text, anchors=None):
     root = {}
     if anchors is None:
         anchors = {}
-    merged = {}
+    merge_groups = []
     lines = text.split("\n")
     i = 0
     seen = False
@@ -1566,6 +1594,12 @@ def plain_root_scalars(text, anchors=None):
             continue
         if not line.strip() or line.lstrip(" \t").startswith("#"):
             continue
+        if line[0] not in " \t":
+            merge_match = key_re.match(line)
+            if merge_match is not None and merge_match.group(1) == "<<":
+                merge_groups.append(merge_sources(anchors, merge_match.group(2) or ""))
+                seen = True
+                continue
         if flow_collection_line(line):
             if not seen and line.lstrip().startswith("{"):
                 return flow_mapping_scalars("\n".join(lines[i - 1:]))
@@ -1579,9 +1613,6 @@ def plain_root_scalars(text, anchors=None):
         raw_key = match.group(1)
         key = decode_escapes(raw_key[1:-1]) if raw_key[0] == '"' else (raw_key[1:-1] if raw_key[0] == "'" else raw_key)
         rest = match.group(2) or ""
-        if raw_key == "<<":
-            merge_anchors(anchors, merged, rest)
-            continue
         if key in root:
             raise ValueError("duplicate key")
         anchor = re.match(r"^&([A-Za-z0-9_-]+)(?:[ \t]+(.*))?$", rest)
@@ -1713,7 +1744,7 @@ def plain_root_scalars(text, anchors=None):
                 value += " " + lines[i].strip()
                 i += 1
         root[key] = value
-    for merge_key, merge_value in merged.items():
+    for merge_key, merge_value in merged_scalars(merge_groups).items():
         if merge_key not in root:
             root[merge_key] = merge_value
     return root
@@ -1727,24 +1758,36 @@ try:
             pass
 
         def merge_source(node):
+            if isinstance(node, yaml.SequenceNode):
+                sources = []
+                for item in node.value:
+                    if not isinstance(item, yaml.MappingNode):
+                        raise ValueError("bad merge")
+                    sources.append(item)
+                return sources
             if not isinstance(node, yaml.MappingNode):
                 raise ValueError("bad merge")
-            return node
+            return [node]
 
         def construct_mapping(loader, node, deep=False):
             merged = []
             explicit = []
             for key_node, value_node in node.value:
                 if key_node.tag == "tag:yaml.org,2002:merge":
-                    merged.append(construct_mapping(loader, merge_source(value_node), deep=deep))
+                    merged.append(merge_source(value_node))
                 else:
                     explicit.append((key_node, value_node))
             mapping = {}
-            for source in merged:
-                for key, value in source.items():
-                    if key in mapping:
-                        raise ValueError("duplicate key")
-                    mapping[key] = value
+            owners = {}
+            for sources in merged:
+                for source in sources:
+                    for key, value in construct_mapping(loader, source, deep=deep).items():
+                        if key in owners:
+                            if owners[key] is not sources:
+                                raise ValueError("duplicate key")
+                            continue
+                        owners[key] = sources
+                        mapping[key] = value
             explicit_keys = {}
             for key_node, value_node in explicit:
                 key = loader.construct_object(key_node, deep=deep)
